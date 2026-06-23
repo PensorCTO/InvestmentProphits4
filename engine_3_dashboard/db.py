@@ -1,0 +1,174 @@
+"""Database helpers for the IP4 Command Center dashboard."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+from database.arena_db import connect_arena_db
+from database.execution_controls_store import (
+    read_execution_controls,
+    request_live_transition,
+    request_paper_transition,
+    set_apex_state,
+    set_crucible_state,
+    set_global_kill_switch,
+    update_execution_controls,
+)
+from database.portfolio_store import (
+    compute_agent_nav,
+    fetch_portfolio_history,
+    record_portfolio_snapshot,
+    reset_apex_wallet,
+)
+from database.strategy_store import read_best_score
+from database.trader_health_store import read_trader_health
+from database.sync_config import connection_mode
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+LOG_DIR = PROJECT_ROOT / "logs"
+APEX_AGENT_ID = os.getenv("APEX_AGENT_ID", "APEX_EDGE")
+
+
+def get_connection(*, sync: bool = False):
+    """Open arena DB. Dashboard reads local state; sync only when explicitly requested."""
+    conn = connect_arena_db()
+    if sync and connection_mode() == "cloud_replica" and hasattr(conn, "sync"):
+        try:
+            conn.sync()
+        except Exception:
+            pass
+    return conn
+
+
+def fetch_controls(conn) -> dict:
+    controls = read_execution_controls(conn)
+    if controls is None:
+        return {
+            "apex_state": "RUNNING",
+            "crucible_state": "RUNNING",
+            "target_execution_mode": "PAPER",
+            "active_execution_mode": "PAPER",
+            "global_kill_switch": False,
+        }
+    return controls
+
+
+def fetch_best_score(conn) -> float:
+    return read_best_score(conn)
+
+
+def fetch_trader_health(conn) -> dict | None:
+    return read_trader_health(conn, agent_id=APEX_AGENT_ID)
+
+
+def fetch_trader_status(conn) -> dict:
+    controls = fetch_controls(conn)
+    active = str(controls.get("active_execution_mode", "PAPER"))
+    target = str(controls.get("target_execution_mode", "PAPER"))
+    blockers: list[str] = []
+
+    if controls.get("global_kill_switch"):
+        blockers.append("Global kill switch is active")
+    if controls.get("apex_state") != "RUNNING":
+        blockers.append(f"Apex state is {controls.get('apex_state')} (must be RUNNING)")
+
+    wants_live = target in ("LIVE", "LIVE_PENDING") or active == "LIVE"
+    if wants_live:
+        if not os.getenv("POLYGON_WALLET_PRIVATE_KEY", "").strip():
+            blockers.append("POLYGON_WALLET_PRIVATE_KEY missing — required for LIVE mode")
+        if not os.getenv("ALCHEMY_API_KEY", "").strip() and not os.getenv(
+            "POLYGON_RPC_PRIMARY", ""
+        ).strip():
+            blockers.append("ALCHEMY_API_KEY or POLYGON_RPC_PRIMARY missing for LIVE RPC")
+    if target in ("LIVE", "LIVE_PENDING") and active != "LIVE":
+        blockers.append(f"Mode transition pending: target={target}, active={active}")
+
+    health = read_trader_health(conn, agent_id=APEX_AGENT_ID)
+    if health:
+        if health.get("status") == "STOPPED":
+            blockers.append(
+                f"Wallet stoppage: {health.get('stoppage_kind')} — {health.get('detail', '')}"
+            )
+        elif health.get("status") == "DEGRADED" and health.get("stoppage_kind"):
+            blockers.append(
+                f"Wallet degraded: {health.get('stoppage_kind')} ({health.get('consecutive_stoppage_ticks')} ticks)"
+            )
+
+    return {
+        "active_mode": active,
+        "target_mode": target,
+        "apex_state": controls.get("apex_state"),
+        "blockers": blockers,
+        "ready": not blockers,
+    }
+
+
+def fetch_portfolio(conn) -> dict:
+    controls = fetch_controls(conn)
+    mode = str(controls.get("active_execution_mode", "PAPER"))
+    total, cash, positions = compute_agent_nav(conn, APEX_AGENT_ID)
+    history = fetch_portfolio_history(conn, agent_id=APEX_AGENT_ID)
+    if not history:
+        snapshot = record_portfolio_snapshot(
+            conn,
+            agent_id=APEX_AGENT_ID,
+            execution_mode=mode,
+        )
+        history = [snapshot]
+    return {
+        "total_nav": total,
+        "cash": cash,
+        "position_value": positions,
+        "execution_mode": mode,
+        "history": history,
+    }
+
+
+def refresh_portfolio_snapshot(conn) -> dict:
+    controls = fetch_controls(conn)
+    mode = str(controls.get("active_execution_mode", "PAPER"))
+    return record_portfolio_snapshot(
+        conn,
+        agent_id=APEX_AGENT_ID,
+        execution_mode=mode,
+    )
+
+
+def restart_simulated_wallet(conn) -> dict:
+    controls = fetch_controls(conn)
+    mode = str(controls.get("active_execution_mode", "PAPER"))
+    return reset_apex_wallet(
+        conn,
+        agent_id=APEX_AGENT_ID,
+        execution_mode=mode,
+        sync=False,
+    )
+
+
+def tail_log(path: Path, *, max_lines: int = 40) -> str:
+    if not path.is_file():
+        return f"(log not found: {path})"
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    return "\n".join(lines[-max_lines:])
+
+
+__all__ = [
+    "APEX_AGENT_ID",
+    "fetch_best_score",
+    "fetch_controls",
+    "fetch_portfolio",
+    "fetch_trader_status",
+    "get_connection",
+    "read_execution_controls",
+    "refresh_portfolio_snapshot",
+    "request_live_transition",
+    "request_paper_transition",
+    "restart_simulated_wallet",
+    "set_apex_state",
+    "set_crucible_state",
+    "set_global_kill_switch",
+    "tail_log",
+    "update_execution_controls",
+    "LOG_DIR",
+]

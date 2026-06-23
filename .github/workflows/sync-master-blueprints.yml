@@ -1,0 +1,64 @@
+name: Sync Master Blueprints
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - InvestmentProphits4_MASTER_BLUEPRINTS.md
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-blueprints:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate master blueprint (push)
+        if: github.event_name == 'push'
+        run: python scripts/sync_master_blueprints.py --validate-only
+
+      - name: Verify DeepSeek secret
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          DEEPSEEK_V4_API: ${{ secrets.DEEPSEEK_V4_API }}
+        run: |
+          if [ -z "$DEEPSEEK_V4_API" ]; then
+            echo "::error::DEEPSEEK_V4_API is empty. Add it under Settings → Secrets and variables → Actions → Repository secrets."
+            exit 1
+          fi
+          echo "DEEPSEEK_V4_API is configured (${#DEEPSEEK_V4_API} chars)."
+
+      - name: Regenerate blueprint via deepseek-v4-flash
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          DEEPSEEK_V4_API: ${{ secrets.DEEPSEEK_V4_API }}
+          DEEPSEEK_BASE_URL: https://api.deepseek.com/v1
+          DEEPSEEK_MODEL: deepseek-v4-flash
+        run: python scripts/sync_master_blueprints.py
+
+      - name: Commit and push if changed
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if git diff --quiet -- InvestmentProphits4_MASTER_BLUEPRINTS.md; then
+            echo "Blueprint unchanged."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add InvestmentProphits4_MASTER_BLUEPRINTS.md
+          git commit -m "docs: sync master blueprints via deepseek-v4-flash"
+          git push

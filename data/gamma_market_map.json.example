@@ -1,0 +1,52 @@
+{
+  "mkt_ai_agi": {
+    "category": "Science",
+    "condition_id": "0xa4d72632ac0ddadcac5247ffc586a193f1bc3bc839cf9ce993c2471e0d599cca",
+    "slug": "will-anthropic-have-the-best-ai-model-at-the-end-of-june-2026"
+  },
+  "mkt_btc_100k": {
+    "category": "Crypto",
+    "condition_id": "0xa0f4c4924ea1a8b410b4ce821c2a9955fad21a1b19bdcfde90816732278b3dd5",
+    "slug": "will-bitcoin-hit-150k-by-june-30-2026"
+  },
+  "mkt_fed_cut": {
+    "category": "Macro",
+    "condition_id": "0xd4e77ba6f29fc093509d24f508631abd445ecf506bbdc9c4c80e60256a318527",
+    "slug": "will-no-fed-rate-cuts-happen-in-2026"
+  },
+  "mkt_oil_100": {
+    "category": "Energy",
+    "condition_id": "0x5db999fad322cea2914535aae5517060c3f80ad6d8c0231cde2124a434d16846",
+    "slug": "will-the-us-invade-iran-before-2027"
+  },
+  "mkt_oscars": {
+    "category": "Culture",
+    "condition_id": "0x894a61a2baa777adf1d03a263a4b2d8faa7e1ebc7bf6694a37701fae8add01d9",
+    "slug": "will-scream-7-be-the-top-grossing-movie-of-2026"
+  },
+  "mkt_recession": {
+    "category": "Business",
+    "condition_id": "0xfdc73f10edf0266756686f35b5712cffa828b0940fc015e0426c76c934c2105d",
+    "slug": "us-recession-by-end-of-2026"
+  },
+  "mkt_scotus_tariff": {
+    "category": "Legal",
+    "condition_id": "0x139ba0e7f931f09466c0fb27fc8ddb5e77ce9d1e2bdc953a5f22765bf779452f",
+    "slug": "scotus-accepts-sports-event-contract-case-by-july-31-2026"
+  },
+  "mkt_super_bowl": {
+    "category": "Sports",
+    "condition_id": "0x94d22b2d3bac37778fe999f94297664908723f5742ffb9d8c1992be8cff0ed29",
+    "slug": "tush-push-banned-for-2026-nfl-season"
+  },
+  "mkt_ukraine_peace": {
+    "category": "Geopolitics",
+    "condition_id": "0x4167e22670f31e5f93d132f78108f3fae809bd15cadf78983eff096845ed1415",
+    "slug": "ukraine-signs-peace-deal-with-russia-before-2027"
+  },
+  "mkt_us_election": {
+    "category": "Politics",
+    "condition_id": "0x7ad403c3508f8e3912940fd1a913f227591145ca0614074208e0b962d5fcc422",
+    "slug": "will-jd-vance-win-the-2028-us-presidential-election"
+  }
+}
