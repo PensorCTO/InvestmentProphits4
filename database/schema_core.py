@@ -155,7 +155,8 @@ def apply_core_schema(conn, *, embedding_dims: int | None = None) -> None:
             cash REAL NOT NULL,
             position_value REAL NOT NULL,
             total_nav REAL NOT NULL,
-            execution_mode TEXT NOT NULL DEFAULT 'PAPER'
+            execution_mode TEXT NOT NULL DEFAULT 'PAPER',
+            total_capital_injected REAL NOT NULL DEFAULT 0.0
         );
     """)
 

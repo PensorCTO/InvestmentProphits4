@@ -14,7 +14,13 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from engine_3_dashboard.processes import engine_runtime_warnings, fetch_engine_processes
+from engine_3_dashboard.processes import (
+    engine_runtime_warnings,
+    ensure_apex_running,
+    ensure_crucible_running,
+    ensure_supervisor_running,
+    fetch_engine_processes,
+)
 from engine_3_dashboard.db import (
     APEX_AGENT_ID,
     LOG_DIR,
@@ -83,6 +89,7 @@ def _init_session_state() -> None:
         "confirm_wallet_reset": False,
         "auto_refresh": True,
         "wallet_reset_notice": None,
+        "engine_notice": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -93,6 +100,9 @@ def render_page() -> None:
     if st.session_state.wallet_reset_notice:
         st.success(st.session_state.wallet_reset_notice)
         st.session_state.wallet_reset_notice = None
+    if st.session_state.engine_notice:
+        st.success(st.session_state.engine_notice)
+        st.session_state.engine_notice = None
 
     try:
         controls = _with_conn(fetch_controls)
@@ -189,14 +199,16 @@ def render_page() -> None:
 
     st.markdown("---")
     st.subheader("Trader Wallet")
-    wallet_col1, wallet_col2, wallet_col3, wallet_col4 = st.columns(4)
+    wallet_col1, wallet_col2, wallet_col3, wallet_col4, wallet_col5 = st.columns(5)
     with wallet_col1:
         st.metric("Total NAV (USD)", f"${portfolio['total_nav']:,.2f}")
     with wallet_col2:
-        st.metric("Cash (Wallet)", f"${portfolio['cash']:,.2f}")
+        st.metric("True PnL (USD)", f"${portfolio.get('true_pnl', 0.0):,.2f}")
     with wallet_col3:
-        st.metric("Held Assets (MTM)", f"${portfolio['position_value']:,.2f}")
+        st.metric("Cash (Wallet)", f"${portfolio['cash']:,.2f}")
     with wallet_col4:
+        st.metric("Held Assets (MTM)", f"${portfolio['position_value']:,.2f}")
+    with wallet_col5:
         st.metric("Mode", portfolio["execution_mode"])
 
     btn_refresh, btn_reset, btn_auto = st.columns([1, 1, 2])
@@ -265,11 +277,18 @@ def render_page() -> None:
         with a1:
             if st.button("Start Apex"):
                 _with_conn(lambda c: set_apex_state(c, "RUNNING"))
+                note = ensure_apex_running() or ensure_supervisor_running()
+                if note:
+                    st.session_state.engine_notice = note
                 st.rerun()
         with a2:
             if st.button("Stop Apex"):
                 _with_conn(lambda c: set_apex_state(c, "DRAIN_AND_HALT"))
                 st.rerun()
+        if st.button("Start Supervisor (recommended)"):
+            note = ensure_supervisor_running(with_dashboard=True)
+            st.session_state.engine_notice = note or "Supervisor already running."
+            st.rerun()
 
     with col2:
         st.subheader("AutoResearch Crucible")
@@ -283,6 +302,9 @@ def render_page() -> None:
         with c1:
             if st.button("Start Crucible"):
                 _with_conn(lambda c: set_crucible_state(c, "RUNNING"))
+                note = ensure_crucible_running()
+                if note:
+                    st.session_state.engine_notice = note
                 st.rerun()
         with c2:
             if st.button("Stop Crucible"):

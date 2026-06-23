@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import signal
 import sys
@@ -29,7 +30,10 @@ from database.execution_controls_store import (
 from database.knowledge_store import KnowledgeStore
 from database.market_state_store import is_snapshot_stale, read_latest_snapshot
 from database.migrate_schema import ensure_replica_schema
-from database.portfolio_store import record_portfolio_snapshot
+from database.portfolio_store import (
+    maybe_restore_bankruptcy_capital,
+    record_portfolio_snapshot,
+)
 from database.replica_store import open_replica, request_cloud_sync, sync_replica_now
 from database.strategy_store import (
     read_active_strategy_source,
@@ -91,10 +95,16 @@ APEX_AGENT_ID = os.getenv("APEX_AGENT_ID", "APEX_EDGE")
 APEX_FRACTIONAL_KELLY = float(os.getenv("APEX_FRACTIONAL_KELLY", "0.35"))
 APEX_MAX_POSITION_PCT = float(os.getenv("APEX_MAX_POSITION_PCT", "0.15"))
 APEX_LIQUIDITY_FLOOR = float(os.getenv("APEX_LIQUIDITY_FLOOR", "50000.0"))
-APEX_MIN_NET_EDGE = effective_min_net_edge()
 APEX_MIN_LADDER_USD = float(os.getenv("APEX_MIN_LADDER_USD", "5.0"))
 APEX_CLOSE_ON_HOLD = os.getenv("APEX_CLOSE_ON_HOLD", "true").lower() in ("true", "1", "yes")
-APEX_MAX_LADDER_LEGS = int(os.getenv("APEX_MAX_LADDER_LEGS", "3"))
+_APEX_MAX_LADDER_LEGS = int(os.getenv("APEX_MAX_LADDER_LEGS", "3"))
+APEX_MAX_LADDER_LEGS = _APEX_MAX_LADDER_LEGS
+_per_market_raw = os.getenv("APEX_MAX_LEGS_PER_MARKET", "").strip()
+APEX_MAX_LEGS_PER_MARKET = (
+    int(_per_market_raw)
+    if _per_market_raw
+    else max(1, math.floor(_APEX_MAX_LADDER_LEGS / 2))
+)
 
 STRATEGY_FILE = PROJECT_ROOT / "engine_2_crucible" / "active_strategy.py"
 LIVE_EXEC_TIMEOUT = float(os.getenv("LIVE_EXEC_TIMEOUT_SECONDS", "30"))
@@ -355,7 +365,14 @@ class ApexEdgeEngine:
         if not source:
             raise StrategyLoadError("No python_source in Turso and no local strategy file")
 
-        self._evaluate_fn = load_evaluate_market_from_source(source)
+        try:
+            self._evaluate_fn = load_evaluate_market_from_source(source)
+        except StrategyLoadError as exc:
+            if self._evaluate_fn is not None:
+                logger.warning("Strategy reload failed, using cached version: %s", exc)
+                return self._evaluate_fn
+            raise
+
         self._cached_version = version
         return self._evaluate_fn
 
@@ -424,6 +441,22 @@ class ApexEdgeEngine:
                 cash = sizing["cash"]
                 nav = sizing["nav"]
                 open_notional = sizing["open_notional"]
+                min_net_edge = effective_min_net_edge()
+                mode = str(controls.get("active_execution_mode", "PAPER"))
+                if maybe_restore_bankruptcy_capital(
+                    conn,
+                    agent_id=APEX_AGENT_ID,
+                    nav=nav,
+                    execution_mode=mode,
+                ):
+                    sizing = load_agent_sizing_snapshot(conn, APEX_AGENT_ID)
+                    if sizing:
+                        cash = sizing["cash"]
+                        nav = sizing["nav"]
+                        open_notional = sizing["open_notional"]
+                    logger.warning(
+                        "APEX bankruptcy floor hit — injected capital to restore NAV"
+                    )
 
                 filled = 0
                 rejected = 0
@@ -431,6 +464,7 @@ class ApexEdgeEngine:
                 closed_rebalance = 0
                 skipped_cap = 0
                 skipped_cooldown = 0
+                skipped_edge = 0
                 skipped_hold = 0
                 evaluated = 0
                 signals = 0
@@ -492,9 +526,11 @@ class ApexEdgeEngine:
 
                     signals += 1
                     signal_direction = "YES" if decision == "BUY_YES" else "NO"
-                    if count_open_legs(conn, APEX_AGENT_ID, market_id) >= APEX_MAX_LADDER_LEGS:
+                    if count_open_legs(conn, APEX_AGENT_ID, market_id) >= APEX_MAX_LEGS_PER_MARKET:
                         skipped_cap += 1
-                        cap_reasons["max_legs"] = cap_reasons.get("max_legs", 0) + 1
+                        cap_reasons["max_legs_per_market"] = (
+                            cap_reasons.get("max_legs_per_market", 0) + 1
+                        )
                         continue
 
                     open_dir = conn.execute(
@@ -667,7 +703,7 @@ class ApexEdgeEngine:
                     entry_context = KnowledgeStore.format_entry_context(
                         category, mid, mid, liq_tier, direction
                     )
-                    min_edge = resolve_min_net_edge(mid, APEX_MIN_NET_EDGE)
+                    min_edge = resolve_min_net_edge(mid, min_net_edge)
                     result = self.gateway.evaluate_and_execute(
                         agent_id=APEX_AGENT_ID,
                         market_id=market_id,
@@ -695,13 +731,19 @@ class ApexEdgeEngine:
                             result["fill_price"],
                         )
                     elif result["status"] == "REJECTED":
-                        rejected += 1
+                        reason = str(result.get("reason", ""))
+                        if reason.startswith("Net Edge") or reason in (
+                            "ladder_no_edge_improvement",
+                        ):
+                            skipped_edge += 1
+                        else:
+                            rejected += 1
                         logger.info(
                             "APEX REJECTED: %s %s %s — %s",
                             APEX_AGENT_ID,
                             market_id,
                             direction,
-                            result.get("reason", "unknown"),
+                            reason or "unknown",
                         )
                     elif result["status"] == "ERROR":
                         rejected += 1
@@ -719,6 +761,7 @@ class ApexEdgeEngine:
                     skipped_cap=skipped_cap,
                     skipped_hold=skipped_hold,
                     skipped_cooldown=skipped_cooldown,
+                    skipped_edge=skipped_edge,
                     evaluated=evaluated,
                     signals=signals,
                     closed_rebalance=closed_rebalance,
@@ -730,18 +773,21 @@ class ApexEdgeEngine:
                 )
                 status, kind, detail, consecutive = self._stoppage.observe(tick_stats)
                 if kind == "CAPITAL_STARVATION":
-                    over_cap_rows: list[tuple[str, str, float, str]] = []
+                    rebalance_rows: list[tuple[str, str, float, str]] = []
                     position_cap = nav * sizing["max_position_pct"]
                     for mid, blob in market_data.items():
                         if not isinstance(blob, dict):
                             continue
+                        legs = count_open_legs(conn, APEX_AGENT_ID, mid)
                         exposure = PaperGateway._get_agent_market_exposure(
                             conn, APEX_AGENT_ID, mid
                         )
-                        if exposure <= position_cap - APEX_MIN_LADDER_USD:
+                        at_max_legs = legs >= APEX_MAX_LEGS_PER_MARKET
+                        over_cap = exposure > position_cap - APEX_MIN_LADDER_USD
+                        if not at_max_legs and not over_cap:
                             continue
                         st = build_market_state(mid, blob)
-                        over_cap_rows.append(
+                        rebalance_rows.append(
                             (
                                 mid,
                                 st.get("category", ""),
@@ -757,7 +803,10 @@ class ApexEdgeEngine:
                         nav=nav,
                         max_position_pct=sizing["max_position_pct"],
                         min_ladder_usd=APEX_MIN_LADDER_USD,
-                        market_rows=over_cap_rows,
+                        market_rows=rebalance_rows,
+                        max_ladder_legs=APEX_MAX_LADDER_LEGS,
+                        max_legs_per_market=APEX_MAX_LEGS_PER_MARKET,
+                        cap_reasons=cap_reasons,
                     )
                     if n_rem:
                         closed_rebalance += n_rem
@@ -848,7 +897,7 @@ class ApexEdgeEngine:
         logger.info(
             "Execution config: min_edge=%.3f min_ladder=$%.0f obi_fair_weight=%s "
             "max_position_pct=%.2f max_portfolio_pct=%.2f",
-            APEX_MIN_NET_EDGE,
+            effective_min_net_edge(),
             APEX_MIN_LADDER_USD,
             os.getenv("OBI_FAIR_WEIGHT", "0.08"),
             APEX_MAX_POSITION_PCT,

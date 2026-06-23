@@ -17,8 +17,8 @@ from database.schema_core import seed_minimal_rows
 from engine_2_crucible.val_bpb_backtest import (
     _flatten_exhaust_rows,
     _mock_resolutions_enabled,
+    _score_samples,
     _synthetic_resolution,
-    run_backtest,
 )
 
 
@@ -45,9 +45,13 @@ def db_conn():
         conn.close()
 
 
-def test_mock_resolutions_enabled_in_paper_mode(monkeypatch):
-    monkeypatch.setenv("EDGE_MODEL_MOCKED", "true")
+def test_mock_resolutions_disabled_by_default(monkeypatch):
     monkeypatch.delenv("BACKTEST_MOCK_RESOLUTIONS", raising=False)
+    assert _mock_resolutions_enabled() is False
+
+
+def test_mock_resolutions_enabled_when_explicit(monkeypatch):
+    monkeypatch.setenv("BACKTEST_MOCK_RESOLUTIONS", "true")
     assert _mock_resolutions_enabled() is True
 
 
@@ -59,14 +63,36 @@ def test_synthetic_resolution_is_deterministic():
 
 def test_flatten_exhaust_uses_mock_resolutions(db_conn, monkeypatch):
     monkeypatch.setenv("BACKTEST_MOCK_RESOLUTIONS", "true")
-    samples = _flatten_exhaust_rows(db_conn, 100)
+    samples = _flatten_exhaust_rows(db_conn, 100, use_mock=True)
     assert len(samples) == 1
     assert samples[0][1] in (0, 1)
 
 
-def test_run_backtest_nonzero_with_mock_data(db_conn, monkeypatch):
-    monkeypatch.setenv("BACKTEST_MOCK_RESOLUTIONS", "true")
-    monkeypatch.setenv("LOCAL_REPLICA_PATH", str(db_conn))
-    # run_backtest opens its own connection via open_replica - need different approach
-    samples = _flatten_exhaust_rows(db_conn, 100)
-    assert len(samples) >= 1
+def test_flatten_exhaust_resolved_only_excludes_unresolved(db_conn):
+    samples = _flatten_exhaust_rows(db_conn, 100, use_mock=False)
+    assert samples == []
+
+
+def test_flatten_exhaust_resolved_only_includes_resolved_markets(db_conn):
+    conn = db_conn
+    conn.execute(
+        """
+        INSERT INTO markets_ledger
+        (market_id, condition_id, category, market_mid, liquidity_tier, is_resolved, resolution_value)
+        VALUES ('mkt_us_election', 'cond1', 'Politics', 0.52, 'HIGH_LIQUIDITY', 1, 1)
+        """
+    )
+    conn.commit()
+    samples = _flatten_exhaust_rows(conn, 100, use_mock=False)
+    assert len(samples) == 1
+    assert samples[0][1] == 1
+
+
+def test_score_samples_empty_returns_zero():
+    def _hold(_state):
+        return "HOLD"
+
+    score, trades, dd = _score_samples([], _hold)
+    assert score == 0.0
+    assert trades == 0
+    assert dd == 0.0

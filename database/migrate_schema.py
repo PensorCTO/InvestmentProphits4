@@ -536,7 +536,8 @@ def migrate_portfolio_snapshots(conn) -> bool:
                 cash REAL NOT NULL,
                 position_value REAL NOT NULL,
                 total_nav REAL NOT NULL,
-                execution_mode TEXT NOT NULL DEFAULT 'PAPER'
+                execution_mode TEXT NOT NULL DEFAULT 'PAPER',
+                total_capital_injected REAL NOT NULL DEFAULT 0.0
             )
             """
         )
@@ -548,6 +549,44 @@ def migrate_portfolio_snapshots(conn) -> bool:
         """
     )
     return changed
+
+
+def migrate_portfolio_snapshots_total_capital_injected(conn) -> bool:
+    if not _table_exists(conn, "portfolio_snapshots"):
+        return False
+    if _column_exists(conn, "portfolio_snapshots", "total_capital_injected"):
+        return False
+    conn.execute(
+        "ALTER TABLE portfolio_snapshots "
+        "ADD COLUMN total_capital_injected REAL NOT NULL DEFAULT 0.0"
+    )
+    return True
+
+
+def migrate_backfill_apex_capital_injections(conn) -> bool:
+    """One-time INITIAL_SEED row for Apex wallet injection ledger."""
+    if not _table_exists(conn, "capital_injection_ledger"):
+        return False
+    from database.portfolio_store import DEFAULT_APEX_AGENT_ID, DEFAULT_INITIAL_CAPITAL
+    from shared.capital_injection import EVENT_INITIAL_SEED, SCOPE_APEX, append_injection
+
+    existing = conn.execute(
+        """
+        SELECT COUNT(*) FROM capital_injection_ledger
+        WHERE scope = ? AND agent_id = ?
+        """,
+        (SCOPE_APEX, DEFAULT_APEX_AGENT_ID),
+    ).fetchone()[0]
+    if existing:
+        return False
+    append_injection(
+        conn,
+        SCOPE_APEX,
+        EVENT_INITIAL_SEED,
+        DEFAULT_INITIAL_CAPITAL,
+        agent_id=DEFAULT_APEX_AGENT_ID,
+    )
+    return True
 
 
 def migrate_chain_nonce_state(conn) -> bool:
@@ -1046,6 +1085,8 @@ def migrate_connection(conn, label: str, *, quiet: bool = False) -> None:
         changes.append("trader_health")
     if migrate_portfolio_snapshots(conn):
         changes.append("portfolio_snapshots")
+    if migrate_portfolio_snapshots_total_capital_injected(conn):
+        changes.append("portfolio_snapshots.total_capital_injected")
     if migrate_chain_nonce_state(conn):
         changes.append("chain_nonce_state")
     if migrate_markets_ledger_resolved_at(conn):
@@ -1106,6 +1147,8 @@ def migrate_connection(conn, label: str, *, quiet: bool = False) -> None:
         changes.append("markets_ledger.refresh_liquidity_tiers")
     if migrate_backfill_capital_injections(conn):
         changes.append("capital_injection_ledger.backfill_initial_seed")
+    if migrate_backfill_apex_capital_injections(conn):
+        changes.append("capital_injection_ledger.backfill_apex_initial_seed")
 
     if changes:
         conn.commit()

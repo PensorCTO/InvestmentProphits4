@@ -16,10 +16,17 @@ from database.execution_controls_store import (
     update_execution_controls,
 )
 from database.portfolio_store import (
+    DEFAULT_INITIAL_CAPITAL,
     compute_agent_nav,
     fetch_portfolio_history,
     record_portfolio_snapshot,
     reset_apex_wallet,
+)
+from shared.capital_injection import (
+    SCOPE_APEX,
+    total_injected,
+    true_return_pct,
+    true_trading_pnl,
 )
 from database.strategy_store import read_best_score
 from database.trader_health_store import read_trader_health
@@ -104,11 +111,19 @@ def fetch_trader_status(conn) -> dict:
     }
 
 
+def _apex_total_injected(conn, agent_id: str = APEX_AGENT_ID) -> float:
+    injected = total_injected(conn, SCOPE_APEX, agent_id=agent_id)
+    if injected <= 0:
+        return DEFAULT_INITIAL_CAPITAL
+    return injected
+
+
 def fetch_portfolio(conn) -> dict:
     controls = fetch_controls(conn)
     mode = str(controls.get("active_execution_mode", "PAPER"))
     total, cash, positions = compute_agent_nav(conn, APEX_AGENT_ID)
     history = fetch_portfolio_history(conn, agent_id=APEX_AGENT_ID)
+    injected = _apex_total_injected(conn, APEX_AGENT_ID)
     if not history:
         snapshot = record_portfolio_snapshot(
             conn,
@@ -121,6 +136,9 @@ def fetch_portfolio(conn) -> dict:
         "cash": cash,
         "position_value": positions,
         "execution_mode": mode,
+        "total_capital_injected": injected,
+        "true_pnl": true_trading_pnl(total, injected),
+        "true_return_pct": true_return_pct(total, injected),
         "history": history,
     }
 

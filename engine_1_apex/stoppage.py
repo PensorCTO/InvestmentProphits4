@@ -20,6 +20,7 @@ class TickStats:
     skipped_cap: int = 0
     skipped_hold: int = 0
     skipped_cooldown: int = 0
+    skipped_edge: int = 0
     evaluated: int = 0
     signals: int = 0
     closed_rebalance: int = 0
@@ -46,14 +47,18 @@ def classify_stoppage(stats: TickStats) -> tuple[str | None, str]:
         )
 
     if stats.signals > 0 and stats.filled == 0:
+        actionable_signals = stats.signals - stats.skipped_edge
+        if actionable_signals <= 0:
+            return None, "edge_gated"
         blocked = stats.rejected + stats.skipped_cap
-        if blocked >= stats.signals:
+        if blocked >= actionable_signals:
             cap_keys = stats.cap_reasons or {}
             capital_block = stats.skipped_cap > 0 and (
                 stats.cash < stats.min_ladder_usd
                 or cap_keys.get("min_ladder", 0) > 0
                 or cap_keys.get("position_cap", 0) > 0
                 or cap_keys.get("max_legs", 0) > 0
+                or cap_keys.get("max_legs_per_market", 0) > 0
             )
             if capital_block:
                 return (
@@ -90,6 +95,12 @@ class StoppageTracker:
             self.last_kind = None
             return "HEALTHY", None, detail, 0
 
+        if kind == "SIGNAL_STARVATION":
+            # Strategy deliberately holding — not a wallet failure.
+            self.consecutive = 0
+            self.last_kind = kind
+            return "HEALTHY", kind, detail, 0
+
         self.consecutive += 1
         self.last_kind = kind
         threshold = stoppage_threshold_ticks()
@@ -112,6 +123,9 @@ def remediate_stoppage(
     max_position_pct: float,
     min_ladder_usd: float,
     market_rows: list[tuple[str, str, float, str]],
+    max_ladder_legs: int = 3,
+    max_legs_per_market: int | None = None,
+    cap_reasons: dict[str, int] | None = None,
 ) -> int:
     """
     Auto-remediate persistent capital stoppages. Returns legs closed.
@@ -122,9 +136,30 @@ def remediate_stoppage(
     if consecutive < stoppage_threshold_ticks():
         return 0
 
+    from engine_1_apex.trade_close import close_smallest_market_leg, count_open_legs
+
     position_cap = nav * max_position_pct
     closed = 0
+    per_market_cap = max_legs_per_market if max_legs_per_market is not None else max_ladder_legs
+    max_legs_hit = bool((cap_reasons or {}).get("max_legs_per_market")) or bool(
+        (cap_reasons or {}).get("max_legs")
+    )
+
     for market_id, category, market_mid, liq_tier in market_rows:
+        legs = count_open_legs(conn, agent_id, market_id)
+        if max_legs_hit and legs >= per_market_cap:
+            if close_smallest_market_leg(
+                conn,
+                agent_id=agent_id,
+                market_id=market_id,
+                category=category,
+                market_mid=market_mid,
+                liquidity_tier=liq_tier,
+                exit_reason="MAX_LEGS_REBALANCE",
+            ):
+                closed += 1
+            continue
+
         exposure = get_agent_market_exposure(conn, agent_id, market_id)
         if exposure <= position_cap - min_ladder_usd:
             continue

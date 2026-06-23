@@ -15,7 +15,7 @@ InvestmentProphits4 (IP4) is a **dual-engine paper arena**:
 
 | Engine | Process | Role |
 |--------|---------|------|
-| **Engine 1 — Apex Edge** | `engine_1_apex/ip4_apex_edge.py` | Oracle sync → `trade_exhaust` snapshots → read `active_strategy` from DB → fair value + net edge gates → paper (or LIVE) fills |
+| **Engine 1 — Apex Edge** | `engine_1_apex/ip4_apex_edge.py` | Oracle sync → `trade_exhaust` snapshots → read `active_strategy` from Turso → fair value + net edge gates → paper (or LIVE) fills |
 | **Engine 2 — Crucible** | `engine_2_crucible/ip4_swarm_crucible.py` | Karpathy loop: DeepSeek proposes full `active_strategy.py` → `val_bpb_backtest.py` Sortino judge → keep/revert → push winners to Turso |
 | **Engine 3 — Command Center** | `engine_3_dashboard/app.py` (Streamlit) | DB-driven controls, wallet NAV, engine process status, logs |
 
@@ -177,7 +177,8 @@ Key env thresholds:
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `APEX_MIN_NET_EDGE` | 0.015 | Live/minimum edge bar |
-| `APEX_PAPER_MIN_NET_EDGE` | 0.008 | Paper execution edge bar |
+| `APEX_PAPER_MIN_NET_EDGE` | 0.015 | Paper execution edge bar (deprecated; uses `APEX_MIN_NET_EDGE` unless `APEX_EDGE_MODE=exploration`) |
+| `APEX_EXPLORATION_MIN_NET_EDGE` | 0.008 | Exploration mode edge bar |
 | `APEX_MIN_LADDER_USD` | 5.0 | Minimum notional per ladder leg |
 
 ---
@@ -384,12 +385,12 @@ InvestmentProphits4/
 
 ## 20. Strategy Summary (One Paragraph)
 
-InvestmentProphits4 paper-trades up to ten Polymarket-style binary markets by combining a **Crucible-evolved** `evaluate_market()` strategy with an **Apex execution stack** that computes fair value from live CLOB mids plus order-book imbalance, enforces synthetic transaction costs and configurable net-edge thresholds, and simulates fractional-Kelly ladder entries subject to per-market exposure caps and a maximum open-leg count. Oracle snapshots land in `trade_exhaust` with full depth fields so the same strategy logic runs in backtest replay and live ticks; the backtest judge scores Sortino on replay rows using synthetic resolutions for still-open markets, while Apex uses real books when `EDGE_MODEL_MOCKED=false`. A DB-driven supervisor spawns Apex and Crucible from `execution_controls`, the Streamlit Command Center exposes kill switch and mode transitions without replacing the supervisor, and inline stoppage detection records wallet health when signals exist but fills stall — distinguishing edge-gate rejection, HOLD-heavy signal starvation, and capital lock-up from process failure.
+InvestmentProphits4 paper-trades up to ten Polymarket-style binary markets by combining a **Crucible-evolved** `evaluate_market()` strategy with an **Apex execution stack** that computes fair value from live CLOB mids plus order-book imbalance, enforces synthetic transaction costs and configurable net-edge thresholds (default 0.015 for both paper and live, dropping to 0.008 in exploration mode via `APEX_EDGE_MODE=exploration` or `CRUCIBLE_EXPLORATION=true`), and simulates fractional-Kelly ladder entries subject to per-market exposure caps and a maximum open-leg count (default `max(1, floor(APEX_MAX_LADDER_LEGS/2))`). Oracle snapshots land in `trade_exhaust` with full depth fields so the same strategy logic runs in backtest replay and live ticks; the backtest judge scores Sortino on replay rows using synthetic resolutions for still-open markets when `BACKTEST_MOCK_RESOLUTIONS=true` (default), while Apex uses real books when `EDGE_MODEL_MOCKED=false`. A DB-driven supervisor (`scripts/supervisor_watch.py`) spawns Apex and Crucible from `execution_controls`, the Streamlit Command Center exposes kill switch and mode transitions without replacing the supervisor, and inline stoppage detection records wallet health when signals exist but fills stall — distinguishing edge-gate rejection, HOLD-heavy signal starvation, and capital lock-up from process failure. Crucible AutoResearch uses DeepSeek `deepseek-v4-flash` via `shared/deepseek.py` for strategy proposals and blueprint sync, with a validity gate that requires at least `AUTORESEARCH_MIN_LIVE_FILL_ELIGIBLE` signals passing the net-edge threshold on the latest live snapshot before KEEPing a champion.
 
 ---
+
+*Auto-synced by deepseek-v4-flash on 2026-06-22T21:45:00Z.*
 
 *This document reflects the IP4 codebase at checkpoint June 2026. For session-level engineering notes see `agent/wiki/project_wiki.md`. Prior art: `../InvestmentProphits3/InvestmentProphits3_MASTER_BLUEPRINTS.md`.*
 
 *Initial checkpoint authored 2026-06-22. Validated by `scripts/sync_master_blueprints.py --validate-only`.*
-
----

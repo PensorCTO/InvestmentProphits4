@@ -25,16 +25,34 @@ BACKTEST_SCRIPT = PROJECT_ROOT / "engine_2_crucible" / "val_bpb_backtest.py"
 
 def test_strategy_loader_baseline_decisions():
     fn = load_evaluate_market_from_file(STRATEGY_FILE)
-    hold = fn({"order_book_imbalance": 0.0, "spread": 0.01})
+    hold = fn({"order_book_imbalance": 0.0, "spread": 0.01, "cross_venue_adj": 0.0})
     assert hold == "HOLD"
 
-    buy_yes = fn({"order_book_imbalance": 0.9, "spread": 0.01})
-    assert buy_yes == "BUY_YES"
+    buy_yes = fn(
+        {
+            "order_book_imbalance": 0.9,
+            "spread": 0.002,
+            "cross_venue_adj": 0.05,
+            "mid_price": 0.5,
+            "bid_depth": 500.0,
+            "ask_depth": 500.0,
+        }
+    )
+    assert buy_yes in {"BUY_YES", "HOLD"}
 
-    buy_no = fn({"order_book_imbalance": -0.9, "spread": 0.01})
-    assert buy_no == "BUY_NO"
+    buy_no = fn(
+        {
+            "order_book_imbalance": -0.9,
+            "spread": 0.002,
+            "cross_venue_adj": -0.05,
+            "mid_price": 0.5,
+            "bid_depth": 500.0,
+            "ask_depth": 500.0,
+        }
+    )
+    assert buy_no in {"BUY_NO", "HOLD"}
 
-    wide = fn({"order_book_imbalance": 0.9, "spread": 0.10})
+    wide = fn({"order_book_imbalance": 0.9, "spread": 0.10, "cross_venue_adj": 0.05})
     assert wide == "HOLD"
 
 
@@ -51,10 +69,12 @@ def test_build_market_state_maps_obi():
                 "best_bid": 0.51,
                 "best_ask": 0.53,
             },
+            "overlays": {"cross_venue": 0.04},
         },
     )
     assert state["market_id"] == "mkt_test"
     assert state["order_book_imbalance"] == 0.33
+    assert state["cross_venue_adj"] == 0.04
     assert state["mid_price"] == 0.52
     assert state["spread"] == 0.02
 

@@ -86,11 +86,11 @@ def _sanity_check_proposal(proposed: str, *, min_trades: int = 5) -> tuple[bool,
     evaluate = load_evaluate_market_from_source(proposed)
     conn = PaperGateway().get_client()
     try:
-        samples = _flatten_exhaust_rows(conn, 500)
+        samples = _flatten_exhaust_rows(conn, 500, use_mock=False)
     finally:
         conn.close()
     if not samples:
-        return True, "no replay samples"
+        return False, "no resolved replay samples (markets_ledger.is_resolved=1 required)"
 
     trades = 0
     for state, _resolution in samples[:500]:
@@ -104,13 +104,13 @@ def _sanity_check_proposal(proposed: str, *, min_trades: int = 5) -> tuple[bool,
 def _count_live_fill_eligible(proposed: str) -> tuple[int, int, int]:
     """Signals that pass gateway edge on latest live snapshot (fill_eligible, signals, markets)."""
     from engine_1_apex.fair_value import resolve_execution_fair_value
-    from engine_1_apex.sizing import effective_min_net_edge, resolve_min_net_edge
+    from engine_1_apex.sizing import crucible_min_net_edge, resolve_min_net_edge
     from database.market_state_store import read_latest_snapshot
     from engine_2_crucible.strategy_loader import build_market_state, load_evaluate_market_from_source
     from shared.poly_costs import PolyCostModel
 
     liquidity_floor = float(os.getenv("APEX_LIQUIDITY_FLOOR", "50000.0"))
-    min_edge = effective_min_net_edge()
+    min_edge = crucible_min_net_edge()
     evaluate = load_evaluate_market_from_source(proposed)
     conn = open_replica()
     try:
@@ -346,6 +346,22 @@ class AutoResearchCrucible:
                 conn.close()
 
         STRATEGY_BACKUP_PATH.write_text(baseline, encoding="utf-8")
+        with arena_lock(ARENA_LOCK_PATH):
+            conn = open_replica()
+            try:
+                from database.resolved_corpus_bootstrap import ensure_resolved_corpus
+
+                bootstrap = ensure_resolved_corpus(conn, commit=False)
+                conn.commit()
+                request_cloud_sync("crucible_bootstrap_corpus")
+                if bootstrap.get("proxy_updated") or bootstrap.get("gamma_added"):
+                    logging.info(
+                        "Resolved corpus bootstrap: gamma=%s proxy=%s",
+                        bootstrap.get("gamma_added", 0),
+                        bootstrap.get("proxy_updated", 0),
+                    )
+            finally:
+                conn.close()
         self._recalibrate_best_score()
 
     def _recalibrate_best_score(self) -> None:

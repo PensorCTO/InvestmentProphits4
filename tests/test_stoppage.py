@@ -19,6 +19,14 @@ def test_classify_signal_starvation():
     assert "10/10" in detail
 
 
+def test_classify_edge_gated_signals_healthy():
+    kind, detail = classify_stoppage(
+        TickStats(signals=2, skipped_edge=2, rejected=0, filled=0)
+    )
+    assert kind is None
+    assert detail == "edge_gated"
+
+
 def test_classify_execution_starvation():
     kind, _ = classify_stoppage(
         TickStats(
@@ -53,13 +61,90 @@ def test_healthy_on_fill():
     assert kind is None
 
 
-def test_tracker_escalates():
+def test_tracker_escalates_execution_starvation():
     tracker = StoppageTracker()
-    stats = TickStats(evaluated=10, skipped_hold=10, filled=0)
+    stats = TickStats(signals=2, rejected=2, filled=0, cash=100.0, min_ladder_usd=5.0)
     status, kind, _, consecutive = tracker.observe(stats)
-    assert kind == "SIGNAL_STARVATION"
+    assert kind == "EXECUTION_STARVATION"
     assert consecutive == 1
     for _ in range(5):
         status, _, _, consecutive = tracker.observe(stats)
     assert status == "DEGRADED"
     assert consecutive == 6
+
+
+def test_tracker_signal_starvation_stays_healthy():
+    tracker = StoppageTracker()
+    stats = TickStats(evaluated=10, skipped_hold=10, filled=0)
+    for _ in range(20):
+        status, kind, _, consecutive = tracker.observe(stats)
+        assert kind == "SIGNAL_STARVATION"
+        assert status == "HEALTHY"
+        assert consecutive == 0
+
+
+def test_remediate_max_legs_per_market_closes_one_leg(monkeypatch):
+    from engine_1_apex import stoppage as stoppage_mod
+    from engine_1_apex import trade_close
+
+    calls: list[str] = []
+
+    def fake_close(conn, **kwargs):
+        calls.append(kwargs["market_id"])
+        return True
+
+    def fake_count(conn, agent_id, market_id):
+        return 1 if market_id == "mkt_oil_100" else 0
+
+    monkeypatch.setattr(trade_close, "close_smallest_market_leg", fake_close)
+    monkeypatch.setattr(trade_close, "count_open_legs", fake_count)
+    monkeypatch.setattr(stoppage_mod, "stoppage_threshold_ticks", lambda: 6)
+
+    n = stoppage_mod.remediate_stoppage(
+        None,
+        agent_id="APEX_EDGE",
+        kind="CAPITAL_STARVATION",
+        consecutive=6,
+        nav=800.0,
+        max_position_pct=1.0,
+        min_ladder_usd=5.0,
+        market_rows=[("mkt_oil_100", "Energy", 0.12, "HIGH_LIQUIDITY")],
+        max_ladder_legs=3,
+        max_legs_per_market=1,
+        cap_reasons={"max_legs_per_market": 1},
+    )
+    assert n == 1
+    assert calls == ["mkt_oil_100"]
+
+
+def test_remediate_max_legs_closes_one_leg(monkeypatch):
+    from engine_1_apex import stoppage as stoppage_mod
+    from engine_1_apex import trade_close
+
+    calls: list[str] = []
+
+    def fake_close(conn, **kwargs):
+        calls.append(kwargs["market_id"])
+        return True
+
+    def fake_count(conn, agent_id, market_id):
+        return 3 if market_id == "mkt_oil_100" else 0
+
+    monkeypatch.setattr(trade_close, "close_smallest_market_leg", fake_close)
+    monkeypatch.setattr(trade_close, "count_open_legs", fake_count)
+    monkeypatch.setattr(stoppage_mod, "stoppage_threshold_ticks", lambda: 6)
+
+    n = stoppage_mod.remediate_stoppage(
+        None,
+        agent_id="APEX_EDGE",
+        kind="CAPITAL_STARVATION",
+        consecutive=6,
+        nav=800.0,
+        max_position_pct=1.0,
+        min_ladder_usd=5.0,
+        market_rows=[("mkt_oil_100", "Energy", 0.12, "HIGH_LIQUIDITY")],
+        max_ladder_legs=3,
+        cap_reasons={"max_legs": 1},
+    )
+    assert n == 1
+    assert calls == ["mkt_oil_100"]

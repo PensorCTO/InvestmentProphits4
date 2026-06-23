@@ -36,6 +36,87 @@ DASHBOARD_SCRIPT = PROJECT_ROOT / "engine_3_dashboard" / "app.py"
 AUDIT_SCRIPT = PROJECT_ROOT / "scripts" / "trader_health_audit.py"
 LOG_DIR = PROJECT_ROOT / "logs"
 PYTHON = PROJECT_ROOT / ".venv" / "bin" / "python"
+SUPERVISOR_LOCK_PATH = PROJECT_ROOT / ".ip4_supervisor.lock"
+
+
+def _supervisor_pid() -> int | None:
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "scripts/supervisor_watch.py"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None
+    pids = [int(x) for x in (result.stdout or "").split() if x.strip().isdigit()]
+    pids = [p for p in pids if p != os.getpid() and _pid_alive(p)]
+    return pids[0] if pids else None
+
+
+def _engine_pid(pattern: str) -> int | None:
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", pattern],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None
+    for line in (result.stdout or "").splitlines():
+        if line.strip().isdigit():
+            pid = int(line.strip())
+            if _pid_alive(pid):
+                return pid
+    return None
+
+
+def _pid_alive(pid: int | None) -> bool:
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["ps", "-o", "state=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        state = (result.stdout or "").strip()
+        if state.startswith("Z"):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def acquire_supervisor_lock():
+    """Exclusive flock — only one supervisor watch process."""
+    import fcntl
+
+    SUPERVISOR_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    handle = SUPERVISOR_LOCK_PATH.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        other = _supervisor_pid()
+        raise RuntimeError(
+            f"Supervisor already running (pid={other}). "
+            "Stop it first: pkill -f supervisor_watch.py"
+        )
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
 
 
 def _sync_db(conn) -> None:
@@ -148,7 +229,10 @@ class SupervisorWatch:
         self.apex_proc: subprocess.Popen | None = None
         self.crucible_proc: subprocess.Popen | None = None
         self.dashboard_proc: subprocess.Popen | None = None
+        self._apex_pid: int | None = None
+        self._crucible_pid: int | None = None
         self._last_health_audit = 0.0
+        self._lock_handle = None
 
     def _maybe_run_health_audit(self) -> None:
         if TRADER_HEALTH_AUDIT_SECONDS <= 0:
@@ -186,34 +270,66 @@ class SupervisorWatch:
     def _ensure_apex(self, controls: dict) -> None:
         kill = controls.get("global_kill_switch")
         state = controls.get("apex_state", "RUNNING")
-        running = self.apex_proc is not None and self.apex_proc.poll() is None
+        running = _pid_alive(self._apex_pid)
 
         if kill or state == "HALTED":
             if running:
                 _stop_process("Apex", self.apex_proc)
             self.apex_proc = None
+            self._apex_pid = None
             return
 
-        if state == "RUNNING" and not running:
-            _kill_orphan_processes("engine_1_apex/ip4_apex_edge.py")
-            self.apex_proc = _spawn("Apex", APEX_SCRIPT, LOG_DIR / "apex.log")
+        if state != "RUNNING":
+            return
+
+        if running:
+            _kill_orphan_processes(
+                "engine_1_apex/ip4_apex_edge.py", keep_pid=self._apex_pid
+            )
+            return
+
+        existing = _engine_pid("engine_1_apex/ip4_apex_edge.py")
+        if existing:
+            self._apex_pid = existing
+            logger.info("Adopted existing Apex pid=%s", existing)
+            return
+
+        _kill_orphan_processes("engine_1_apex/ip4_apex_edge.py")
+        self.apex_proc = _spawn("Apex", APEX_SCRIPT, LOG_DIR / "apex.log")
+        self._apex_pid = self.apex_proc.pid
 
     def _ensure_crucible(self, controls: dict) -> None:
         kill = controls.get("global_kill_switch")
         state = controls.get("crucible_state", "RUNNING")
-        running = self.crucible_proc is not None and self.crucible_proc.poll() is None
+        running = _pid_alive(self._crucible_pid)
 
         if kill or state == "HALTED":
             if running:
                 _stop_process("Crucible", self.crucible_proc)
             self.crucible_proc = None
+            self._crucible_pid = None
             return
 
-        if state == "RUNNING" and not running:
-            _kill_orphan_processes("engine_2_crucible/ip4_swarm_crucible.py")
-            self.crucible_proc = _spawn(
-                "Crucible", CRUCIBLE_SCRIPT, LOG_DIR / "crucible.log"
+        if state != "RUNNING":
+            return
+
+        if running:
+            _kill_orphan_processes(
+                "engine_2_crucible/ip4_swarm_crucible.py", keep_pid=self._crucible_pid
             )
+            return
+
+        existing = _engine_pid("engine_2_crucible/ip4_swarm_crucible.py")
+        if existing:
+            self._crucible_pid = existing
+            logger.info("Adopted existing Crucible pid=%s", existing)
+            return
+
+        _kill_orphan_processes("engine_2_crucible/ip4_swarm_crucible.py")
+        self.crucible_proc = _spawn(
+            "Crucible", CRUCIBLE_SCRIPT, LOG_DIR / "crucible.log"
+        )
+        self._crucible_pid = self.crucible_proc.pid
 
     def _ensure_dashboard(self) -> None:
         if not self.with_dashboard:
@@ -231,6 +347,12 @@ class SupervisorWatch:
         signal.signal(signal.SIGTERM, self._handle_signal)
 
         from scripts.start_local_sqld import start_local_sqld
+
+        try:
+            self._lock_handle = acquire_supervisor_lock()
+        except RuntimeError as exc:
+            logger.error("%s", exc)
+            return 1
 
         start_local_sqld()
 
@@ -273,6 +395,11 @@ class SupervisorWatch:
             _stop_process("Apex", self.apex_proc)
             _stop_process("Crucible", self.crucible_proc)
             _stop_process("Dashboard", self.dashboard_proc)
+            if self._lock_handle is not None:
+                try:
+                    self._lock_handle.close()
+                except Exception:
+                    pass
             logger.info("Supervisor stopped")
         return 0
 

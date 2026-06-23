@@ -33,6 +33,7 @@ data/gamma_market_map.json
 data/ip4_sqld_primary.db
 data/ip4_sqld_primary.db-*
 logs/sqld.pid
+.ip4_supervisor.lock
 data/arena_snapshot.json
 .arena_daemon.lock
 

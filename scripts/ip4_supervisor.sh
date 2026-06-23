@@ -33,6 +33,17 @@ fi
   exit 1
 }
 
+_alive_supervisor_pid() {
+  local pid
+  for pid in $(pgrep -f 'scripts/supervisor_watch.py' 2>/dev/null || true); do
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "$pid"
+      return 0
+    fi
+  done
+  return 1
+}
+
 MODE="${1:-both}"
 WITH_DASHBOARD=false
 if [[ "${2:-}" == "--dashboard" ]] || [[ "${1:-}" == "--dashboard" ]]; then
@@ -47,12 +58,36 @@ if [[ "$WITH_DASHBOARD" == true ]] || [[ "$MODE" == "watch" && "${2:-}" == "--da
   fi
 fi
 
-if [[ "$MODE" == "watch" ]]; then
+if [[ "$MODE" == "watch" ]] || [[ "$MODE" == "watch-bg" ]]; then
+  EXISTING="$(_alive_supervisor_pid || true)"
+  if [[ -n "$EXISTING" ]]; then
+    echo "Supervisor already running (pid ${EXISTING})." >&2
+    echo "  tail -f logs/supervisor.log logs/apex.log" >&2
+    echo "  stop: pkill -f supervisor_watch.py" >&2
+    exit 1
+  fi
+  rm -f "$ROOT/.ip4_supervisor.lock"
   WATCH_ARGS=()
   if [[ "$WITH_DASHBOARD" == true ]] || [[ "${2:-}" == "--dashboard" ]]; then
     WATCH_ARGS+=(--dashboard)
   fi
+  if [[ "$MODE" == "watch-bg" ]]; then
+    echo "Starting IP4 supervisor in background (DB-driven lifecycle)..."
+    nohup "$PYTHON" "$ROOT/scripts/supervisor_watch.py" "${WATCH_ARGS[@]}" \
+      >> "$ROOT/logs/supervisor.log" 2>&1 &
+    SUP_PID=$!
+    sleep 1
+    if kill -0 "$SUP_PID" 2>/dev/null; then
+      echo "Supervisor started (pid ${SUP_PID})."
+      echo "  tail -f logs/supervisor.log logs/apex.log"
+      echo "  stop: pkill -f supervisor_watch.py"
+      exit 0
+    fi
+    echo "ERROR: Supervisor failed to start — see logs/supervisor.log" >&2
+    exit 1
+  fi
   echo "Starting IP4 supervisor watch (DB-driven lifecycle)..."
+  echo "Running in foreground — Ctrl+C to stop. Tail: tail -f logs/supervisor.log logs/apex.log"
   exec "$PYTHON" "$ROOT/scripts/supervisor_watch.py" "${WATCH_ARGS[@]}"
 fi
 
@@ -75,7 +110,7 @@ case "$MODE" in
   crucible) CRUCIBLE_ONLY=true ;;
   both) ;;
   *)
-    echo "Usage: $0 [both|apex|crucible|watch|dashboard] [--dashboard]" >&2
+    echo "Usage: $0 [both|apex|crucible|watch|watch-bg|dashboard] [--dashboard]" >&2
     exit 1
     ;;
 esac

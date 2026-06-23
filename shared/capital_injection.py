@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 SCOPE_SWARM = "SWARM"
 SCOPE_PRIME = "PRIME"
+SCOPE_APEX = "APEX"
 
 EVENT_INITIAL_SEED = "INITIAL_SEED"
 EVENT_EVOLUTION_BIRTH = "EVOLUTION_BIRTH"
@@ -42,6 +43,7 @@ def total_injected(
     scope: str,
     *,
     lane_id: str | None = None,
+    agent_id: str | None = None,
 ) -> float:
     if lane_id:
         row = conn.execute(
@@ -51,6 +53,15 @@ def total_injected(
             WHERE scope = ? AND lane_id = ?
             """,
             (scope, lane_id),
+        ).fetchone()
+    elif agent_id:
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(amount), 0)
+            FROM capital_injection_ledger
+            WHERE scope = ? AND agent_id = ?
+            """,
+            (scope, agent_id),
         ).fetchone()
     else:
         row = conn.execute(
@@ -62,6 +73,10 @@ def total_injected(
             (scope,),
         ).fetchone()
     return float(row[0]) if row else 0.0
+
+
+def true_trading_pnl(nav: float, injected: float) -> float:
+    return round(nav - injected, 2)
 
 
 def true_return_pct(nav: float, injected: float) -> float:

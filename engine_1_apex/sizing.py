@@ -78,15 +78,18 @@ def get_agent_open_notional(conn, agent_id: str) -> float:
 
 
 def effective_min_net_edge() -> float:
-    """Min edge gate; paper execution uses a lower bar (live data or mock data)."""
+    """Min edge gate for Apex paper and live execution (both default to live bar)."""
     live = float(os.getenv("APEX_MIN_NET_EDGE", "0.015"))
-    from shared.arena_mode import is_paper_execution
-
-    if is_paper_execution():
-        paper = os.getenv("APEX_PAPER_MIN_NET_EDGE", "0.008").strip()
-        if paper:
-            return float(paper)
+    if os.getenv("APEX_EDGE_MODE", "").strip().lower() == "exploration":
+        return float(os.getenv("APEX_EXPLORATION_MIN_NET_EDGE", "0.008"))
     return live
+
+
+def crucible_min_net_edge() -> float:
+    """Edge bar for Crucible live-fill eligibility checks."""
+    if os.getenv("CRUCIBLE_EXPLORATION", "").strip().lower() in ("true", "1", "yes"):
+        return float(os.getenv("APEX_EXPLORATION_MIN_NET_EDGE", "0.008"))
+    return float(os.getenv("APEX_MIN_NET_EDGE", "0.015"))
 
 
 def resolve_min_net_edge(market_mid: float, base_min_edge: float) -> float:

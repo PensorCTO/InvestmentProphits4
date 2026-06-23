@@ -17,9 +17,11 @@ from database.schema_core import seed_minimal_rows
 from database.portfolio_store import (
     compute_agent_nav,
     fetch_portfolio_history,
+    get_apex_total_injected,
     record_portfolio_snapshot,
     reset_apex_wallet,
 )
+from shared.capital_injection import true_trading_pnl
 
 
 @pytest.fixture
@@ -35,14 +37,16 @@ def db_conn():
 
 
 def test_record_and_fetch_snapshot(db_conn):
-    record_portfolio_snapshot(db_conn, agent_id="APEX_EDGE", commit=True, sync=False)
+    snapshot = record_portfolio_snapshot(db_conn, agent_id="APEX_EDGE", commit=True, sync=False)
     history = fetch_portfolio_history(db_conn, agent_id="APEX_EDGE")
     assert len(history) == 1
     assert history[0]["cash"] == pytest.approx(100.0)
     assert history[0]["total_nav"] == pytest.approx(100.0)
+    assert snapshot["total_capital_injected"] == pytest.approx(100.0)
+    assert snapshot["true_pnl"] == pytest.approx(0.0)
 
 
-def test_reset_wallet_clears_history_and_restores_cash(db_conn):
+def test_reset_wallet_preserves_history_and_tracks_injection(db_conn):
     db_conn.execute(
         """
         INSERT OR IGNORE INTO markets_ledger
@@ -63,6 +67,7 @@ def test_reset_wallet_clears_history_and_restores_cash(db_conn):
     )
     db_conn.commit()
 
+    record_portfolio_snapshot(db_conn, agent_id="APEX_EDGE", commit=True, sync=False)
     result = reset_apex_wallet(db_conn, agent_id="APEX_EDGE", commit=True, sync=False)
     assert result["closed_positions"] == 1
     assert result["initial_capital"] == pytest.approx(100.0)
@@ -71,4 +76,9 @@ def test_reset_wallet_clears_history_and_restores_cash(db_conn):
     assert positions == pytest.approx(0.0)
     assert cash == pytest.approx(100.0)
     assert total == pytest.approx(100.0)
-    assert len(fetch_portfolio_history(db_conn, agent_id="APEX_EDGE")) == 1
+
+    history = fetch_portfolio_history(db_conn, agent_id="APEX_EDGE")
+    assert len(history) >= 2
+    injected = get_apex_total_injected(db_conn, "APEX_EDGE")
+    assert injected == pytest.approx(200.0)
+    assert true_trading_pnl(total, injected) == pytest.approx(-100.0)

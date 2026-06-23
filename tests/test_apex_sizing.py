@@ -121,11 +121,37 @@ def test_resolve_min_net_edge_longshot():
 
 def test_effective_min_net_edge_paper_mode(monkeypatch):
     monkeypatch.setenv("EXECUTION_MODE", "paper")
-    monkeypatch.setenv("APEX_PAPER_MIN_NET_EDGE", "0.008")
+    monkeypatch.delenv("APEX_EDGE_MODE", raising=False)
+    monkeypatch.setenv("APEX_MIN_NET_EDGE", "0.015")
+    from engine_1_apex.sizing import effective_min_net_edge
+
+    assert effective_min_net_edge() == pytest.approx(0.015)
+
+
+def test_effective_min_net_edge_exploration_mode(monkeypatch):
+    monkeypatch.setenv("APEX_EDGE_MODE", "exploration")
+    monkeypatch.setenv("APEX_EXPLORATION_MIN_NET_EDGE", "0.008")
     monkeypatch.setenv("APEX_MIN_NET_EDGE", "0.015")
     from engine_1_apex.sizing import effective_min_net_edge
 
     assert effective_min_net_edge() == pytest.approx(0.008)
+
+
+def test_crucible_min_net_edge_exploration(monkeypatch):
+    monkeypatch.setenv("CRUCIBLE_EXPLORATION", "true")
+    monkeypatch.setenv("APEX_EXPLORATION_MIN_NET_EDGE", "0.008")
+    monkeypatch.setenv("APEX_MIN_NET_EDGE", "0.015")
+    from engine_1_apex.sizing import crucible_min_net_edge
+
+    assert crucible_min_net_edge() == pytest.approx(0.008)
+
+
+def test_crucible_min_net_edge_default(monkeypatch):
+    monkeypatch.delenv("CRUCIBLE_EXPLORATION", raising=False)
+    monkeypatch.setenv("APEX_MIN_NET_EDGE", "0.015")
+    from engine_1_apex.sizing import crucible_min_net_edge
+
+    assert crucible_min_net_edge() == pytest.approx(0.015)
 
 
 def test_effective_min_net_edge_live_execution(monkeypatch):

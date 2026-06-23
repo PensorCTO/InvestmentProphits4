@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from engine_1_apex.commit_reveal import assert_market_unresolved
 from engine_1_apex.sizing import (
     compute_ladder_budget,
+    effective_min_net_edge,
     is_stop_loss_cooldown_active,
     load_agent_sizing_snapshot,
     max_portfolio_pct,
@@ -35,7 +36,7 @@ class PaperGateway:
         self.auth_token = os.getenv("TURSO_AUTH_TOKEN")
 
         # MINIMUM_NET_EDGE is absolute. Do not lower this to chase churn.
-        self.MIN_NET_EDGE = 0.015
+        self.MIN_NET_EDGE = effective_min_net_edge()
 
     def get_client(self):
         """Returns a local-only replica connection (cloud sync is deferred)."""

@@ -3,10 +3,10 @@
 
 from __future__ import annotations
 
-import json
 import math
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -17,9 +17,13 @@ from dotenv import load_dotenv
 load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 from database.replica_store import open_replica
+from engine_2_crucible.backtest_corpus import (
+    flatten_exhaust_rows,
+    mock_resolutions_enabled,
+    synthetic_resolution as _synthetic_resolution,
+)
 from engine_2_crucible.strategy_loader import (
     StrategyLoadError,
-    build_market_state,
     load_evaluate_market_from_file,
 )
 
@@ -28,44 +32,9 @@ BACKTEST_MAX_ROWS = int(os.getenv("BACKTEST_MAX_ROWS", "10000"))
 INITIAL_CAPITAL = 1000.0
 DRAWDOWN_PENALTY_THRESHOLD = 0.05
 
-
-def _mock_resolutions_enabled() -> bool:
-    explicit = os.getenv("BACKTEST_MOCK_RESOLUTIONS", "").strip().lower()
-    if explicit in ("true", "1", "yes"):
-        return True
-    if explicit in ("false", "0", "no"):
-        return False
-    # Backtest replay must not depend on live EDGE_MODEL_MOCKED — open markets
-    # in markets_ledger are almost never resolved during paper research.
-    return True
-
-
-def _synthetic_resolution(market_id: str, as_of_ms: int, mid: float) -> int:
-    """Deterministic paper outcome: resolve YES with probability = mid."""
-    import hashlib
-
-    clamped = max(0.01, min(0.99, float(mid)))
-    roll = int(
-        hashlib.sha256(f"{market_id}:{as_of_ms}".encode()).hexdigest()[:8],
-        16,
-    ) / 0xFFFFFFFF
-    return 1 if roll < clamped else 0
-
-
-def _load_resolutions(conn) -> dict[str, int | None]:
-    rows = conn.execute(
-        """
-        SELECT market_id, is_resolved, resolution_value
-        FROM markets_ledger
-        """
-    ).fetchall()
-    out: dict[str, int | None] = {}
-    for market_id, is_resolved, resolution_value in rows:
-        if is_resolved:
-            out[market_id] = int(resolution_value) if resolution_value is not None else None
-        else:
-            out[market_id] = None
-    return out
+# Backward-compatible aliases for tests and Crucible imports.
+_mock_resolutions_enabled = mock_resolutions_enabled
+_flatten_exhaust_rows = flatten_exhaust_rows
 
 
 def _entry_cost(mid: float, spread: float, decision: str) -> float:
@@ -105,65 +74,13 @@ def _sortino_ratio(returns: list[float]) -> float:
     return mean_r / downside_dev
 
 
-def _flatten_exhaust_rows(conn, max_rows: int) -> list[tuple[dict, int]]:
-    rows = conn.execute(
-        """
-        SELECT payload, as_of_ms FROM trade_exhaust
-        ORDER BY as_of_ms DESC
-        LIMIT ?
-        """,
-        (max_rows,),
-    ).fetchall()
-    resolutions = _load_resolutions(conn)
-    use_mock = _mock_resolutions_enabled()
-    samples: list[tuple[dict, int]] = []
-
-    for payload_raw, as_of_ms in rows:
-        try:
-            markets = json.loads(payload_raw)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(markets, dict):
-            continue
-        for market_id, blob in markets.items():
-            if not isinstance(blob, dict):
-                continue
-            resolution = resolutions.get(market_id)
-            state = build_market_state(market_id, blob)
-            if resolution is None and use_mock:
-                mid = float(state.get("mid_price", 0.5))
-                resolution = _synthetic_resolution(
-                    market_id, int(as_of_ms or 0), mid
-                )
-            if resolution is None:
-                continue
-            samples.append((state, resolution))
-
-    return samples
-
-
-def run_backtest() -> float:
-    evaluate_market = load_evaluate_market_from_file(STRATEGY_FILE)
-    try:
-        conn = open_replica()
-    except Exception:
-        print("SCORE:0.0000", flush=True)
-        return 0.0
-
-    try:
-        table = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='trade_exhaust'"
-        ).fetchone()
-        if not table:
-            print("SCORE:0.0000", flush=True)
-            return 0.0
-        samples = _flatten_exhaust_rows(conn, BACKTEST_MAX_ROWS)
-    finally:
-        conn.close()
-
+def _score_samples(
+    samples: list[tuple[dict, int]],
+    evaluate_market: Callable[[dict], str],
+) -> tuple[float, int, float]:
+    """Return (score, trade_count, max_drawdown) for a sample corpus."""
     if not samples:
-        print("SCORE:0.0000", flush=True)
-        return 0.0
+        return 0.0, 0, 0.0
 
     capital = INITIAL_CAPITAL
     peak_capital = INITIAL_CAPITAL
@@ -200,7 +117,37 @@ def run_backtest() -> float:
     if not trade_returns and samples:
         score = total_return
 
-    print(f"TRADES:{len(trade_returns)}", flush=True)
+    return score, len(trade_returns), max_drawdown
+
+
+def run_backtest() -> float:
+    evaluate_market = load_evaluate_market_from_file(STRATEGY_FILE)
+    try:
+        conn = open_replica()
+    except Exception:
+        print("SCORE:0.0000", flush=True)
+        print("TRADES:0", flush=True)
+        return 0.0
+
+    try:
+        table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='trade_exhaust'"
+        ).fetchone()
+        if not table:
+            print("SCORE:0.0000", flush=True)
+            print("TRADES:0", flush=True)
+            return 0.0
+        resolved_samples = flatten_exhaust_rows(conn, BACKTEST_MAX_ROWS, use_mock=False)
+        if mock_resolutions_enabled():
+            dev_samples = flatten_exhaust_rows(conn, BACKTEST_MAX_ROWS, use_mock=True)
+            dev_score, dev_trades, _ = _score_samples(dev_samples, evaluate_market)
+            print(f"RESEARCH_SCORE:{dev_score:.4f}", flush=True)
+            print(f"RESEARCH_TRADES:{dev_trades}", flush=True)
+    finally:
+        conn.close()
+
+    score, trades, _ = _score_samples(resolved_samples, evaluate_market)
+    print(f"TRADES:{trades}", flush=True)
     print(f"SCORE:{score:.4f}", flush=True)
     return score
 

@@ -6,6 +6,15 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
+from shared.capital_injection import (
+    EVENT_BANKRUPTCY_RESET,
+    EVENT_INITIAL_SEED,
+    SCOPE_APEX,
+    append_injection,
+    total_injected,
+    true_return_pct,
+    true_trading_pnl,
+)
 from shared.poly_costs import PolyCostModel
 from database.replica_store import commit_local, request_cloud_sync
 
@@ -15,6 +24,83 @@ DEFAULT_INITIAL_CAPITAL = float(os.getenv("APEX_INITIAL_CAPITAL", "100.0"))
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def apex_bankruptcy_floor() -> float | None:
+    raw = os.getenv("APEX_BANKRUPTCY_FLOOR", "").strip()
+    if not raw:
+        return None
+    return float(raw)
+
+
+def get_apex_total_injected(
+    conn,
+    agent_id: str = DEFAULT_APEX_AGENT_ID,
+) -> float:
+    injected = total_injected(conn, SCOPE_APEX, agent_id=agent_id)
+    if injected <= 0:
+        return DEFAULT_INITIAL_CAPITAL
+    return injected
+
+
+def ensure_apex_initial_injection(
+    conn,
+    agent_id: str = DEFAULT_APEX_AGENT_ID,
+) -> None:
+    if total_injected(conn, SCOPE_APEX, agent_id=agent_id) > 0:
+        return
+    append_injection(
+        conn,
+        SCOPE_APEX,
+        EVENT_INITIAL_SEED,
+        DEFAULT_INITIAL_CAPITAL,
+        agent_id=agent_id,
+    )
+
+
+def maybe_restore_bankruptcy_capital(
+    conn,
+    *,
+    agent_id: str = DEFAULT_APEX_AGENT_ID,
+    nav: float,
+    execution_mode: str = "PAPER",
+) -> bool:
+    """Inject capital when NAV falls below APEX_BANKRUPTCY_FLOOR."""
+    floor = apex_bankruptcy_floor()
+    if floor is None or nav >= floor:
+        return False
+
+    inject_amount = round(DEFAULT_INITIAL_CAPITAL - nav, 2)
+    if inject_amount <= 0:
+        return False
+
+    row = conn.execute(
+        "SELECT capital FROM agent_archetypes WHERE agent_id = ? AND is_active = 1",
+        (agent_id,),
+    ).fetchone()
+    if not row:
+        return False
+
+    new_cash = round(float(row[0]) + inject_amount, 2)
+    conn.execute(
+        "UPDATE agent_archetypes SET capital = ? WHERE agent_id = ?",
+        (new_cash, agent_id),
+    )
+    append_injection(
+        conn,
+        SCOPE_APEX,
+        EVENT_BANKRUPTCY_RESET,
+        inject_amount,
+        agent_id=agent_id,
+    )
+    record_portfolio_snapshot(
+        conn,
+        agent_id=agent_id,
+        execution_mode=execution_mode,
+        commit=False,
+        sync=False,
+    )
+    return True
 
 
 def _mark_open_position_value(
@@ -72,15 +158,27 @@ def record_portfolio_snapshot(
     commit: bool = True,
     sync: bool = True,
 ) -> dict[str, Any]:
+    ensure_apex_initial_injection(conn, agent_id=agent_id)
     total_nav, cash, position_value = compute_agent_nav(conn, agent_id)
+    total_capital_injected = get_apex_total_injected(conn, agent_id)
+    true_pnl = true_trading_pnl(total_nav, total_capital_injected)
     captured_at = _utc_now_iso()
     conn.execute(
         """
         INSERT INTO portfolio_snapshots
-        (agent_id, captured_at, cash, position_value, total_nav, execution_mode)
-        VALUES (?, ?, ?, ?, ?, ?)
+        (agent_id, captured_at, cash, position_value, total_nav, execution_mode,
+         total_capital_injected)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (agent_id, captured_at, cash, position_value, total_nav, execution_mode),
+        (
+            agent_id,
+            captured_at,
+            cash,
+            position_value,
+            total_nav,
+            execution_mode,
+            total_capital_injected,
+        ),
     )
     if commit:
         commit_local(conn)
@@ -93,6 +191,9 @@ def record_portfolio_snapshot(
         "position_value": position_value,
         "total_nav": total_nav,
         "execution_mode": execution_mode,
+        "total_capital_injected": total_capital_injected,
+        "true_pnl": true_pnl,
+        "true_return_pct": true_return_pct(total_nav, total_capital_injected),
     }
 
 
@@ -102,6 +203,37 @@ def fetch_portfolio_history(
     agent_id: str = DEFAULT_APEX_AGENT_ID,
     limit: int = 500,
 ) -> list[dict[str, Any]]:
+    has_injected = conn.execute(
+        """
+        SELECT 1 FROM pragma_table_info('portfolio_snapshots')
+        WHERE name = 'total_capital_injected'
+        """
+    ).fetchone()
+    if has_injected:
+        rows = conn.execute(
+            """
+            SELECT captured_at, cash, position_value, total_nav, execution_mode,
+                   total_capital_injected
+            FROM portfolio_snapshots
+            WHERE agent_id = ?
+            ORDER BY captured_at ASC
+            LIMIT ?
+            """,
+            (agent_id, limit),
+        ).fetchall()
+        return [
+            {
+                "captured_at": row[0],
+                "cash": float(row[1]),
+                "position_value": float(row[2]),
+                "total_nav": float(row[3]),
+                "execution_mode": row[4],
+                "total_capital_injected": float(row[5]),
+                "true_pnl": true_trading_pnl(float(row[3]), float(row[5])),
+            }
+            for row in rows
+        ]
+
     rows = conn.execute(
         """
         SELECT captured_at, cash, position_value, total_nav, execution_mode
@@ -112,6 +244,7 @@ def fetch_portfolio_history(
         """,
         (agent_id, limit),
     ).fetchall()
+    injected = get_apex_total_injected(conn, agent_id)
     return [
         {
             "captured_at": row[0],
@@ -119,6 +252,8 @@ def fetch_portfolio_history(
             "position_value": float(row[2]),
             "total_nav": float(row[3]),
             "execution_mode": row[4],
+            "total_capital_injected": injected,
+            "true_pnl": true_trading_pnl(float(row[3]), injected),
         }
         for row in rows
     ]
@@ -137,6 +272,7 @@ def reset_apex_wallet(
     from engine_1_apex.trade_close import close_open_trade
 
     seed = initial_capital if initial_capital is not None else DEFAULT_INITIAL_CAPITAL
+    ensure_apex_initial_injection(conn, agent_id=agent_id)
     open_rows = conn.execute(
         """
         SELECT
@@ -172,9 +308,12 @@ def reset_apex_wallet(
         "UPDATE agent_archetypes SET capital = ? WHERE agent_id = ?",
         (seed, agent_id),
     )
-    conn.execute(
-        "DELETE FROM portfolio_snapshots WHERE agent_id = ?",
-        (agent_id,),
+    append_injection(
+        conn,
+        SCOPE_APEX,
+        EVENT_BANKRUPTCY_RESET,
+        seed,
+        agent_id=agent_id,
     )
     snapshot = record_portfolio_snapshot(
         conn,
