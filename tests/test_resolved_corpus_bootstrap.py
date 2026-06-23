@@ -78,10 +78,22 @@ def test_seed_resolved_corpus_from_exhaust(db_conn):
     result = seed_resolved_corpus_from_exhaust(db_conn, commit=True)
     assert result["updated"] == 1
     row = db_conn.execute(
-        "SELECT is_resolved, resolution_value FROM markets_ledger WHERE market_id = 'mkt_us_election'"
+        """
+        SELECT is_resolved, resolution_value, backtest_resolution_value
+        FROM markets_ledger WHERE market_id = 'mkt_us_election'
+        """
     ).fetchone()
-    assert row[0] == 1
-    assert row[1] in (0, 1)
+    assert row[0] == 0
+    assert row[1] is None
+    assert row[2] in (0, 1)
+
+
+def test_seed_does_not_block_live_oracle(db_conn):
+    ensure_resolved_corpus(db_conn, commit=True)
+    active = db_conn.execute(
+        "SELECT COUNT(*) FROM markets_ledger WHERE is_resolved = 0"
+    ).fetchone()[0]
+    assert active >= 1
 
 
 def test_ensure_resolved_corpus_idempotent(db_conn):

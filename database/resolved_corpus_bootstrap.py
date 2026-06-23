@@ -18,6 +18,31 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def _has_backtest_resolution_columns(conn) -> bool:
+    rows = conn.execute("PRAGMA table_info(markets_ledger)").fetchall()
+    names = {row[1] for row in rows}
+    return "backtest_resolution_value" in names
+
+
+def _corpus_resolution_count(conn) -> int:
+    if _has_backtest_resolution_columns(conn):
+        return int(
+            conn.execute(
+                """
+                SELECT COUNT(*) FROM markets_ledger
+                WHERE backtest_resolution_value IS NOT NULL OR (
+                    is_resolved = 1 AND resolution_value IS NOT NULL
+                )
+                """
+            ).fetchone()[0]
+        )
+    return int(
+        conn.execute(
+            "SELECT COUNT(*) FROM markets_ledger WHERE is_resolved = 1"
+        ).fetchone()[0]
+    )
+
+
 def _mids_from_exhaust(conn) -> dict[str, list[float]]:
     rows = conn.execute(
         "SELECT payload FROM trade_exhaust ORDER BY as_of_ms ASC"
@@ -62,10 +87,15 @@ def seed_resolved_corpus_from_exhaust(
     commit: bool = True,
 ) -> dict[str, int | str]:
     """
-    Mark unresolved markets as resolved using trade_exhaust mid-drift proxies.
+    Store exhaust mid-drift proxy labels for Crucible replay.
 
-    Safe to call repeatedly — only updates rows where is_resolved=0.
+    Does not set is_resolved — live oracle must keep syncing open markets.
     """
+    if not _has_backtest_resolution_columns(conn):
+        raise RuntimeError(
+            "markets_ledger.backtest_resolution_value missing — run migrate_schema"
+        )
+
     mids = _mids_from_exhaust(conn)
     updated = 0
     skipped = 0
@@ -77,18 +107,21 @@ def seed_resolved_corpus_from_exhaust(
             skipped += 1
             continue
         cur = conn.execute(
-            "SELECT is_resolved FROM markets_ledger WHERE market_id = ?",
+            """
+            SELECT backtest_resolution_value
+            FROM markets_ledger WHERE market_id = ?
+            """,
             (market_id,),
         ).fetchone()
-        if not cur or cur[0]:
+        if not cur or cur[0] is not None:
             continue
         conn.execute(
             """
             UPDATE markets_ledger
-            SET is_resolved = 1,
-                resolution_value = ?,
-                resolved_at = ?
-            WHERE market_id = ? AND is_resolved = 0
+            SET backtest_resolution_value = ?,
+                backtest_resolution_source = 'exhaust_proxy',
+                backtest_resolved_at = ?
+            WHERE market_id = ? AND backtest_resolution_value IS NULL
             """,
             (resolution, now, market_id),
         )
@@ -122,21 +155,17 @@ def refresh_gamma_resolutions(conn, *, commit: bool = True) -> int:
 
 def ensure_resolved_corpus(conn, *, commit: bool = True) -> dict:
     """
-    Ensure at least one resolved market exists for Crucible replay.
+    Ensure at least one backtest resolution label exists for Crucible replay.
 
     Order: Gamma refresh for real closures, then exhaust mid-drift proxies.
     """
-    resolved = conn.execute(
-        "SELECT COUNT(*) FROM markets_ledger WHERE is_resolved = 1"
-    ).fetchone()[0]
-    if resolved:
-        return {"already_resolved": int(resolved), "gamma_added": 0, "proxy_updated": 0}
+    corpus_count = _corpus_resolution_count(conn)
+    if corpus_count:
+        return {"already_resolved": corpus_count, "gamma_added": 0, "proxy_updated": 0}
 
     gamma_added = refresh_gamma_resolutions(conn, commit=False)
-    resolved = conn.execute(
-        "SELECT COUNT(*) FROM markets_ledger WHERE is_resolved = 1"
-    ).fetchone()[0]
-    if resolved:
+    corpus_count = _corpus_resolution_count(conn)
+    if corpus_count:
         if commit:
             commit_local(conn)
         return {

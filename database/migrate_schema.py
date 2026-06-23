@@ -668,6 +668,60 @@ def migrate_markets_ledger_resolved_at(conn) -> bool:
     return True
 
 
+def migrate_markets_ledger_backtest_resolution(conn) -> bool:
+    """Add backtest-only resolution columns (must not block live oracle sync)."""
+    changed = False
+    for column, ddl in (
+        ("backtest_resolution_value", "INTEGER"),
+        ("backtest_resolution_source", "TEXT"),
+        ("backtest_resolved_at", "TEXT"),
+    ):
+        if _column_exists(conn, "markets_ledger", column):
+            continue
+        try:
+            conn.execute(f"ALTER TABLE markets_ledger ADD COLUMN {column} {ddl}")
+            changed = True
+        except Exception as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
+    return changed
+
+
+def migrate_repair_proxy_resolved_markets(conn) -> bool:
+    """
+    Move exhaust proxy labels off is_resolved.
+
+    Older bootstrap incorrectly set is_resolved=1 for Crucible-only proxies,
+    which made load_active_markets() empty and stopped the oracle.
+    """
+    if not _column_exists(conn, "markets_ledger", "backtest_resolution_value"):
+        return False
+    rows = conn.execute(
+        """
+        SELECT market_id, resolution_value
+        FROM markets_ledger
+        WHERE is_resolved = 1 AND backtest_resolution_value IS NULL
+        """
+    ).fetchall()
+    if not rows:
+        return False
+    for market_id, resolution_value in rows:
+        conn.execute(
+            """
+            UPDATE markets_ledger
+            SET backtest_resolution_value = ?,
+                backtest_resolution_source = 'exhaust_proxy_migrated',
+                backtest_resolved_at = COALESCE(backtest_resolved_at, resolved_at, CURRENT_TIMESTAMP),
+                is_resolved = 0,
+                resolution_value = NULL,
+                resolved_at = NULL
+            WHERE market_id = ?
+            """,
+            (resolution_value, market_id),
+        )
+    return True
+
+
 def migrate_market_state(conn) -> bool:
     """Create singleton market_state table for oracle overlay snapshots."""
     if _table_exists(conn, "market_state"):
@@ -1095,6 +1149,10 @@ def migrate_connection(conn, label: str, *, quiet: bool = False) -> None:
         changes.append("markets_ledger.clob_token_ids")
     if migrate_markets_ledger_gamma_signals(conn):
         changes.append("markets_ledger.gamma_volume+gamma_liquidity")
+    if migrate_markets_ledger_backtest_resolution(conn):
+        changes.append("markets_ledger.backtest_resolution")
+    if migrate_repair_proxy_resolved_markets(conn):
+        changes.append("markets_ledger.repair_proxy_is_resolved")
     if migrate_market_state(conn):
         changes.append("market_state")
     if migrate_active_strategy(conn):

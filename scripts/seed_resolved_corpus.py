@@ -29,7 +29,11 @@ def main() -> int:
         request_cloud_sync("seed_resolved_corpus")
         samples = flatten_exhaust_rows(conn, 500, use_mock=False)
         resolved = conn.execute(
-            "SELECT COUNT(*) FROM markets_ledger WHERE is_resolved = 1"
+            """
+            SELECT COUNT(*) FROM markets_ledger
+            WHERE backtest_resolution_value IS NOT NULL
+               OR (is_resolved = 1 AND resolution_value IS NOT NULL)
+            """
         ).fetchone()[0]
     finally:
         conn.close()

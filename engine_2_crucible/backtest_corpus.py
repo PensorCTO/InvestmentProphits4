@@ -31,14 +31,16 @@ def synthetic_resolution(market_id: str, as_of_ms: int, mid: float) -> int:
 def load_resolutions(conn) -> dict[str, int | None]:
     rows = conn.execute(
         """
-        SELECT market_id, is_resolved, resolution_value
+        SELECT market_id, is_resolved, resolution_value, backtest_resolution_value
         FROM markets_ledger
         """
     ).fetchall()
     out: dict[str, int | None] = {}
-    for market_id, is_resolved, resolution_value in rows:
-        if is_resolved:
-            out[market_id] = int(resolution_value) if resolution_value is not None else None
+    for market_id, is_resolved, resolution_value, backtest_resolution_value in rows:
+        if is_resolved and resolution_value is not None:
+            out[market_id] = int(resolution_value)
+        elif backtest_resolution_value is not None:
+            out[market_id] = int(backtest_resolution_value)
         else:
             out[market_id] = None
     return out
