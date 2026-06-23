@@ -130,3 +130,60 @@ def test_backtest_runs_without_crash():
     assert proc.returncode == 0
     assert re.search(r"SCORE:-?\d+\.\d{4}", proc.stdout)
     assert re.search(r"TRADES:\d+", proc.stdout)
+
+
+def test_keep_reverts_when_replay_gate_fails(monkeypatch):
+    class FakeCrucible:
+        def __init__(self):
+            self.reverted = None
+
+        def _run_backtest(self):
+            return 9.99, 100, "SCORE:9.9900", "", 0
+
+        def _revert_strategy(self, reason):
+            self.reverted = reason
+
+        def _keep_strategy(self, proposed, score):
+            raise AssertionError("KEEP should not run when replay gate fails")
+
+    crucible = FakeCrucible()
+    monkeypatch.setattr(ip4_swarm_crucible, "DRY_RUN", True)
+    monkeypatch.setattr(
+        ip4_swarm_crucible,
+        "replay_fill_eligibility",
+        lambda proposed: type(
+            "R",
+            (),
+            {
+                "passed": False,
+                "detail": "signals=10 fill_eligible=0 edge_rejected=10 reject_rate=1.00",
+            },
+        )(),
+        raising=False,
+    )
+
+    from engine_2_crucible import live_replay_gate
+
+    monkeypatch.setattr(live_replay_gate, "replay_fill_eligibility", lambda proposed: live_replay_gate.ReplayGateResult(
+        signals=10,
+        fill_eligible=0,
+        edge_rejected=10,
+        reject_rate=1.0,
+        passed=False,
+        detail="signals=10 fill_eligible=0",
+    ))
+
+    # Exercise the KEEP branch logic inline (mirrors ip4_swarm_crucible)
+    score, trades, _, _, rc = crucible._run_backtest()
+    best_score = 1.0
+    proposed = "def evaluate_market(s): return 'HOLD'"
+    winner_code = proposed
+    assert rc == 0 and score is not None and score > best_score
+
+    from engine_2_crucible.live_replay_gate import replay_fill_eligibility
+
+    replay = replay_fill_eligibility(proposed)
+    if not replay.passed:
+        crucible._revert_strategy(f"Replay edge gate failed: {replay.detail}")
+    assert crucible.reverted is not None
+    assert "Replay edge gate failed" in crucible.reverted

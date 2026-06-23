@@ -64,6 +64,7 @@ IP4 is a **dual-engine paper arena** on libSQL (local sqld or Turso Cloud):
 1. Ensure sqld: `.venv/bin/python scripts/start_local_sqld.py`
 2. Start stack: `nohup .venv/bin/python scripts/supervisor_watch.py --dashboard >> logs/supervisor.log 2>&1 &`
 3. Verify: supervisor + apex + crucible + streamlit pids; dashboard HTTP 200 on :8501
+4. **Before claiming any fix done:** `.venv/bin/python scripts/acceptance_gate.py --scope full` (see `.cursor/skills/ip4-definition-of-done/SKILL.md`)
 4. Logs: `logs/supervisor.log`, `logs/apex.log`, `logs/crucible.log`, `logs/dashboard.log`
 
 **Wallet STOPPED in UI:** Apex is likely still ticking. Check `trader_health.stoppage_kind` — EXECUTION_STARVATION means edge gate rejected signals, not infra failure.
@@ -100,7 +101,7 @@ Key modules post-audit:
 | done | 7-point Priority Build Order audit refactor |
 | done | Karpathy LLM wiki (`project_wiki.py`, `.cursor/rules/llm-wiki.mdc`) |
 | done | Seed resolved markets for Crucible (`scripts/seed_resolved_corpus.py`, auto on Crucible preflight) |
-| todo | Refresh `InvestmentProphits4_MASTER_BLUEPRINTS.md` via sync script (stale edge-gate docs) |
+| done | Refresh `InvestmentProphits4_MASTER_BLUEPRINTS.md` via sync script (stale edge-gate docs) |
 | done | Sync Turso `active_strategy.python_source` with local champion after audit |
 | done | Enable `CROSS_VENUE_ENABLED=true` for paper cross-venue overlays |
 | todo | Harden supervisor persistence (`watch-bg` exit investigation; zombie child detection fixed) |
@@ -235,3 +236,58 @@ Mirror IP2/IP3 pattern: `agent/project_wiki.py`, structured markdown sections, C
 - **Verified:** 10 resolved markets, 5000 replay samples; champion replay TRADES=691; sanity check passes on baseline strategy.
 
 **Next:** Refresh master blueprints.
+
+### 2026-06-22 — Crucible corpus REVERT loop (stale process)
+
+- **Root cause:** Crucible started before `backtest_resolution_value` fix (commit `4acd227`); Python kept old cached `backtest_corpus.load_resolutions()` (`is_resolved=1` only). After oracle repair all markets have `is_resolved=0` → sanity check saw 0 samples despite DB having 10 proxy labels.
+- **Fixes:** Restarted Crucible; `_sanity_check_proposal` now uses `open_replica()` + `ensure_resolved_corpus()` + direct `flatten_exhaust_rows` import; updated error message.
+- **Verified:** Iterations 4–5 ran backtests (SCORE=-8.21, TRADES=836+) — no more "no resolved replay samples" errors.
+
+**Next:** Restart Crucible after corpus/schema deploys; consider supervisor code-change detection.
+
+### 2026-06-22 — Crucible corpus REVERT loop (stale process)
+
+- **Root cause:** Crucible started before `backtest_resolution_value` fix (commit `4acd227`); Python kept old cached `backtest_corpus.load_resolutions()` (`is_resolved=1` only). After oracle repair all markets have `is_resolved=0` → sanity check saw 0 samples despite DB having 10 proxy labels.
+- **Fixes:** Restarted Crucible; `_sanity_check_proposal` now uses `open_replica()` + `ensure_resolved_corpus()` + direct `flatten_exhaust_rows` import; updated error message.
+- **Verified:** Iterations 4–5 ran backtests (SCORE=-8.21, TRADES=836+) — no more "no resolved replay samples" errors.
+
+**Next:** Restart Crucible after corpus/schema deploys; consider supervisor code-change detection.
+
+### 2026-06-23 07:56 — IP4 Wallet Stabilization plan implemented (Phases 0-5): verify_stack, honest trading telemetry (STALLED), HOLD hysteresis, Crucible replay edge gate, live CLOB preflight, restart_stack, soak_verify, CI pytest workflow. 139/140 tests pass.
+
+**Next:** Run restart_stack.py + soak_verify.py --minutes 30 on live stack; monitor trading_status vs HEALTHY.
+
+### 2026-06-23 08:02 — Fixed Trader Wallet panel: fetch_portfolio_history returned oldest 500 rows (chart showed $1099 NAV vs live $95). Switched to DESC+reverse; legacy injected=0 rows use fallback. Wallet panel now shows Capital Injected + True Return. Fixed minutes_since_last_fill after Apex restart (wall-clock from last_fill_at + DB hydrate). Added test_supervisor_lock, bankruptcy injection test, autoresearch replay REVERT test, supervisor spawn reason + post-spawn verify_stack --quick.
+
+**Next:** Restart dashboard to pick up app.py; optional: fix test_apex_sizing env isolation for APEX_EDGE_MODE=exploration in .env
+
+### 2026-06-23 — Phase 3: verify_stack infra/trading split
+
+- **`run_verify(include_trading=False)`** default: sqld, processes, dashboard HTTP, trader_health_fresh, edge_model only — no zero_fill_streak / STALLED failures.
+- **`--trading` flag** adds `check_zero_fill_streak` + `check_trading_stalled`; `trader_health_audit.py` STALLED exit 1 only with `--trading`.
+- **`restart_stack.py`** documents infra-only post-restart verify.
+- **Tests:** 10/10 in `tests/test_verify_stack.py`.
+
+**Next:** `soak_verify.py` may want `--trading` for long-run trading gates; run `restart_stack.py` to confirm infra PASS with live STALLED streak.
+
+### 2026-06-23 08:20 — Dashboard dead fix (approved spec Q1=B): cap-stall auto-remediation (remediate_cap_stall after 30 ticks), infra/trading split UI (INFRA ALIVE + TRADING STALLED), verify_stack infra-only default + --trading flag. Fixed read_trader_health preflight kwarg. Live: CAP STALL closed mkt_us_election leg; verify_stack PASS; 156 tests pass.
+
+**Next:** Monitor edge_gated STALLED on mkt_fed_cut (live CLOB); optional Crucible strategy or exploration mode if fills needed.
+
+### 2026-06-23 08:33 — Cap-block stall fix complete (gate PASS)
+
+- **Root cause:** `zero_fill_streak` only counted actionable (non-edge-gated) signals, so `remediate_cap_stall` never fired while `max_legs_per_market` blocked every tick; strategy refilled closed legs after 120s cooldown.
+- **Fix:** Added `cap_blocked_streak` in `StoppageTracker` (increments on sustained `max_legs_per_market` blocks); remediate now keys off that counter. Kept actionable-only `zero_fill_streak` for STALLED classification. Entry cooldown remains 600s on remediated market.
+- **Live:** Apex restart → 18 cap_blocked ticks → `APEX CAP STALL remediate` closed mkt_us_election leg; subsequent ticks `cap_reasons=None`, `skipped_cooldown=1`.
+- **Verified:** `acceptance_gate.py --scope full` PASS (159 pytest, apex_cap_stall_pattern OK, trading_status=IDLE).
+
+**Next:** Soak monitor for refill after 600s cooldown; confirm no cap_blocked pattern recurrence.
+
+### 2026-06-23 08:41 — Supervisor respawn fix + stack restart (gate PASS)
+
+- **Symptom:** QA reported supervisor not working; after manual Apex kill supervisor **adopted a dying stray pid** instead of spawning fresh (6s+ gap, no ticks).
+- **Fix:** `supervisor_watch._reconcile_engine()` — when tracked pid dies, skip adopt, terminate stray, spawn fresh. `ensure_supervisor_running()` verifies pid alive after 1.5s. Dashboard shows supervisor pid. `restart_stack.py` validates supervisor start.
+- **Gate:** `apex_cap_stall_pattern` now scopes to current Apex session ticks after last `CAP STALL remediate` (avoids false FAIL from pre-restart log tail).
+- **Live:** `restart_stack.py` → supervisor pid=48020, apex=48117; kill-test respawns in ~3s with log `Tracked Apex pid=… died — terminating stray … before respawn`. Cap remediate at 08:40:26; acceptance gate PASS (163 pytest).
+
+**Next:** Monitor supervisor through dashboard Start/Stop; soak cap cooldown cycle.

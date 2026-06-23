@@ -33,6 +33,8 @@ ContextStream MCP is **disabled**. Use the in-repo Karpathy-style wiki as persis
 
 Append to `## Session Log` via `append_session_log()` — what changed, validation, **Next** step.
 
+**Before sign-off:** run `.venv/bin/python scripts/acceptance_gate.py --scope full` — see `.cursor/skills/ip4-definition-of-done/SKILL.md`. Exit 1 = not done.
+
 ## Operator actions
 
 When the user asks to start/stop/fix the stack: **the agent runs commands** — do not dump shell recipes unless they explicitly want them.

@@ -524,6 +524,27 @@ def migrate_trader_health(conn) -> bool:
     return changed
 
 
+def migrate_trader_health_trading_activity(conn) -> bool:
+    """Add trading activity columns to trader_health."""
+    changed = False
+    columns = [
+        ("dominant_block_reason", "TEXT"),
+        ("minutes_since_last_fill", "REAL"),
+        ("zero_fill_streak", "INTEGER NOT NULL DEFAULT 0"),
+        ("trading_status", "TEXT NOT NULL DEFAULT 'IDLE'"),
+    ]
+    for name, col_type in columns:
+        if _column_exists(conn, "trader_health", name):
+            continue
+        try:
+            conn.execute(f"ALTER TABLE trader_health ADD COLUMN {name} {col_type}")
+            changed = True
+        except Exception as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
+    return changed
+
+
 def migrate_portfolio_snapshots(conn) -> bool:
     changed = False
     if not _table_exists(conn, "portfolio_snapshots"):
@@ -1137,6 +1158,8 @@ def migrate_connection(conn, label: str, *, quiet: bool = False) -> None:
         changes.append("execution_controls")
     if migrate_trader_health(conn):
         changes.append("trader_health")
+    if migrate_trader_health_trading_activity(conn):
+        changes.append("trader_health.trading_activity")
     if migrate_portfolio_snapshots(conn):
         changes.append("portfolio_snapshots")
     if migrate_portfolio_snapshots_total_capital_injected(conn):

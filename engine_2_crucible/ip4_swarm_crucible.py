@@ -79,18 +79,22 @@ def parse_backtest_output(stdout: str) -> tuple[float | None, int | None]:
 
 def _sanity_check_proposal(proposed: str, *, min_trades: int = 5) -> tuple[bool, str]:
     """Reject proposals that never trade on recent replay-shaped states."""
-    from engine_1_apex.gateway import PaperGateway
+    from database.resolved_corpus_bootstrap import ensure_resolved_corpus
+    from engine_2_crucible.backtest_corpus import flatten_exhaust_rows
     from engine_2_crucible.strategy_loader import load_evaluate_market_from_source
-    from engine_2_crucible.val_bpb_backtest import _flatten_exhaust_rows
 
     evaluate = load_evaluate_market_from_source(proposed)
-    conn = PaperGateway().get_client()
+    conn = open_replica()
     try:
-        samples = _flatten_exhaust_rows(conn, 500, use_mock=False)
+        ensure_resolved_corpus(conn, commit=True)
+        samples = flatten_exhaust_rows(conn, 500, use_mock=False)
     finally:
         conn.close()
     if not samples:
-        return False, "no resolved replay samples (markets_ledger.is_resolved=1 required)"
+        return (
+            False,
+            "no resolved replay samples (backtest_resolution_value or is_resolved label required)",
+        )
 
     trades = 0
     for state, _resolution in samples[:500]:
@@ -433,6 +437,10 @@ class AutoResearchCrucible:
                 )
                 conn.commit()
                 logging.info("KEEP v%d — pushed strategy to Turso (score=%.4f)", version, score)
+                logging.info(
+                    "KEEP v%d — awaiting Apex reload; monitor next ticks for edge_reject_rate",
+                    version,
+                )
             finally:
                 conn.close()
         request_cloud_sync("crucible_strategy_keep")
@@ -542,6 +550,19 @@ class AutoResearchCrucible:
         )
 
         if score > best_score:
+            from engine_2_crucible.live_replay_gate import replay_fill_eligibility
+
+            replay = replay_fill_eligibility(proposed)
+            if not replay.passed:
+                STRATEGY_PATH.write_text(winner_code, encoding="utf-8")
+                self._revert_strategy(
+                    f"Replay edge gate failed: {replay.detail} "
+                    f"(need>={os.getenv('AUTORESEARCH_MIN_REPLAY_FILL_ELIGIBLE', '5')} "
+                    f"fill-eligible, reject_rate<="
+                    f"{os.getenv('AUTORESEARCH_MAX_REPLAY_EDGE_REJECT_RATE', '0.5')})"
+                )
+                return
+
             live_signals, live_markets = _count_live_signals(proposed)
             fill_eligible, _, _ = _count_live_fill_eligible(proposed)
             min_live = int(os.getenv("AUTORESEARCH_MIN_LIVE_SIGNALS", "1"))

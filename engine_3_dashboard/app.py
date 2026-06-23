@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import sys
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -16,7 +16,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from engine_3_dashboard.processes import (
     engine_runtime_warnings,
-    ensure_apex_running,
     ensure_crucible_running,
     ensure_supervisor_running,
     fetch_engine_processes,
@@ -90,6 +89,7 @@ def _init_session_state() -> None:
         "auto_refresh": True,
         "wallet_reset_notice": None,
         "engine_notice": None,
+        "last_dashboard_refresh": datetime.now(timezone.utc),
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -154,6 +154,28 @@ def render_page() -> None:
                 st.rerun()
 
     st.markdown("---")
+    st.subheader("System Status")
+    infra_banner, trading_banner = st.columns(2)
+    with infra_banner:
+        if trader_status["ready"]:
+            st.success("INFRA ALIVE")
+        else:
+            st.error("INFRA BLOCKED")
+            for blocker in trader_status["infra_blockers"]:
+                st.caption(blocker)
+    with trading_banner:
+        if trader_status["trading_blockers"]:
+            st.error("TRADING STALLED")
+            for blocker in trader_status["trading_blockers"]:
+                st.caption(blocker)
+        elif trader_status.get("trading_warnings"):
+            st.warning("TRADING CAUTION")
+            for warning in trader_status["trading_warnings"]:
+                st.caption(warning)
+        elif trader_status.get("trading_ready", True):
+            st.success("TRADING ACTIVE")
+
+    st.markdown("---")
     st.subheader("Trader Status")
     status_col1, status_col2 = st.columns(2)
     with status_col1:
@@ -161,13 +183,50 @@ def render_page() -> None:
         st.write(f"**Target mode:** {trader_status['target_mode']}")
         st.write(f"**Apex state:** {trader_status['apex_state']}")
     with status_col2:
-        if trader_status["blockers"]:
-            for blocker in trader_status["blockers"]:
+        if trader_status["infra_blockers"]:
+            st.caption("Infra blockers:")
+            for blocker in trader_status["infra_blockers"]:
                 st.warning(blocker)
-        else:
-            st.success("Trader ready — Apex can execute ticks.")
+        elif trader_status["ready"]:
+            st.success("Infra ready — processes and controls OK.")
+        if trader_status.get("trading_warnings"):
+            st.caption("Trading warnings:")
+            for warning in trader_status["trading_warnings"]:
+                st.warning(warning)
+        if trader_status["trading_blockers"]:
+            st.caption("Trading blockers:")
+            for blocker in trader_status["trading_blockers"]:
+                st.error(blocker)
+        elif trader_status.get("trading_ready", True):
+            st.success("Trading active — no stall detected.")
 
     if trader_health:
+        st.markdown("---")
+        st.subheader("Trading Activity")
+        ts = trader_health.get("trading_status", "IDLE")
+        streak = trader_health.get("zero_fill_streak", 0)
+        msf = trader_health.get("minutes_since_last_fill")
+        block = trader_health.get("dominant_block_reason") or "—"
+        t1, t2, t3, t4 = st.columns(4)
+        with t1:
+            if ts == "ACTIVE":
+                st.success(f"Trading: {ts}")
+            elif ts == "STALLED":
+                st.error(f"Trading: {ts}")
+            elif ts == "STARVED":
+                st.warning(f"Trading: {ts}")
+            else:
+                st.info(f"Trading: {ts}")
+        with t2:
+            st.metric("Zero-fill streak", int(streak))
+        with t3:
+            if msf is not None:
+                st.metric("Min since fill", f"{float(msf):.1f}")
+            else:
+                st.metric("Min since fill", "—")
+        with t4:
+            st.metric("Block reason", str(block))
+
         st.markdown("---")
         st.subheader("Wallet Health")
         h1, h2, h3, h4 = st.columns(4)
@@ -180,17 +239,18 @@ def render_page() -> None:
             else:
                 st.error(f"Status: {status}")
         with h2:
-            st.metric("Stoppage streak", trader_health.get("consecutive_stoppage_ticks", 0))
+            st.metric("Stoppage streak", int(trader_health.get("consecutive_stoppage_ticks", 0)))
         with h3:
-            st.metric("Last tick signals", trader_health.get("signals_last_tick", 0))
+            st.metric("Last tick signals", int(trader_health.get("signals_last_tick", 0)))
         with h4:
-            st.metric("Last tick fills", trader_health.get("filled_last_tick", 0))
+            st.metric("Last tick fills", int(trader_health.get("filled_last_tick", 0)))
         kind = trader_health.get("stoppage_kind")
         if kind:
             st.warning(f"**{kind}:** {trader_health.get('detail', '')}")
         cap = trader_health.get("cap_reasons") or {}
         if cap:
-            st.caption(f"Cap reasons (last tick): {cap}")
+            parts = [f"{key}={value}" for key, value in sorted(cap.items())]
+            st.caption(f"Cap reasons (last tick): {', '.join(parts)}")
         updated = trader_health.get("updated_at")
         if updated:
             st.caption(f"Health updated: {updated}")
@@ -199,17 +259,29 @@ def render_page() -> None:
 
     st.markdown("---")
     st.subheader("Trader Wallet")
-    wallet_col1, wallet_col2, wallet_col3, wallet_col4, wallet_col5 = st.columns(5)
+    session_capital = portfolio.get("session_capital", portfolio.get("total_capital_injected", 0.0))
+    session_pnl = portfolio.get("session_pnl", 0.0)
+    session_return = portfolio.get("session_return_pct", 0.0)
+    lifetime_injected = portfolio.get("total_capital_injected", 0.0)
+    lifetime_pnl = portfolio.get("true_pnl", 0.0)
+    wallet_col1, wallet_col2, wallet_col3, wallet_col4, wallet_col5, wallet_col6 = st.columns(6)
     with wallet_col1:
         st.metric("Total NAV (USD)", f"${portfolio['total_nav']:,.2f}")
     with wallet_col2:
-        st.metric("True PnL (USD)", f"${portfolio.get('true_pnl', 0.0):,.2f}")
+        st.metric("Session Start", f"${session_capital:,.2f}")
     with wallet_col3:
-        st.metric("Cash (Wallet)", f"${portfolio['cash']:,.2f}")
+        st.metric("Session PnL (USD)", f"${session_pnl:,.2f}")
     with wallet_col4:
-        st.metric("Held Assets (MTM)", f"${portfolio['position_value']:,.2f}")
+        st.metric("Session Return", f"{session_return:.1f}%")
     with wallet_col5:
-        st.metric("Mode", portfolio["execution_mode"])
+        st.metric("Cash (Wallet)", f"${portfolio['cash']:,.2f}")
+    with wallet_col6:
+        st.metric("Held Assets (MTM)", f"${portfolio['position_value']:,.2f}")
+    st.caption(
+        f"Execution mode: {portfolio['execution_mode']} · "
+        f"Lifetime capital injected ${lifetime_injected:,.2f} · "
+        f"Lifetime true PnL ${lifetime_pnl:,.2f}"
+    )
 
     btn_refresh, btn_reset, btn_auto = st.columns([1, 1, 2])
     with btn_refresh:
@@ -250,15 +322,18 @@ def render_page() -> None:
     history = portfolio.get("history") or []
     if history:
         chart_df = pd.DataFrame(history)
-        chart_df["captured_at"] = pd.to_datetime(chart_df["captured_at"], errors="coerce")
-        chart_df = chart_df.set_index("captured_at").sort_index()
-        st.line_chart(
-            chart_df[["cash", "position_value", "total_nav"]],
-            height=360,
-        )
-        st.caption(
-            f"Timeline: cash (green), held assets mark-to-market (blue), total NAV (orange) — agent {APEX_AGENT_ID}"
-        )
+        chart_df["captured_at"] = pd.to_datetime(chart_df["captured_at"], errors="coerce", utc=True)
+        chart_df = chart_df.dropna(subset=["captured_at"]).set_index("captured_at").sort_index()
+        if not chart_df.empty:
+            st.line_chart(
+                chart_df[["total_nav", "cash", "position_value"]],
+                height=360,
+            )
+            st.caption(
+                f"Current session — total NAV, cash, and held assets (MTM) for {APEX_AGENT_ID}"
+            )
+        else:
+            st.info("Portfolio history timestamps could not be parsed.")
     else:
         st.info("No portfolio history yet. Start Apex or click Refresh Chart.")
 
@@ -267,6 +342,11 @@ def render_page() -> None:
 
     with col1:
         st.subheader("Apex Edge")
+        sup_pid = engine_processes.get("supervisor")
+        if sup_pid:
+            st.caption(f"Supervisor pid {sup_pid}")
+        else:
+            st.error("Supervisor not running — engines will not auto-restart")
         st.metric("DB state", controls.get("apex_state", "RUNNING"))
         apex_pid = engine_processes.get("apex")
         if apex_pid:
@@ -275,19 +355,27 @@ def render_page() -> None:
             st.error("Process not running")
         a1, a2 = st.columns(2)
         with a1:
-            if st.button("Start Apex"):
-                _with_conn(lambda c: set_apex_state(c, "RUNNING"))
-                note = ensure_apex_running() or ensure_supervisor_running()
-                if note:
-                    st.session_state.engine_notice = note
+            supervisor_alive = engine_processes.get("supervisor") is not None
+            if st.button("Start Apex", disabled=supervisor_alive):
+                if supervisor_alive:
+                    st.session_state.engine_notice = (
+                        "Supervisor is running — it manages Apex. Stop supervisor first to spawn directly."
+                    )
+                else:
+                    st.error("Direct Apex spawn disabled — start Supervisor instead.")
                 st.rerun()
+            elif supervisor_alive:
+                st.caption("Apex managed by supervisor")
         with a2:
             if st.button("Stop Apex"):
                 _with_conn(lambda c: set_apex_state(c, "DRAIN_AND_HALT"))
                 st.rerun()
-        if st.button("Start Supervisor (recommended)"):
+        if st.button("Start Supervisor (recommended)", type="primary"):
             note = ensure_supervisor_running(with_dashboard=True)
-            st.session_state.engine_notice = note or "Supervisor already running."
+            sup = fetch_engine_processes().get("supervisor")
+            st.session_state.engine_notice = (
+                note or f"Supervisor already running (pid {sup})."
+            )
             st.rerun()
 
     with col2:
@@ -300,12 +388,17 @@ def render_page() -> None:
             st.error("Process not running")
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("Start Crucible"):
-                _with_conn(lambda c: set_crucible_state(c, "RUNNING"))
-                note = ensure_crucible_running()
-                if note:
-                    st.session_state.engine_notice = note
+            supervisor_alive = engine_processes.get("supervisor") is not None
+            if st.button("Start Crucible", disabled=supervisor_alive):
+                if supervisor_alive:
+                    st.session_state.engine_notice = (
+                        "Supervisor is running — it manages Crucible."
+                    )
+                else:
+                    st.error("Direct Crucible spawn disabled — start Supervisor instead.")
                 st.rerun()
+            elif supervisor_alive:
+                st.caption("Crucible managed by supervisor")
         with c2:
             if st.button("Stop Crucible"):
                 _with_conn(lambda c: set_crucible_state(c, "HALTED"))
@@ -359,14 +452,19 @@ def render_page() -> None:
         st.caption("Auto-refresh paused while a confirmation dialog is open.")
 
 
-@st.fragment(run_every=timedelta(seconds=5))
-def _live_refresh() -> None:
-    render_page()
+def _maybe_autorefresh() -> None:
+    if not st.session_state.auto_refresh or _confirm_dialog_open():
+        return
+    now = datetime.now(timezone.utc)
+    last = st.session_state.get("last_dashboard_refresh")
+    if last is None or now - last >= timedelta(seconds=5):
+        st.session_state.last_dashboard_refresh = now
+        st.rerun()
 
 
 _init_session_state()
+if "last_dashboard_refresh" not in st.session_state:
+    st.session_state.last_dashboard_refresh = datetime.now(timezone.utc)
 
-if st.session_state.auto_refresh and not _confirm_dialog_open():
-    _live_refresh()
-else:
-    render_page()
+render_page()
+_maybe_autorefresh()

@@ -158,6 +158,8 @@ def test_effective_min_net_edge_live_execution(monkeypatch):
     monkeypatch.setenv("EXECUTION_MODE", "live")
     monkeypatch.setenv("APEX_PAPER_MIN_NET_EDGE", "0.008")
     monkeypatch.setenv("APEX_MIN_NET_EDGE", "0.015")
+    monkeypatch.delenv("APEX_EDGE_MODE", raising=False)
+    monkeypatch.delenv("CRUCIBLE_EXPLORATION", raising=False)
     from engine_1_apex.sizing import effective_min_net_edge
 
     assert effective_min_net_edge() == pytest.approx(0.015)

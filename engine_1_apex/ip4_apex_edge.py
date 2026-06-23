@@ -66,7 +66,12 @@ from engine_1_apex.risk_daemon import RiskDaemon
 from engine_1_apex.stoppage import (
     StoppageTracker,
     TickStats,
+    cap_stall_entry_cooldown_seconds,
+    cap_stall_remediate_ticks,
+    derive_dominant_block_reason,
+    derive_trading_status,
     persist_trader_health,
+    remediate_cap_stall,
     remediate_stoppage,
     stoppage_threshold_ticks,
 )
@@ -97,6 +102,9 @@ APEX_MAX_POSITION_PCT = float(os.getenv("APEX_MAX_POSITION_PCT", "0.15"))
 APEX_LIQUIDITY_FLOOR = float(os.getenv("APEX_LIQUIDITY_FLOOR", "50000.0"))
 APEX_MIN_LADDER_USD = float(os.getenv("APEX_MIN_LADDER_USD", "5.0"))
 APEX_CLOSE_ON_HOLD = os.getenv("APEX_CLOSE_ON_HOLD", "true").lower() in ("true", "1", "yes")
+APEX_HOLD_CLOSE_TICKS = int(os.getenv("APEX_HOLD_CLOSE_TICKS", "3"))
+APEX_MIN_HOLD_SECONDS = int(os.getenv("APEX_MIN_HOLD_SECONDS", "60"))
+APEX_REMEDIATE_COOLDOWN_SECONDS = int(os.getenv("APEX_REMEDIATE_COOLDOWN_SECONDS", "120"))
 _APEX_MAX_LADDER_LEGS = int(os.getenv("APEX_MAX_LADDER_LEGS", "3"))
 APEX_MAX_LADDER_LEGS = _APEX_MAX_LADDER_LEGS
 _per_market_raw = os.getenv("APEX_MAX_LEGS_PER_MARKET", "").strip()
@@ -188,6 +196,8 @@ class ApexEdgeEngine:
         self._signals_enabled = True
         self._mode_swap_in_progress = False
         self._stoppage = StoppageTracker()
+        self._hold_streak: dict[str, int] = {}
+        self._remediate_cooldown_until: dict[str, float] = {}
 
     def _validate_live_credentials(self) -> None:
         if not os.getenv("ALCHEMY_API_KEY", "").strip() and not os.getenv(
@@ -345,6 +355,11 @@ class ApexEdgeEngine:
                     seed_conn.commit()
                 finally:
                     seed_conn.close()
+
+                from database.trader_health_store import read_trader_health
+
+                agent_id = os.getenv("APEX_AGENT_ID", "APEX_EDGE")
+                self._stoppage.hydrate(read_trader_health(conn, agent_id=agent_id))
             finally:
                 conn.close()
 
@@ -465,10 +480,12 @@ class ApexEdgeEngine:
                 skipped_cap = 0
                 skipped_cooldown = 0
                 skipped_edge = 0
+                skipped_already_positioned = 0
                 skipped_hold = 0
                 evaluated = 0
                 signals = 0
                 cap_reasons: dict[str, int] = {}
+                cap_stall_rows: list[tuple[str, str, float, str]] = []
                 for market_id, data in market_data.items():
                     if not isinstance(data, dict):
                         continue
@@ -489,49 +506,94 @@ class ApexEdgeEngine:
                     evaluated += 1
                     if decision == "HOLD":
                         skipped_hold += 1
+                        self._hold_streak[market_id] = self._hold_streak.get(market_id, 0) + 1
                         if APEX_CLOSE_ON_HOLD:
-                            open_dir = conn.execute(
+                            open_row = conn.execute(
                                 """
-                                SELECT 1 FROM trade_execution
+                                SELECT committed_at FROM trade_execution
                                 WHERE agent_id = ? AND market_id = ? AND status = 'OPEN'
                                 LIMIT 1
                                 """,
                                 (APEX_AGENT_ID, market_id),
                             ).fetchone()
-                            if open_dir:
-                                category = state.get("category", "")
-                                mid = float(state.get("mid_price", 0.5))
-                                n_closed = close_agent_market_positions(
-                                    conn,
-                                    agent_id=APEX_AGENT_ID,
-                                    market_id=market_id,
-                                    category=category,
-                                    market_mid=mid,
-                                    liquidity_tier=liq_tier,
-                                    exit_reason="THESIS_EXPIRED",
-                                )
-                                if n_closed:
-                                    closed_flip += n_closed
-                                    sizing = load_agent_sizing_snapshot(conn, APEX_AGENT_ID)
-                                    if sizing:
-                                        cash = sizing["cash"]
-                                        nav = sizing["nav"]
-                                        open_notional = sizing["open_notional"]
+                            if open_row:
+                                hold_streak = self._hold_streak[market_id]
+                                min_hold_ok = True
+                                if open_row[0] and APEX_MIN_HOLD_SECONDS > 0:
+                                    from datetime import datetime, timezone
+
+                                    try:
+                                        opened = datetime.fromisoformat(
+                                            str(open_row[0]).replace("Z", "+00:00")
+                                        )
+                                        if opened.tzinfo is None:
+                                            opened = opened.replace(tzinfo=timezone.utc)
+                                        age_s = (
+                                            datetime.now(timezone.utc) - opened
+                                        ).total_seconds()
+                                        min_hold_ok = age_s >= APEX_MIN_HOLD_SECONDS
+                                    except ValueError:
+                                        min_hold_ok = True
+                                if hold_streak >= APEX_HOLD_CLOSE_TICKS and min_hold_ok:
+                                    category = state.get("category", "")
+                                    mid = float(state.get("mid_price", 0.5))
+                                    n_closed = close_agent_market_positions(
+                                        conn,
+                                        agent_id=APEX_AGENT_ID,
+                                        market_id=market_id,
+                                        category=category,
+                                        market_mid=mid,
+                                        liquidity_tier=liq_tier,
+                                        exit_reason="THESIS_EXPIRED",
+                                    )
+                                    if n_closed:
+                                        closed_flip += n_closed
+                                        self._hold_streak.pop(market_id, None)
+                                        sizing = load_agent_sizing_snapshot(
+                                            conn, APEX_AGENT_ID
+                                        )
+                                        if sizing:
+                                            cash = sizing["cash"]
+                                            nav = sizing["nav"]
+                                            open_notional = sizing["open_notional"]
+                                        logger.info(
+                                            "APEX CLOSE thesis_expired: %s closed %d leg(s)",
+                                            market_id,
+                                            n_closed,
+                                        )
+                                elif open_row:
                                     logger.info(
-                                        "APEX CLOSE thesis_expired: %s closed %d leg(s)",
+                                        "APEX HOLD hysteresis: %s hold_streak=%d/%d — keeping position",
                                         market_id,
-                                        n_closed,
+                                        hold_streak,
+                                        APEX_HOLD_CLOSE_TICKS,
                                     )
                         continue
 
-                    signals += 1
+                    self._hold_streak.pop(market_id, None)
+
+                    cooldown_until = self._remediate_cooldown_until.get(market_id, 0.0)
+                    if time.monotonic() < cooldown_until:
+                        skipped_cooldown += 1
+                        continue
+
                     signal_direction = "YES" if decision == "BUY_YES" else "NO"
                     if count_open_legs(conn, APEX_AGENT_ID, market_id) >= APEX_MAX_LEGS_PER_MARKET:
-                        skipped_cap += 1
+                        skipped_already_positioned += 1
                         cap_reasons["max_legs_per_market"] = (
                             cap_reasons.get("max_legs_per_market", 0) + 1
                         )
+                        cap_stall_rows.append(
+                            (
+                                market_id,
+                                state.get("category", ""),
+                                float(state.get("mid_price", 0.5)),
+                                liq_tier,
+                            )
+                        )
                         continue
+
+                    signals += 1
 
                     open_dir = conn.execute(
                         """
@@ -762,6 +824,7 @@ class ApexEdgeEngine:
                     skipped_hold=skipped_hold,
                     skipped_cooldown=skipped_cooldown,
                     skipped_edge=skipped_edge,
+                    skipped_already_positioned=skipped_already_positioned,
                     evaluated=evaluated,
                     signals=signals,
                     closed_rebalance=closed_rebalance,
@@ -771,6 +834,42 @@ class ApexEdgeEngine:
                     min_ladder_usd=APEX_MIN_LADDER_USD,
                     cap_reasons=cap_reasons,
                 )
+                if (
+                    self._stoppage.cap_blocked_streak >= cap_stall_remediate_ticks()
+                    and derive_dominant_block_reason(tick_stats) == "cap_blocked"
+                    and cap_reasons.get("max_legs_per_market")
+                ):
+                    cap_stall_targets = [
+                        row
+                        for row in cap_stall_rows
+                        if time.monotonic()
+                        >= self._remediate_cooldown_until.get(row[0], 0.0)
+                    ]
+                    n_cap = remediate_cap_stall(
+                        conn,
+                        agent_id=APEX_AGENT_ID,
+                        cap_blocked_streak=self._stoppage.cap_blocked_streak,
+                        cap_reasons=cap_reasons,
+                        market_rows=cap_stall_targets,
+                    )
+                    if n_cap:
+                        tick_stats.closed_rebalance += n_cap
+                        closed_rebalance += n_cap
+                        for mid, _, _, _ in cap_stall_targets[:1]:
+                            self._remediate_cooldown_until[mid] = (
+                                time.monotonic() + cap_stall_entry_cooldown_seconds()
+                            )
+                        sizing = load_agent_sizing_snapshot(conn, APEX_AGENT_ID)
+                        if sizing:
+                            cash = sizing["cash"]
+                            nav = sizing["nav"]
+                            open_notional = sizing["open_notional"]
+                            tick_stats.cash = cash
+                            tick_stats.nav = nav
+                        logger.warning(
+                            "APEX CAP STALL remediate: closed %d leg(s) on max_legs_per_market",
+                            n_cap,
+                        )
                 status, kind, detail, consecutive = self._stoppage.observe(tick_stats)
                 if kind == "CAPITAL_STARVATION":
                     rebalance_rows: list[tuple[str, str, float, str]] = []
@@ -810,6 +909,10 @@ class ApexEdgeEngine:
                     )
                     if n_rem:
                         closed_rebalance += n_rem
+                        for mid, _, _, _ in rebalance_rows:
+                            self._remediate_cooldown_until[mid] = (
+                                time.monotonic() + APEX_REMEDIATE_COOLDOWN_SECONDS
+                            )
                         sizing = load_agent_sizing_snapshot(conn, APEX_AGENT_ID)
                         if sizing:
                             cash = sizing["cash"]

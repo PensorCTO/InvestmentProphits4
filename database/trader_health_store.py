@@ -14,33 +14,26 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def read_trader_health(conn, *, agent_id: str) -> dict | None:
-    row = conn.execute(
-        """
-        SELECT agent_id, status, stoppage_kind, detail, consecutive_stoppage_ticks,
-               last_fill_at, last_activity_at, signals_last_tick, filled_last_tick,
-               skipped_hold_last_tick, skipped_cap_last_tick, rejected_last_tick,
-               cash, nav, cap_reasons_json, updated_at
-        FROM trader_health
-        WHERE id = ?
-        """,
-        (TRADER_HEALTH_ROW_ID,),
-    ).fetchone()
-    if not row:
-        return None
+def _row_to_dict(row) -> dict:
     cap_reasons = {}
     if row[14]:
         try:
             cap_reasons = json.loads(row[14])
         except json.JSONDecodeError:
             cap_reasons = {}
+    last_fill_at = row[5]
+    minutes_since = float(row[17]) if len(row) > 17 and row[17] is not None else None
+    if minutes_since is None and last_fill_at:
+        from engine_1_apex.stoppage import _minutes_since_iso
+
+        minutes_since = _minutes_since_iso(last_fill_at)
     return {
         "agent_id": row[0],
         "status": row[1],
         "stoppage_kind": row[2],
         "detail": row[3],
         "consecutive_stoppage_ticks": int(row[4] or 0),
-        "last_fill_at": row[5],
+        "last_fill_at": last_fill_at,
         "last_activity_at": row[6],
         "signals_last_tick": int(row[7] or 0),
         "filled_last_tick": int(row[8] or 0),
@@ -51,7 +44,30 @@ def read_trader_health(conn, *, agent_id: str) -> dict | None:
         "nav": float(row[13] or 0),
         "cap_reasons": cap_reasons,
         "updated_at": row[15],
+        "dominant_block_reason": row[16] if len(row) > 16 else None,
+        "minutes_since_last_fill": minutes_since,
+        "zero_fill_streak": int(row[18] or 0) if len(row) > 18 else 0,
+        "trading_status": row[19] if len(row) > 19 else "IDLE",
     }
+
+
+def read_trader_health(conn, *, agent_id: str) -> dict | None:
+    row = conn.execute(
+        """
+        SELECT agent_id, status, stoppage_kind, detail, consecutive_stoppage_ticks,
+               last_fill_at, last_activity_at, signals_last_tick, filled_last_tick,
+               skipped_hold_last_tick, skipped_cap_last_tick, rejected_last_tick,
+               cash, nav, cap_reasons_json, updated_at,
+               dominant_block_reason, minutes_since_last_fill, zero_fill_streak,
+               trading_status
+        FROM trader_health
+        WHERE id = ?
+        """,
+        (TRADER_HEALTH_ROW_ID,),
+    ).fetchone()
+    if not row:
+        return None
+    return _row_to_dict(row)
 
 
 def write_trader_health(
@@ -72,6 +88,10 @@ def write_trader_health(
     cash: float = 0.0,
     nav: float = 0.0,
     cap_reasons: dict | None = None,
+    dominant_block_reason: str | None = None,
+    minutes_since_last_fill: float | None = None,
+    zero_fill_streak: int = 0,
+    trading_status: str = "IDLE",
     commit: bool = True,
 ) -> None:
     now = _utc_now_iso()
@@ -81,8 +101,9 @@ def write_trader_health(
         (id, agent_id, status, stoppage_kind, detail, consecutive_stoppage_ticks,
          last_fill_at, last_activity_at, signals_last_tick, filled_last_tick,
          skipped_hold_last_tick, skipped_cap_last_tick, rejected_last_tick,
-         cash, nav, cap_reasons_json, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         cash, nav, cap_reasons_json, updated_at,
+         dominant_block_reason, minutes_since_last_fill, zero_fill_streak, trading_status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             agent_id = excluded.agent_id,
             status = excluded.status,
@@ -99,7 +120,13 @@ def write_trader_health(
             cash = excluded.cash,
             nav = excluded.nav,
             cap_reasons_json = excluded.cap_reasons_json,
-            updated_at = excluded.updated_at
+            updated_at = excluded.updated_at,
+            dominant_block_reason = excluded.dominant_block_reason,
+            minutes_since_last_fill = COALESCE(
+                excluded.minutes_since_last_fill, trader_health.minutes_since_last_fill
+            ),
+            zero_fill_streak = excluded.zero_fill_streak,
+            trading_status = excluded.trading_status
         """,
         (
             TRADER_HEALTH_ROW_ID,
@@ -119,6 +146,10 @@ def write_trader_health(
             nav,
             json.dumps(cap_reasons or {}),
             now,
+            dominant_block_reason,
+            minutes_since_last_fill,
+            zero_fill_streak,
+            trading_status,
         ),
     )
     if commit:

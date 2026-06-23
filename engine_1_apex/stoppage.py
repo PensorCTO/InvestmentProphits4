@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from database.trader_health_store import write_trader_health
 from engine_1_apex.trade_close import (
@@ -21,6 +22,7 @@ class TickStats:
     skipped_hold: int = 0
     skipped_cooldown: int = 0
     skipped_edge: int = 0
+    skipped_already_positioned: int = 0
     evaluated: int = 0
     signals: int = 0
     closed_rebalance: int = 0
@@ -33,6 +35,81 @@ class TickStats:
 
 def stoppage_threshold_ticks() -> int:
     return int(os.getenv("APEX_STOPPAGE_TICKS", "6"))
+
+
+def trading_stall_ticks() -> int:
+    return int(os.getenv("APEX_TRADING_STALL_TICKS", "18"))
+
+
+def cap_stall_remediate_ticks() -> int:
+    return int(os.getenv("APEX_CAP_STALL_REMEDIATE_TICKS", "18"))
+
+
+def cap_stall_entry_cooldown_seconds() -> int:
+    return int(os.getenv("APEX_CAP_STALL_ENTRY_COOLDOWN_SECONDS", "600"))
+
+
+def actionable_unfilled_signals(stats: TickStats) -> int:
+    """Signals that could still fill this tick (exclude edge-gated)."""
+    if stats.filled > 0:
+        return 0
+    return max(0, stats.signals - stats.skipped_edge)
+
+
+def is_cap_stall_tick(stats: TickStats) -> bool:
+    """Persistent max_legs_per_market block with no fill or close this tick."""
+    if stats.filled > 0 or stats.closed_rebalance > 0 or stats.closed_flip > 0:
+        return False
+    return bool((stats.cap_reasons or {}).get("max_legs_per_market"))
+
+
+def _minutes_since_iso(iso: str | None) -> float | None:
+    if not iso:
+        return None
+    try:
+        ts = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - ts).total_seconds() / 60.0
+    except ValueError:
+        return None
+
+
+def derive_dominant_block_reason(stats: TickStats) -> str:
+    """Primary reason the wallet did not fill this tick."""
+    if stats.filled > 0 or stats.closed_flip > 0:
+        return "activity"
+    if stats.evaluated > 0 and stats.skipped_hold >= stats.evaluated:
+        return "all_hold"
+    cap_keys = stats.cap_reasons or {}
+    if stats.skipped_cap > 0 or cap_keys:
+        return "cap_blocked"
+    if stats.signals > 0 and stats.skipped_edge >= stats.signals:
+        return "edge_gated"
+    if stats.signals > 0 and stats.rejected > 0:
+        return "execution_rejected"
+    if stats.signals == 0:
+        return "none"
+    return "none"
+
+
+def derive_trading_status(
+    stats: TickStats,
+    *,
+    zero_fill_streak: int,
+) -> str:
+    """Trading activity status — independent of infra/stoppage status."""
+    if stats.filled > 0 or stats.closed_flip > 0:
+        return "ACTIVE"
+    if stats.closed_rebalance > 0:
+        return "ACTIVE"
+    if stats.evaluated > 0 and stats.skipped_hold >= stats.evaluated:
+        return "STARVED"
+    if actionable_unfilled_signals(stats) > 0 and zero_fill_streak >= trading_stall_ticks():
+        return "STALLED"
+    if stats.signals > 0:
+        return "IDLE"
+    return "IDLE"
 
 
 def classify_stoppage(stats: TickStats) -> tuple[str | None, str]:
@@ -53,12 +130,21 @@ def classify_stoppage(stats: TickStats) -> tuple[str | None, str]:
         blocked = stats.rejected + stats.skipped_cap
         if blocked >= actionable_signals:
             cap_keys = stats.cap_reasons or {}
+            if (
+                stats.cash >= stats.min_ladder_usd
+                and not cap_keys.get("min_ladder")
+                and not cap_keys.get("position_cap")
+                and (
+                    stats.skipped_edge >= stats.rejected
+                    or cap_keys.get("max_legs_per_market")
+                    or cap_keys.get("max_legs")
+                )
+            ):
+                return None, "deployed_or_edge_gated"
             capital_block = stats.skipped_cap > 0 and (
                 stats.cash < stats.min_ladder_usd
                 or cap_keys.get("min_ladder", 0) > 0
                 or cap_keys.get("position_cap", 0) > 0
-                or cap_keys.get("max_legs", 0) > 0
-                or cap_keys.get("max_legs_per_market", 0) > 0
             )
             if capital_block:
                 return (
@@ -80,6 +166,20 @@ class StoppageTracker:
         self.consecutive: int = 0
         self.last_fill_monotonic: float | None = None
         self.last_kind: str | None = None
+        self.zero_fill_streak: int = 0
+        self.cap_blocked_streak: int = 0
+        self.last_fill_at_iso: str | None = None
+
+    def hydrate(self, health: dict | None) -> None:
+        """Restore streak/fill timestamps from DB after Apex restart."""
+        if not health:
+            return
+        last_fill = health.get("last_fill_at")
+        if last_fill:
+            self.last_fill_at_iso = str(last_fill)
+        streak = health.get("zero_fill_streak")
+        if streak is not None:
+            self.zero_fill_streak = int(streak)
 
     def observe(self, stats: TickStats) -> tuple[str, str | None, str, int]:
         """
@@ -89,6 +189,21 @@ class StoppageTracker:
         kind, detail = classify_stoppage(stats)
         if stats.filled > 0:
             self.last_fill_monotonic = time.monotonic()
+            self.last_fill_at_iso = (
+                datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+            )
+            self.zero_fill_streak = 0
+        elif stats.closed_flip > 0 or stats.closed_rebalance > 0:
+            self.zero_fill_streak = 0
+        elif actionable_unfilled_signals(stats) > 0:
+            self.zero_fill_streak += 1
+        else:
+            self.zero_fill_streak = 0
+
+        if is_cap_stall_tick(stats):
+            self.cap_blocked_streak += 1
+        else:
+            self.cap_blocked_streak = 0
 
         if kind is None:
             self.consecutive = 0
@@ -111,6 +226,11 @@ class StoppageTracker:
         else:
             status = "HEALTHY"
         return status, kind, detail, self.consecutive
+
+    def minutes_since_last_fill(self) -> float | None:
+        if self.last_fill_monotonic is not None:
+            return (time.monotonic() - self.last_fill_monotonic) / 60.0
+        return _minutes_since_iso(self.last_fill_at_iso)
 
 
 def remediate_stoppage(
@@ -140,26 +260,11 @@ def remediate_stoppage(
 
     position_cap = nav * max_position_pct
     closed = 0
-    per_market_cap = max_legs_per_market if max_legs_per_market is not None else max_ladder_legs
-    max_legs_hit = bool((cap_reasons or {}).get("max_legs_per_market")) or bool(
-        (cap_reasons or {}).get("max_legs")
-    )
+
+    if (cap_reasons or {}).get("max_legs_per_market") or (cap_reasons or {}).get("max_legs"):
+        return 0
 
     for market_id, category, market_mid, liq_tier in market_rows:
-        legs = count_open_legs(conn, agent_id, market_id)
-        if max_legs_hit and legs >= per_market_cap:
-            if close_smallest_market_leg(
-                conn,
-                agent_id=agent_id,
-                market_id=market_id,
-                category=category,
-                market_mid=market_mid,
-                liquidity_tier=liq_tier,
-                exit_reason="MAX_LEGS_REBALANCE",
-            ):
-                closed += 1
-            continue
-
         exposure = get_agent_market_exposure(conn, agent_id, market_id)
         if exposure <= position_cap - min_ladder_usd:
             continue
@@ -178,6 +283,40 @@ def remediate_stoppage(
     return closed
 
 
+def remediate_cap_stall(
+    conn,
+    *,
+    agent_id: str,
+    cap_blocked_streak: int,
+    cap_reasons: dict[str, int] | None,
+    market_rows: list[tuple[str, str, float, str]],
+) -> int:
+    """
+    Auto-remediate persistent max_legs_per_market cap stalls.
+    Closes the smallest leg on a signaling market. Returns legs closed.
+    market_rows: (market_id, category, market_mid, liquidity_tier)
+    """
+    if cap_blocked_streak < cap_stall_remediate_ticks():
+        return 0
+    if not (cap_reasons or {}).get("max_legs_per_market"):
+        return 0
+
+    from engine_1_apex.trade_close import close_smallest_market_leg
+
+    for market_id, category, market_mid, liq_tier in market_rows:
+        if close_smallest_market_leg(
+            conn,
+            agent_id=agent_id,
+            market_id=market_id,
+            category=category,
+            market_mid=market_mid,
+            liquidity_tier=liq_tier,
+            exit_reason="CAP_STALL_REMEDIATE",
+        ):
+            return 1
+    return 0
+
+
 def persist_trader_health(
     conn,
     *,
@@ -190,20 +329,26 @@ def persist_trader_health(
     consecutive: int,
     commit: bool = False,
 ) -> None:
-    last_fill_at = None
-    if tracker.last_fill_monotonic is not None:
-        from datetime import datetime, timezone
+    dominant_block_reason = derive_dominant_block_reason(stats)
+    trading_status = derive_trading_status(
+        stats, zero_fill_streak=tracker.zero_fill_streak
+    )
+    minutes_since = tracker.minutes_since_last_fill()
+    if minutes_since is None:
+        from database.trader_health_store import read_trader_health
 
-        last_fill_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        existing = read_trader_health(conn, agent_id)
+        iso = (existing or {}).get("last_fill_at") or tracker.last_fill_at_iso
+        minutes_since = _minutes_since_iso(iso)
 
     write_trader_health(
         conn,
         agent_id=agent_id,
         status=status,
-        stoppage_kind=kind,
-        detail=detail if kind else None,
+        stoppage_kind=kind if status != "HEALTHY" or kind == "SIGNAL_STARVATION" else None,
+        detail=detail if kind and (status != "HEALTHY" or kind == "SIGNAL_STARVATION") else None,
         consecutive_stoppage_ticks=consecutive,
-        last_fill_at=last_fill_at if stats.filled > 0 else None,
+        last_fill_at=tracker.last_fill_at_iso if stats.filled > 0 else None,
         signals_last_tick=stats.signals,
         filled_last_tick=stats.filled,
         skipped_hold_last_tick=stats.skipped_hold,
@@ -212,5 +357,9 @@ def persist_trader_health(
         cash=stats.cash,
         nav=stats.nav,
         cap_reasons=stats.cap_reasons,
+        dominant_block_reason=dominant_block_reason,
+        minutes_since_last_fill=minutes_since,
+        zero_fill_streak=tracker.zero_fill_streak,
+        trading_status=trading_status,
         commit=commit,
     )

@@ -212,11 +212,26 @@ def check_markets_seeded() -> None:
         conn.close()
 
 
+def check_oracle_mode() -> None:
+    mocked = os.getenv("EDGE_MODEL_MOCKED", "true").lower() in ("true", "1", "yes")
+    allow_mock = os.getenv("IP4_ALLOW_MOCK_ORACLE", "").lower() in ("true", "1", "yes")
+    if mocked and not allow_mock:
+        fail(
+            "EDGE_MODEL_MOCKED=true — paper runs require live CLOB. "
+            "Set EDGE_MODEL_MOCKED=false or IP4_ALLOW_MOCK_ORACLE=true for offline dev."
+        )
+    elif mocked:
+        warn("EDGE_MODEL_MOCKED=true with IP4_ALLOW_MOCK_ORACLE — synthetic oracle")
+    else:
+        ok("EDGE_MODEL_MOCKED=false — live CLOB oracle")
+
+
 def main() -> None:
     print("IP4 Preflight\n")
     check_env_file()
     check_turso()
     check_sqld_or_turso()
+    check_oracle_mode()
     check_rpc_latency()
     check_deepseek()
     check_strategy_files()

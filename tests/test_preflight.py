@@ -43,3 +43,16 @@ def test_check_rpc_latency_skipped_in_paper_mode(monkeypatch):
         preflight.check_rpc_latency()
 
     assert not preflight.FAILURES
+
+
+def test_check_oracle_mode_fails_without_escape(monkeypatch):
+    monkeypatch.setenv("EDGE_MODEL_MOCKED", "true")
+    monkeypatch.delenv("IP4_ALLOW_MOCK_ORACLE", raising=False)
+    preflight.check_oracle_mode()
+    assert preflight.FAILURES
+
+
+def test_check_oracle_mode_passes_live_clob(monkeypatch):
+    monkeypatch.setenv("EDGE_MODEL_MOCKED", "false")
+    preflight.check_oracle_mode()
+    assert not preflight.FAILURES

@@ -331,6 +331,7 @@ cp .env.example .env   # edit keys
 | Trade close / trim | `tests/test_trade_close.py` |
 | Blueprint validation | `tests/test_sync_master_blueprints.py` |
 | Backtest mock resolutions | `tests/test_backtest_mock.py` |
+| Resolved corpus bootstrap | `tests/test_resolved_corpus_bootstrap.py` |
 
 CI (`.github/workflows/sync-master-blueprints.yml`): validates blueprint on push to `main`.
 
@@ -361,6 +362,7 @@ InvestmentProphits4/
 │   ├── supervisor_watch.py                      ← process spawner
 │   ├── dashboard_service.py                     ← Streamlit watchdog
 │   ├── sync_master_blueprints.py                ← blueprint LLM sync
+│   ├── seed_resolved_corpus.py                  ← resolved market bootstrap
 │   └── trader_health_audit.py
 ├── shared/                                      ← CLOB, costs, deepseek
 └── tests/
@@ -385,7 +387,7 @@ InvestmentProphits4/
 
 ## 20. Strategy Summary (One Paragraph)
 
-InvestmentProphits4 paper-trades up to ten Polymarket-style binary markets by combining a **Crucible-evolved** `evaluate_market()` strategy with an **Apex execution stack** that computes fair value from live CLOB mids plus order-book imbalance, enforces synthetic transaction costs and configurable net-edge thresholds (default 0.015 for both paper and live, dropping to 0.008 in exploration mode via `APEX_EDGE_MODE=exploration` or `CRUCIBLE_EXPLORATION=true`), and simulates fractional-Kelly ladder entries subject to per-market exposure caps and a maximum open-leg count (default `max(1, floor(APEX_MAX_LADDER_LEGS/2))`). Oracle snapshots land in `trade_exhaust` with full depth fields so the same strategy logic runs in backtest replay and live ticks; the backtest judge scores Sortino on replay rows using synthetic resolutions for still-open markets when `BACKTEST_MOCK_RESOLUTIONS=true` (default), while Apex uses real books when `EDGE_MODEL_MOCKED=false`. A DB-driven supervisor (`scripts/supervisor_watch.py`) spawns Apex and Crucible from `execution_controls`, the Streamlit Command Center exposes kill switch and mode transitions without replacing the supervisor, and inline stoppage detection records wallet health when signals exist but fills stall — distinguishing edge-gate rejection, HOLD-heavy signal starvation, and capital lock-up from process failure. Crucible AutoResearch uses DeepSeek `deepseek-v4-flash` via `shared/deepseek.py` for strategy proposals and blueprint sync, with a validity gate that requires at least `AUTORESEARCH_MIN_LIVE_FILL_ELIGIBLE` signals passing the net-edge threshold on the latest live snapshot before KEEPing a champion.
+InvestmentProphits4 paper-trades up to ten Polymarket-style binary markets by combining a **Crucible-evolved** `evaluate_market()` strategy with an **Apex execution stack** that computes fair value from live CLOB mids plus order-book imbalance, enforces synthetic transaction costs and configurable net-edge thresholds (default 0.015 for both paper and live, dropping to 0.008 in exploration mode via `APEX_EDGE_MODE=exploration` or `CRUCIBLE_EXPLORATION=true`), and simulates fractional-Kelly ladder entries subject to per-market exposure caps and a maximum open-leg count (default `max(1, floor(APEX_MAX_LADDER_LEGS/2))`). Oracle snapshots land in `trade_exhaust` with full depth fields so the same strategy logic runs in backtest replay and live ticks; the backtest judge scores Sortino on replay rows using synthetic resolutions for still-open markets when `BACKTEST_MOCK_RESOLUTIONS=true` (default), while Apex uses real books when `EDGE_MODEL_MOCKED=false`. A DB-driven supervisor (`scripts/supervisor_watch.py`) spawns Apex and Crucible from `execution_controls`, the Streamlit Command Center exposes kill switch and mode transitions without replacing the supervisor, and inline stoppage detection records wallet health when signals exist but fills stall — distinguishing edge-gate rejection, HOLD-heavy signal starvation, and capital lock-up from process failure. Crucible AutoResearch uses DeepSeek `deepseek-v4-flash` via `shared/deepseek.py` for strategy proposals and blueprint sync, with a validity gate that requires at least `AUTORESEARCH_MIN_LIVE_FILL_ELIGIBLE` signals passing the net-edge threshold on the latest live snapshot before KEEPing a champion. The resolved corpus bootstrap (`database/resolved_corpus_bootstrap.py` and `scripts/seed_resolved_corpus.py`) ensures `markets_ledger.is_resolved` rows exist for champion backtesting, and the oracle fix separating `BACKTEST_MOCK_RESOLUTIONS` from `EDGE_MODEL_MOCKED` prevents live oracle stalls from affecting research replay.
 
 ---
 

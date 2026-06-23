@@ -20,7 +20,8 @@ from database.resolved_corpus_bootstrap import (
     seed_resolved_corpus_from_exhaust,
 )
 from database.schema_core import seed_minimal_rows
-from engine_2_crucible.backtest_corpus import enrich_backtest_cross_venue, flatten_exhaust_rows
+from engine_2_crucible.backtest_corpus import flatten_exhaust_rows
+from engine_2_crucible.strategy_loader import enrich_cross_venue_adj
 
 
 @pytest.fixture
@@ -109,9 +110,9 @@ def test_flatten_exhaust_after_bootstrap(db_conn):
     assert len(samples) == 12
 
 
-def test_enrich_backtest_cross_venue_from_obi(monkeypatch):
-    monkeypatch.setenv("BACKTEST_ENRICH_CROSS_VENUE", "true")
-    state = enrich_backtest_cross_venue(
+def test_enrich_cross_venue_adj_from_obi(monkeypatch):
+    monkeypatch.setenv("CROSS_VENUE_ENABLED", "true")
+    state = enrich_cross_venue_adj(
         {"cross_venue_adj": 0.0, "order_book_imbalance": 0.25}
     )
     assert state["cross_venue_adj"] == 0.02

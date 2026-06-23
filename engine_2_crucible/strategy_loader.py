@@ -207,6 +207,34 @@ def validate_strategy_in_subprocess(
         raise StrategyLoadError(detail or "sandbox validation failed")
 
 
+def enrich_cross_venue_adj(state: dict) -> dict:
+    """
+    When Kalshi cross-venue is unavailable, derive a bounded OBI-aligned proxy.
+
+    Keeps consensus-gated strategies tradable in paper while real cross_venue
+    overlays remain preferred when present.
+    """
+    if abs(float(state.get("cross_venue_adj", 0.0))) >= 0.01:
+        return state
+    explicit = os.getenv("CROSS_VENUE_OBI_PROXY", "").strip().lower()
+    if explicit in ("false", "0", "no"):
+        return state
+    if explicit not in ("true", "1", "yes"):
+        legacy = os.getenv("BACKTEST_ENRICH_CROSS_VENUE", "true").strip().lower()
+        if legacy in ("false", "0", "no"):
+            return state
+    from shared.overlay_mode import cross_venue_enabled
+
+    if not cross_venue_enabled():
+        return state
+    obi = float(state.get("order_book_imbalance", 0.0))
+    if abs(obi) < 0.05:
+        return state
+    enriched = dict(state)
+    enriched["cross_venue_adj"] = 0.02 if obi > 0 else -0.02
+    return enriched
+
+
 def build_market_state(market_id: str, market_blob: dict) -> dict:
     """Map oracle/exhaust market blob to evaluate_market input dict."""
     from shared.poly_costs import PolyCostModel
@@ -235,7 +263,8 @@ def build_market_state(market_id: str, market_blob: dict) -> dict:
         "liquidity_usd": float(clob.get("liquidity_usd", 0.0)),
         "cross_venue_adj": float((market_blob.get("overlays") or {}).get("cross_venue", 0.0)),
     }
-    return _apply_mock_book_depth(state)
+    state = _apply_mock_book_depth(state)
+    return enrich_cross_venue_adj(state)
 
 
 def _apply_mock_book_depth(state: dict) -> dict:

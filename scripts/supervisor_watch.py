@@ -169,10 +169,10 @@ def _kill_orphan_processes(script_name: str, *, keep_pid: int | None = None) -> 
             pass
 
 
-def _spawn(name: str, script: Path, log_path: Path) -> subprocess.Popen:
+def _spawn(name: str, script: Path, log_path: Path, *, reason: str) -> subprocess.Popen:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_file = log_path.open("a", encoding="utf-8")
-    logger.info("Starting %s (pid pending) log=%s", name, log_path)
+    logger.info("Starting %s reason=%s script=%s log=%s", name, reason, script.name, log_path)
     proc = subprocess.Popen(
         [sys.executable, str(script)],
         cwd=str(PROJECT_ROOT),
@@ -180,8 +180,27 @@ def _spawn(name: str, script: Path, log_path: Path) -> subprocess.Popen:
         stderr=subprocess.STDOUT,
         start_new_session=True,
     )
-    logger.info("Started %s pid=%s", name, proc.pid)
+    logger.info("Started %s pid=%s reason=%s", name, proc.pid, reason)
+    _post_spawn_verify(name)
     return proc
+
+
+def _post_spawn_verify(engine: str) -> None:
+    try:
+        from scripts.verify_stack import run_verify
+
+        report = run_verify(quick=True)
+        if report.passed:
+            logger.info("Post-spawn verify OK for %s", engine)
+        else:
+            failed = [c.name for c in report.checks if not c.passed]
+            logger.warning(
+                "Post-spawn verify failed for %s: %s",
+                engine,
+                "; ".join(failed) or "unknown",
+            )
+    except Exception as exc:
+        logger.warning("Post-spawn verify error for %s: %s", engine, exc)
 
 
 def _require_streamlit() -> None:
@@ -267,10 +286,30 @@ class SupervisorWatch:
         logger.info("Supervisor received signal %s — shutting down", signum)
         self._shutdown = True
 
+    def _reconcile_engine(
+        self,
+        proc: subprocess.Popen | None,
+        pid: int | None,
+    ) -> tuple[subprocess.Popen | None, int | None, int | None]:
+        """Drop stale handles; return (proc, pid, prior_pid_if_dead)."""
+        prior = pid
+        if proc is not None and proc.poll() is not None:
+            proc = None
+            pid = None
+        elif pid is not None and not _pid_alive(pid):
+            proc = None
+            pid = None
+        tracked_died = prior is not None and pid is None
+        return proc, pid, prior if tracked_died else None
+
     def _ensure_apex(self, controls: dict) -> None:
         kill = controls.get("global_kill_switch")
         state = controls.get("apex_state", "RUNNING")
-        running = _pid_alive(self._apex_pid)
+
+        self.apex_proc, self._apex_pid, dead_pid = self._reconcile_engine(
+            self.apex_proc, self._apex_pid
+        )
+        running = self._apex_pid is not None and _pid_alive(self._apex_pid)
 
         if kill or state == "HALTED":
             if running:
@@ -289,19 +328,44 @@ class SupervisorWatch:
             return
 
         existing = _engine_pid("engine_1_apex/ip4_apex_edge.py")
-        if existing:
+        if existing and dead_pid is None:
             self._apex_pid = existing
             logger.info("Adopted existing Apex pid=%s", existing)
             return
 
+        if existing and dead_pid is not None:
+            logger.warning(
+                "Tracked Apex pid=%s died — terminating stray pid=%s before respawn",
+                dead_pid,
+                existing,
+            )
+            try:
+                os.kill(existing, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if not _pid_alive(existing):
+                    break
+                time.sleep(0.2)
+
         _kill_orphan_processes("engine_1_apex/ip4_apex_edge.py")
-        self.apex_proc = _spawn("Apex", APEX_SCRIPT, LOG_DIR / "apex.log")
+        self.apex_proc = _spawn(
+            "Apex",
+            APEX_SCRIPT,
+            LOG_DIR / "apex.log",
+            reason=f"apex_state={state} process_dead",
+        )
         self._apex_pid = self.apex_proc.pid
 
     def _ensure_crucible(self, controls: dict) -> None:
         kill = controls.get("global_kill_switch")
         state = controls.get("crucible_state", "RUNNING")
-        running = _pid_alive(self._crucible_pid)
+
+        self.crucible_proc, self._crucible_pid, dead_pid = self._reconcile_engine(
+            self.crucible_proc, self._crucible_pid
+        )
+        running = self._crucible_pid is not None and _pid_alive(self._crucible_pid)
 
         if kill or state == "HALTED":
             if running:
@@ -320,14 +384,33 @@ class SupervisorWatch:
             return
 
         existing = _engine_pid("engine_2_crucible/ip4_swarm_crucible.py")
-        if existing:
+        if existing and dead_pid is None:
             self._crucible_pid = existing
             logger.info("Adopted existing Crucible pid=%s", existing)
             return
 
+        if existing and dead_pid is not None:
+            logger.warning(
+                "Tracked Crucible pid=%s died — terminating stray pid=%s before respawn",
+                dead_pid,
+                existing,
+            )
+            try:
+                os.kill(existing, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if not _pid_alive(existing):
+                    break
+                time.sleep(0.2)
+
         _kill_orphan_processes("engine_2_crucible/ip4_swarm_crucible.py")
         self.crucible_proc = _spawn(
-            "Crucible", CRUCIBLE_SCRIPT, LOG_DIR / "crucible.log"
+            "Crucible",
+            CRUCIBLE_SCRIPT,
+            LOG_DIR / "crucible.log",
+            reason=f"crucible_state={state} process_dead",
         )
         self._crucible_pid = self.crucible_proc.pid
 

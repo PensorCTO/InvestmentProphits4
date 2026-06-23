@@ -185,14 +185,13 @@ class PolyCostModel:
         *,
         capital: float | None = None,
     ) -> float:
-        """Signed edge in trade direction before costs."""
+        """Signed edge in trade direction after spread + slippage at fill price."""
+        fill = cls.get_execution_price(
+            market_mid, direction, liquidity_tier, bet_size, capital=capital
+        )
         if direction == "YES":
-            raw_edge = fair_value - market_mid
-        else:
-            raw_edge = market_mid - fair_value
-        half_spread = cls.TIER_SPREADS.get(liquidity_tier, 0.035) / 2.0
-        slippage = cls._slippage(bet_size, liquidity_tier, capital=capital)
-        return raw_edge - (half_spread + slippage)
+            return fair_value - fill
+        return (1.0 - fair_value) - fill
 
     @classmethod
     def get_position_exit_price(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timezone
 from typing import Any
@@ -9,6 +10,7 @@ from typing import Any
 from shared.capital_injection import (
     EVENT_BANKRUPTCY_RESET,
     EVENT_INITIAL_SEED,
+    EVENT_WALLET_RESET,
     SCOPE_APEX,
     append_injection,
     total_injected,
@@ -17,6 +19,8 @@ from shared.capital_injection import (
 )
 from shared.poly_costs import PolyCostModel
 from database.replica_store import commit_local, request_cloud_sync
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_APEX_AGENT_ID = os.getenv("APEX_AGENT_ID", "APEX_EDGE")
 DEFAULT_INITIAL_CAPITAL = float(os.getenv("APEX_INITIAL_CAPITAL", "100.0"))
@@ -92,6 +96,13 @@ def maybe_restore_bankruptcy_capital(
         EVENT_BANKRUPTCY_RESET,
         inject_amount,
         agent_id=agent_id,
+    )
+    logger.warning(
+        "APEX bankruptcy floor injection: nav=%.2f floor=%.2f injected=$%.2f new_cash=$%.2f",
+        nav,
+        floor,
+        inject_amount,
+        new_cash,
     )
     record_portfolio_snapshot(
         conn,
@@ -197,6 +208,98 @@ def record_portfolio_snapshot(
     }
 
 
+def _parse_db_timestamp(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    text = str(raw).strip().replace(" ", "T")
+    if "+" not in text and not text.endswith("Z"):
+        text += "+00:00"
+    try:
+        ts = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts
+    except ValueError:
+        return None
+
+
+def last_session_basis(
+    conn,
+    *,
+    agent_id: str = DEFAULT_APEX_AGENT_ID,
+) -> tuple[float, datetime | None]:
+    """Return (session_start_capital, session_start_time) from the latest injection event."""
+    row = conn.execute(
+        """
+        SELECT amount, created_at FROM capital_injection_ledger
+        WHERE scope = ? AND agent_id = ?
+        ORDER BY rowid DESC LIMIT 1
+        """,
+        (SCOPE_APEX, agent_id),
+    ).fetchone()
+    if row:
+        return float(row[0]), _parse_db_timestamp(str(row[1]))
+    return DEFAULT_INITIAL_CAPITAL, None
+
+
+def filter_history_since_session(
+    history: list[dict[str, Any]],
+    session_start: datetime | None,
+) -> list[dict[str, Any]]:
+    if not session_start or not history:
+        return history
+    filtered: list[dict[str, Any]] = []
+    for row in history:
+        ts = _parse_db_timestamp(row.get("captured_at"))
+        if ts is None or ts >= session_start:
+            filtered.append(row)
+    return filtered or history[-1:]
+
+
+def append_live_nav_point(
+    history: list[dict[str, Any]],
+    *,
+    total_nav: float,
+    cash: float,
+    position_value: float,
+    execution_mode: str,
+    total_capital_injected: float,
+) -> list[dict[str, Any]]:
+    """Ensure chart ends at the same NAV as the live metric row."""
+    if not history:
+        return [
+            {
+                "captured_at": _utc_now_iso(),
+                "cash": cash,
+                "position_value": position_value,
+                "total_nav": total_nav,
+                "execution_mode": execution_mode,
+                "total_capital_injected": total_capital_injected,
+                "true_pnl": true_trading_pnl(total_nav, total_capital_injected),
+            }
+        ]
+    last = history[-1]
+    if (
+        last.get("total_nav") == total_nav
+        and last.get("cash") == cash
+        and last.get("position_value") == position_value
+    ):
+        return history
+    out = list(history)
+    out.append(
+        {
+            "captured_at": _utc_now_iso(),
+            "cash": cash,
+            "position_value": position_value,
+            "total_nav": total_nav,
+            "execution_mode": execution_mode,
+            "total_capital_injected": total_capital_injected,
+            "true_pnl": true_trading_pnl(total_nav, total_capital_injected),
+        }
+    )
+    return out
+
+
 def fetch_portfolio_history(
     conn,
     *,
@@ -216,11 +319,15 @@ def fetch_portfolio_history(
                    total_capital_injected
             FROM portfolio_snapshots
             WHERE agent_id = ?
-            ORDER BY captured_at ASC
+            ORDER BY captured_at DESC
             LIMIT ?
             """,
             (agent_id, limit),
         ).fetchall()
+        rows = list(reversed(rows))
+        fallback_injected = get_apex_total_injected(conn, agent_id)
+        if fallback_injected <= 0:
+            fallback_injected = DEFAULT_INITIAL_CAPITAL
         return [
             {
                 "captured_at": row[0],
@@ -228,8 +335,14 @@ def fetch_portfolio_history(
                 "position_value": float(row[2]),
                 "total_nav": float(row[3]),
                 "execution_mode": row[4],
-                "total_capital_injected": float(row[5]),
-                "true_pnl": true_trading_pnl(float(row[3]), float(row[5])),
+                "total_capital_injected": (
+                    injected := (
+                        float(row[5])
+                        if row[5] is not None and float(row[5]) > 0
+                        else fallback_injected
+                    )
+                ),
+                "true_pnl": true_trading_pnl(float(row[3]), injected),
             }
             for row in rows
         ]
@@ -239,12 +352,15 @@ def fetch_portfolio_history(
         SELECT captured_at, cash, position_value, total_nav, execution_mode
         FROM portfolio_snapshots
         WHERE agent_id = ?
-        ORDER BY captured_at ASC
+        ORDER BY captured_at DESC
         LIMIT ?
         """,
         (agent_id, limit),
     ).fetchall()
+    rows = list(reversed(rows))
     injected = get_apex_total_injected(conn, agent_id)
+    if injected <= 0:
+        injected = DEFAULT_INITIAL_CAPITAL
     return [
         {
             "captured_at": row[0],
@@ -311,7 +427,7 @@ def reset_apex_wallet(
     append_injection(
         conn,
         SCOPE_APEX,
-        EVENT_BANKRUPTCY_RESET,
+        EVENT_WALLET_RESET,
         seed,
         agent_id=agent_id,
     )
