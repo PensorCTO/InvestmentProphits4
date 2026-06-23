@@ -94,6 +94,8 @@ def test_extract_python_from_fence():
     response = """Here is the file:
 
 ```python
+OVERLAY_WEIGHTS = {"order_book_imbalance": 1.0}
+
 def evaluate_market(market_state):
     return "HOLD"
 ```
@@ -106,6 +108,8 @@ def test_extract_python_strips_prose_fallback():
     response = """Sure! Updated strategy below.
 
 # active_strategy.py
+OVERLAY_WEIGHTS = {"order_book_imbalance": 1.0}
+
 def evaluate_market(market_state: dict) -> str:
     return "HOLD"
 """

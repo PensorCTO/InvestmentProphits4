@@ -92,7 +92,7 @@ def test_score_samples_empty_returns_zero():
     def _hold(_state):
         return "HOLD"
 
-    score, trades, dd = _score_samples([], _hold)
+    score, trades, dd, _returns = _score_samples([], _hold)
     assert score == 0.0
     assert trades == 0
     assert dd == 0.0

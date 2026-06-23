@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -37,6 +37,7 @@ from engine_3_dashboard.db import (
     set_crucible_state,
     set_global_kill_switch,
     tail_log,
+    log_file_status,
 )
 from engine_3_dashboard.hrana import is_transient_hrana_error
 
@@ -89,11 +90,154 @@ def _init_session_state() -> None:
         "auto_refresh": True,
         "wallet_reset_notice": None,
         "engine_notice": None,
-        "last_dashboard_refresh": datetime.now(timezone.utc),
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+
+def _format_minutes_ago(minutes: float | None) -> str:
+    if minutes is None:
+        return "—"
+    if minutes < 1:
+        return "<1 min ago"
+    return f"{minutes:.0f} min ago"
+
+
+def _render_live_heartbeat() -> None:
+    now = datetime.now().strftime("%H:%M:%S")
+    paused = _confirm_dialog_open()
+    hb1, hb2 = st.columns([3, 1])
+    with hb1:
+        if st.session_state.auto_refresh and not paused:
+            st.caption(f"Live heartbeat · refreshed {now} · polling every 5s")
+        elif st.session_state.auto_refresh and paused:
+            st.caption(f"Auto-refresh paused (confirmation open) · loaded {now}")
+        else:
+            st.caption(f"Manual refresh only · loaded {now}")
+    with hb2:
+        st.session_state.auto_refresh = st.checkbox(
+            "Auto-refresh (5s)",
+            value=st.session_state.auto_refresh,
+            key="auto_refresh_top",
+        )
+
+
+def _render_trade_flow_status() -> None:
+    """Honest view: plumbing vs alpha verify badges + last session events."""
+    try:
+        from scripts.trade_flow_verify import (
+            check_engines_running,
+            collect_flow_verdict,
+        )
+
+        engines = check_engines_running()
+        verdict, recent, _log_status = collect_flow_verdict()
+
+        st.subheader("Trade Flow (current Apex session)")
+        if recent.session_started_display:
+            st.caption(f"Session started {recent.session_started_display}")
+
+        v1, v2 = st.columns(2)
+        with v1:
+            if verdict.plumbing_ok:
+                st.success("**Plumbing: PASS** — buy + sell in apex.log this session")
+            else:
+                st.error("**Plumbing: FAIL** — need ≥1 buy and ≥1 sell since Apex restart")
+        with v2:
+            if verdict.alpha_ok:
+                st.success(
+                    f"**Alpha: PASS** — {verdict.alpha_sell_count} log / "
+                    f"{verdict.db_alpha_closes} db discretionary close(s)"
+                )
+            elif verdict.plumbing_ok:
+                st.warning(
+                    f"**Alpha: CHURN ONLY** — {verdict.cap_stall_sell_count} cap-stall sell(s), "
+                    "0 thesis/flip closes"
+                )
+            else:
+                st.info("**Alpha: NONE** — no discretionary closes yet this session")
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("Apex pid", engines.apex_pid or "DOWN")
+        with c2:
+            st.metric("Session buys", recent.buy_count)
+        with c3:
+            st.metric("Alpha sells", recent.alpha_sell_count)
+        with c4:
+            st.metric("Cap-stall sells", recent.cap_stall_sell_count)
+
+        b1, b2 = st.columns(2)
+        with b1:
+            if recent.last_buy:
+                st.markdown(
+                    f"**Last buy** {recent.last_buy.ts_display} "
+                    f"({_format_minutes_ago(recent.minutes_since_last_buy)})"
+                )
+                st.caption(recent.last_buy.evidence[:220])
+            else:
+                st.markdown("**Last buy:** none this session")
+        with b2:
+            if recent.last_sell:
+                label = recent.last_sell.event_type.replace("_", " ")
+                st.markdown(
+                    f"**Last sell** ({label}) {recent.last_sell.ts_display} "
+                    f"({_format_minutes_ago(recent.minutes_since_last_sell)})"
+                )
+                st.caption(recent.last_sell.evidence[:220])
+            else:
+                st.markdown("**Last sell:** none this session")
+    except Exception as exc:
+        st.caption(f"Trade flow check unavailable: {exc}")
+
+
+def _render_engine_logs() -> None:
+    st.markdown("---")
+    _render_trade_flow_status()
+    st.markdown("---")
+    st.subheader("Engine Logs (disk tail — refreshes with auto-refresh)")
+    log_tab1, log_tab2 = st.tabs(["Crucible Log", "Apex Log"])
+    crucible_path = LOG_DIR / "crucible.log"
+    apex_path = LOG_DIR / "apex.log"
+    with log_tab1:
+        c_status = log_file_status(crucible_path)
+        if not c_status["exists"]:
+            st.error(f"Missing log file: {crucible_path}")
+        elif c_status["stale"]:
+            st.error(
+                f"Crucible log stale — last write {c_status['age_seconds']:.0f}s ago "
+                f"({c_status['last_modified']}). Process may be down."
+            )
+        else:
+            st.success(
+                f"Crucible log live — updated {c_status['age_seconds']:.0f}s ago "
+                f"({c_status['last_modified']})"
+            )
+        st.caption(f"Path: {crucible_path}")
+        st.caption(c_status["last_line"][:200])
+        body = tail_log(crucible_path)
+        st.caption(f"Showing last {len(body.splitlines())} lines")
+        st.code(body or "(empty log file)", language="text")
+    with log_tab2:
+        a_status = log_file_status(apex_path)
+        if not a_status["exists"]:
+            st.error(f"Missing log file: {apex_path}")
+        elif a_status["stale"]:
+            st.error(
+                f"Apex log stale — last write {a_status['age_seconds']:.0f}s ago "
+                f"({a_status['last_modified']}). Process may be down."
+            )
+        else:
+            st.success(
+                f"Apex log live — updated {a_status['age_seconds']:.0f}s ago "
+                f"({a_status['last_modified']})"
+            )
+        st.caption(f"Path: {apex_path}")
+        st.caption(a_status["last_line"][:200])
+        body = tail_log(apex_path)
+        st.caption(f"Showing last {len(body.splitlines())} lines")
+        st.code(body or "(empty log file)", language="text")
 
 
 def render_page() -> None:
@@ -104,12 +248,14 @@ def render_page() -> None:
         st.success(st.session_state.engine_notice)
         st.session_state.engine_notice = None
 
+    _render_live_heartbeat()
+
     try:
         controls = _with_conn(fetch_controls)
         portfolio = _with_conn(fetch_portfolio)
         trader_status = _with_conn(fetch_trader_status)
         trader_health = _with_conn(fetch_trader_health)
-        engine_processes = fetch_engine_processes()
+        engine_processes = fetch_engine_processes(controls)
         runtime_warnings = engine_runtime_warnings(controls, engine_processes)
     except Exception as exc:
         st.error("Cannot reach the trading database.")
@@ -119,6 +265,7 @@ def render_page() -> None:
             "From the project root: `.venv/bin/python scripts/start_local_sqld.py` "
             "or `./scripts/ip4_supervisor.sh watch --dashboard`."
         )
+        _render_engine_logs()
         return
 
     for warning in runtime_warnings:
@@ -227,6 +374,34 @@ def render_page() -> None:
         with t4:
             st.metric("Block reason", str(block))
 
+        try:
+            from database.trading_activity_store import fetch_activity_breakdown
+            from engine_2_crucible.live_trading_feedback import since_iso_for_apex_session
+
+            since_iso = since_iso_for_apex_session()
+            activity = _with_conn(
+                lambda c: fetch_activity_breakdown(
+                    c,
+                    agent_id=APEX_AGENT_ID,
+                    since_iso=since_iso,
+                )
+            )
+            st.caption("Activity this Apex session (since last engine restart)")
+            a1, a2, a3, a4 = st.columns(4)
+            with a1:
+                st.metric("Cap-stall closes", int(activity.get("cap_stall_closes", 0)))
+            with a2:
+                st.metric("Alpha closes", int(
+                    activity.get("thesis_closes", 0)
+                    + activity.get("signal_flip_closes", 0)
+                ))
+            with a3:
+                st.metric("Churn ratio", f"{activity.get('churn_ratio', 0.0):.0%}")
+            with a4:
+                st.metric("Alpha PnL", f"${activity.get('alpha_pnl', 0.0):.2f}")
+        except Exception as exc:
+            st.caption(f"Activity breakdown unavailable: {exc}")
+
         st.markdown("---")
         st.subheader("Wallet Health")
         h1, h2, h3, h4 = st.columns(4)
@@ -283,7 +458,7 @@ def render_page() -> None:
         f"Lifetime true PnL ${lifetime_pnl:,.2f}"
     )
 
-    btn_refresh, btn_reset, btn_auto = st.columns([1, 1, 2])
+    btn_refresh, btn_reset, _btn_spacer = st.columns([1, 1, 2])
     with btn_refresh:
         if st.button("Refresh Chart", key="refresh_portfolio_chart"):
             _with_conn(refresh_portfolio_snapshot, sync=True)
@@ -313,11 +488,6 @@ def render_page() -> None:
                 if st.button("Cancel Reset", key="wallet_reset_cancel"):
                     st.session_state.confirm_wallet_reset = False
                     st.rerun()
-    with btn_auto:
-        st.session_state.auto_refresh = st.checkbox(
-            "Auto-refresh every 5s",
-            value=st.session_state.auto_refresh,
-        )
 
     history = portfolio.get("history") or []
     if history:
@@ -356,7 +526,19 @@ def render_page() -> None:
         a1, a2 = st.columns(2)
         with a1:
             supervisor_alive = engine_processes.get("supervisor") is not None
-            if st.button("Start Apex", disabled=supervisor_alive):
+            apex_wanted = controls.get("apex_state") == "RUNNING"
+            if (
+                supervisor_alive
+                and not apex_pid
+                and not apex_wanted
+            ):
+                if st.button("Resume Apex", type="primary"):
+                    _with_conn(lambda c: set_apex_state(c, "RUNNING"))
+                    st.session_state.engine_notice = (
+                        "Apex set to RUNNING — supervisor will spawn within a few seconds."
+                    )
+                    st.rerun()
+            elif st.button("Start Apex", disabled=supervisor_alive):
                 if supervisor_alive:
                     st.session_state.engine_notice = (
                         "Supervisor is running — it manages Apex. Stop supervisor first to spawn directly."
@@ -389,7 +571,19 @@ def render_page() -> None:
         c1, c2 = st.columns(2)
         with c1:
             supervisor_alive = engine_processes.get("supervisor") is not None
-            if st.button("Start Crucible", disabled=supervisor_alive):
+            crucible_wanted = controls.get("crucible_state") == "RUNNING"
+            if (
+                supervisor_alive
+                and not crucible_pid
+                and not crucible_wanted
+            ):
+                if st.button("Resume Crucible", type="primary"):
+                    _with_conn(lambda c: set_crucible_state(c, "RUNNING"))
+                    st.session_state.engine_notice = (
+                        "Crucible set to RUNNING — supervisor will spawn within a few seconds."
+                    )
+                    st.rerun()
+            elif st.button("Start Crucible", disabled=supervisor_alive):
                 if supervisor_alive:
                     st.session_state.engine_notice = (
                         "Supervisor is running — it manages Crucible."
@@ -440,31 +634,18 @@ def render_page() -> None:
     score = _with_conn(fetch_best_score)
     st.metric("Alpha Score (best Sortino)", f"{score:.4f}")
 
-    log_tab1, log_tab2 = st.tabs(["Crucible Log", "Apex Log"])
-    with log_tab1:
-        st.code(tail_log(LOG_DIR / "crucible.log"), language="text")
-    with log_tab2:
-        st.code(tail_log(LOG_DIR / "apex.log"), language="text")
-
-    if st.session_state.auto_refresh and not _confirm_dialog_open():
-        st.caption(f"Auto-refresh on — last load {time.strftime('%H:%M:%S')}")
-    elif st.session_state.auto_refresh and _confirm_dialog_open():
-        st.caption("Auto-refresh paused while a confirmation dialog is open.")
+    _render_engine_logs()
 
 
 def _maybe_autorefresh() -> None:
+    """Block ~5s then rerun so the page actually polls while the tab is open."""
     if not st.session_state.auto_refresh or _confirm_dialog_open():
         return
-    now = datetime.now(timezone.utc)
-    last = st.session_state.get("last_dashboard_refresh")
-    if last is None or now - last >= timedelta(seconds=5):
-        st.session_state.last_dashboard_refresh = now
-        st.rerun()
+    time.sleep(5)
+    st.rerun()
 
 
 _init_session_state()
-if "last_dashboard_refresh" not in st.session_state:
-    st.session_state.last_dashboard_refresh = datetime.now(timezone.utc)
 
 render_page()
 _maybe_autorefresh()

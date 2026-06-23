@@ -93,10 +93,12 @@ Lineage: conceptual descendant of IP2/IP3 agent arenas, but **standalone codebas
 ### Apex tick loop (simplified)
 
 1. Oracle worker writes `trade_exhaust` payload (per-market CLOB mid, spread, depth, overlays).
-2. Load `active_strategy.python_source` → `evaluate_market(state)` per market.
+2. Load `active_strategy.python_source` from Turso → `evaluate_market(state)` per market.
 3. Fair value + net edge vs `APEX_MIN_NET_EDGE` (paper: `APEX_PAPER_MIN_NET_EDGE`).
 4. `PaperGateway` simulates fills; updates cash/NAV; ladder + cap checks.
-5. Stoppage detector → `trader_health` row; optional cap rebalance trim.
+5. Stoppage detector → `trader_health` row (`dominant_block_reason` includes `fully_deployed` when max legs are held in the signaled direction).
+6. **Cap-stall remediation** (`remediate_cap_stall`) only when `should_remediate_cap_stall()` — i.e. genuine `cap_blocked` starvation, **not** when already deployed on a persistent BUY signal (prevents buy→force-sell→rebuy spread churn).
+7. Optional capital-starvation rebalance trim (`remediate_stoppage`).
 
 ### Crucible loop (simplified)
 
@@ -244,6 +246,16 @@ Supervisor opens a **new DB connection each poll tick** to avoid stale Hrana ses
 
 Stoppage kinds: `SIGNAL_STARVATION`, `EXECUTION_STARVATION`, `CAPITAL_STARVATION`.
 
+Dominant block reasons (dashboard / `trader_health`): `fully_deployed`, `cap_blocked`, `edge_gated`, `all_hold`, `activity`.
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/stack_status.py` | Snapshot supervisor + engine PIDs + wallet health |
+| `scripts/restart_stack.py` | Stop/start stack + optional trade-flow verify |
+| `scripts/stop_stack.py` | Clean shutdown |
+| `scripts/verify_trade_flow.py` | Post-restart buy+sell gate |
+| `scripts/acceptance_gate.py` | Definition-of-done QA |
+
 ---
 
 ## 14. LLM / Agent Infrastructure
@@ -272,6 +284,8 @@ See `.env.example` for full list. Checkpoint highlights:
 EDGE_MODEL_MOCKED=false          # live CLOB oracle
 EXECUTION_MODE=paper
 APEX_MAX_LADDER_LEGS=3
+APEX_CAP_STALL_REMEDIATE_TICKS=18   # only remediate cap_blocked, not fully_deployed
+APEX_CAP_STALL_ENTRY_COOLDOWN_SECONDS=60
 APEX_STOPPAGE_TICKS=6
 BACKTEST_MOCK_RESOLUTIONS=true   # backtest judge (independent of live mock)
 IP4_DASHBOARD_PORT=8501
@@ -313,6 +327,18 @@ cp .env.example .env   # edit keys
 .venv/bin/python scripts/sync_master_blueprints.py
 ```
 
+### Stack lifecycle (agent-operated)
+
+```bash
+.venv/bin/python scripts/stack_status.py --require-healthy
+.venv/bin/python scripts/restart_stack.py
+.venv/bin/python scripts/verify_trade_flow.py
+.venv/bin/python scripts/acceptance_gate.py --scope full
+.venv/bin/python scripts/stop_stack.py
+```
+
+See `.cursor/skills/ip4-stack-lifecycle/SKILL.md` and `agent/wiki/project_wiki.md` Operator Runbook.
+
 ### Tests
 
 ```bash
@@ -332,8 +358,22 @@ cp .env.example .env   # edit keys
 | Blueprint validation | `tests/test_sync_master_blueprints.py` |
 | Backtest mock resolutions | `tests/test_backtest_mock.py` |
 | Resolved corpus bootstrap | `tests/test_resolved_corpus_bootstrap.py` |
+| Acceptance gate | `tests/test_acceptance_gate.py` |
+| Apex sizing | `tests/test_apex_sizing.py` |
+| AutoResearch | `tests/test_autoresearch.py` |
+| Dashboard blockers | `tests/test_dashboard_blockers.py` |
+| Dashboard portfolio | `tests/test_dashboard_portfolio.py` |
+| Dashboard processes | `tests/test_dashboard_processes.py` |
+| Hold hysteresis | `tests/test_hold_hysteresis.py` |
+| Live replay gate | `tests/test_live_replay_gate.py` |
+| Portfolio store | `tests/test_portfolio_store.py` |
+| Preflight | `tests/test_preflight.py` |
+| Supervisor lock | `tests/test_supervisor_lock.py` |
+| Supervisor orphans | `tests/test_supervisor_orphans.py` |
+| Trader health store | `tests/test_trader_health_store.py` |
+| Verify stack | `tests/test_verify_stack.py` |
 
-CI (`.github/workflows/sync-master-blueprints.yml`): validates blueprint on push to `main`.
+CI (`.github/workflows/test.yml`): runs full test suite on push to `main`.
 
 ---
 
@@ -354,18 +394,58 @@ InvestmentProphits4/
 ├── InvestmentProphits4_MASTER_BLUEPRINTS.md   ← this document
 ├── agent/wiki/project_wiki.md                 ← session log + decisions
 ├── engine_1_apex/                             ← Apex Edge execution
+│   ├── ip4_apex_edge.py                       ← main loop
+│   ├── stoppage.py                            ← stoppage tracker + remediation
+│   ├── fair_value.py                          ← fair value computation
+│   ├── kelly_sizing.py                        ← fractional Kelly
+│   ├── sizing.py                              ← edge gates, ladder caps
+│   ├── trade_close.py                         ← position close + trim
+│   ├── risk_daemon.py                         ← bracket exits
+│   ├── oracle_sync.py                         ← CLOB + Gamma sync
+│   └── execution/                             ← gateway, nonce, RPC
 ├── engine_2_crucible/                           ← AutoResearch + backtest judge
+│   ├── ip4_swarm_crucible.py                   ← main loop
+│   ├── active_strategy.py                      ← LLM-editable strategy
+│   ├── val_bpb_backtest.py                     ← Sortino judge (never LLM)
+│   ├── strategy_loader.py                      ← AST sandbox + load
+│   ├── strategy_instructions.md                ← human mandate
+│   ├── backtest_corpus.py                      ← exhaust flatten
+│   └── live_replay_gate.py                     ← live signal gate
 ├── engine_3_dashboard/                          ← Streamlit Command Center
+│   ├── app.py                                  ← main UI
+│   ├── db.py                                   ← DB helpers
+│   ├── processes.py                            ← engine process helpers
+│   └── hrana.py                                ← transient error detection
 ├── database/                                    ← schema, stores, seed, migrate
+│   ├── migrate_schema.py                       ← schema migrations
+│   ├── seed_arena.py                           ← market + agent seed
+│   ├── execution_controls_store.py             ← control plane
+│   ├── strategy_store.py                       ← champion strategy
+│   ├── portfolio_store.py                      ← NAV + injection ledger
+│   ├── trader_health_store.py                  ← stoppage persistence
+│   ├── market_state_store.py                   ← oracle snapshots
+│   ├── replica_store.py                        ← embedded replica sync
+│   └── resolved_corpus_bootstrap.py            ← resolved market bootstrap
 ├── scripts/
 │   ├── ip4_supervisor.sh                        ← entrypoint
 │   ├── supervisor_watch.py                      ← process spawner
 │   ├── dashboard_service.py                     ← Streamlit watchdog
 │   ├── sync_master_blueprints.py                ← blueprint LLM sync
-│   ├── seed_resolved_corpus.py                  ← resolved market bootstrap
-│   └── trader_health_audit.py
+│   ├── acceptance_gate.py                       ← full system validation
+│   ├── verify_stack.py                          ← stack health check
+│   ├── restart_stack.py                         ← full restart
+│   ├── preflight.py                             ← startup checks
+│   ├── soak_verify.py                           ← soak test
+│   ├── trader_health_audit.py                   ← periodic health audit
+│   └── start_local_sqld.py                      ← sqld bootstrap
 ├── shared/                                      ← CLOB, costs, deepseek
-└── tests/
+│   ├── deepseek.py                              ← DeepSeek V4 client
+│   ├── poly_costs.py                            ← transaction cost model
+│   ├── capital_injection.py                     ← injection ledger
+│   └── polymarket_clob.py                       ← CLOB client
+├── tests/                                       ← 211 tests
+└── .github/workflows/
+    └── test.yml                                 ← CI test suite
 ```
 
 ### Seed markets (`database/seed_arena.py`)
@@ -387,11 +467,11 @@ InvestmentProphits4/
 
 ## 20. Strategy Summary (One Paragraph)
 
-InvestmentProphits4 paper-trades up to ten Polymarket-style binary markets by combining a **Crucible-evolved** `evaluate_market()` strategy with an **Apex execution stack** that computes fair value from live CLOB mids plus order-book imbalance, enforces synthetic transaction costs and configurable net-edge thresholds (default 0.015 for both paper and live, dropping to 0.008 in exploration mode via `APEX_EDGE_MODE=exploration` or `CRUCIBLE_EXPLORATION=true`), and simulates fractional-Kelly ladder entries subject to per-market exposure caps and a maximum open-leg count (default `max(1, floor(APEX_MAX_LADDER_LEGS/2))`). Oracle snapshots land in `trade_exhaust` with full depth fields so the same strategy logic runs in backtest replay and live ticks; the backtest judge scores Sortino on replay rows using synthetic resolutions for still-open markets when `BACKTEST_MOCK_RESOLUTIONS=true` (default), while Apex uses real books when `EDGE_MODEL_MOCKED=false`. A DB-driven supervisor (`scripts/supervisor_watch.py`) spawns Apex and Crucible from `execution_controls`, the Streamlit Command Center exposes kill switch and mode transitions without replacing the supervisor, and inline stoppage detection records wallet health when signals exist but fills stall — distinguishing edge-gate rejection, HOLD-heavy signal starvation, and capital lock-up from process failure. Crucible AutoResearch uses DeepSeek `deepseek-v4-flash` via `shared/deepseek.py` for strategy proposals and blueprint sync, with a validity gate that requires at least `AUTORESEARCH_MIN_LIVE_FILL_ELIGIBLE` signals passing the net-edge threshold on the latest live snapshot before KEEPing a champion. The resolved corpus bootstrap (`database/resolved_corpus_bootstrap.py` and `scripts/seed_resolved_corpus.py`) ensures `markets_ledger.is_resolved` rows exist for champion backtesting, and the oracle fix separating `BACKTEST_MOCK_RESOLUTIONS` from `EDGE_MODEL_MOCKED` prevents live oracle stalls from affecting research replay.
+InvestmentProphits4 paper-trades up to ten Polymarket-style binary markets by combining a **Crucible-evolved** `evaluate_market()` strategy with an **Apex execution stack** that computes fair value from live CLOB mids plus order-book imbalance, enforces synthetic transaction costs and configurable net-edge thresholds (default 0.015 for both paper and live, dropping to 0.008 in exploration mode via `APEX_EDGE_MODE=exploration` or `CRUCIBLE_EXPLORATION=true`), and simulates fractional-Kelly ladder entries subject to per-market exposure caps and a maximum open-leg count (default `max(1, floor(APEX_MAX_LADDER_LEGS/2))`). Oracle snapshots land in `trade_exhaust` with full depth fields so the same strategy logic runs in backtest replay and live ticks; the backtest judge scores Sortino on replay rows using synthetic resolutions for still-open markets when `BACKTEST_MOCK_RESOLUTIONS=true` (default), while Apex uses real books when `EDGE_MODEL_MOCKED=false`. A DB-driven supervisor (`scripts/supervisor_watch.py`) spawns Apex and Crucible from `execution_controls`, the Streamlit Command Center exposes kill switch and mode transitions without replacing the supervisor, and inline stoppage detection records wallet health when signals exist but fills stall — distinguishing edge-gate rejection, HOLD-heavy signal starvation, and capital lock-up from process failure. Crucible AutoResearch uses DeepSeek `deepseek-v4-flash` via `shared/deepseek.py` for strategy proposals and blueprint sync, with a validity gate that requires at least `AUTORESEARCH_MIN_LIVE_FILL_ELIGIBLE` signals passing the net-edge threshold on the latest live snapshot before KEEPing a champion. The resolved corpus bootstrap (`database/resolved_corpus_bootstrap.py` and `scripts/seed_resolved_corpus.py`) ensures `markets_ledger.is_resolved` rows exist for champion backtesting, and the oracle fix separating `BACKTEST_MOCK_RESOLUTIONS` from `EDGE_MODEL_MOCKED` prevents live oracle stalls from affecting research replay. The acceptance gate (`scripts/acceptance_gate.py`) validates the full stack — schema, seed data, engine processes, trade flow, and blueprint consistency — before any deployment claim, and the verify stack (`scripts/verify_stack.py`) provides a quick health check with per-check pass/fail reporting for supervisor post-spawn verification.
 
 ---
 
-*Auto-synced by deepseek-v4-flash on 2026-06-22T21:45:00Z.*
+*Auto-synced by deepseek-v4-flash on 2026-06-23T09:45:00Z.*
 
 *This document reflects the IP4 codebase at checkpoint June 2026. For session-level engineering notes see `agent/wiki/project_wiki.md`. Prior art: `../InvestmentProphits3/InvestmentProphits3_MASTER_BLUEPRINTS.md`.*
 

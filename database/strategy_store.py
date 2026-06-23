@@ -200,6 +200,11 @@ def read_latest_trade_exhaust(conn) -> dict[str, Any] | None:
     }
 
 
+def _trade_exhaust_has_oracle_ts(conn) -> bool:
+    rows = conn.execute("PRAGMA table_info(trade_exhaust)").fetchall()
+    return any(row[1] == "oracle_ts" for row in rows)
+
+
 def write_trade_exhaust(
     conn,
     *,
@@ -208,19 +213,36 @@ def write_trade_exhaust(
     commit: bool = True,
 ) -> str:
     as_of_ms = int(time.time() * 1000)
+    oracle_ts = int(time.time())
     exhaust_id = f"ex_{as_of_ms}"
-    conn.execute(
-        """
-        INSERT INTO trade_exhaust (exhaust_id, as_of_ms, oracle_snapshot_id, payload)
-        VALUES (?, ?, ?, ?)
-        """,
-        (
-            exhaust_id,
-            as_of_ms,
-            oracle_snapshot_id,
-            json.dumps(markets_payload),
-        ),
-    )
+    if _trade_exhaust_has_oracle_ts(conn):
+        conn.execute(
+            """
+            INSERT INTO trade_exhaust
+            (exhaust_id, as_of_ms, oracle_snapshot_id, payload, oracle_ts)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                exhaust_id,
+                as_of_ms,
+                oracle_snapshot_id,
+                json.dumps(markets_payload),
+                oracle_ts,
+            ),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO trade_exhaust (exhaust_id, as_of_ms, oracle_snapshot_id, payload)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                exhaust_id,
+                as_of_ms,
+                oracle_snapshot_id,
+                json.dumps(markets_payload),
+            ),
+        )
     if commit:
         commit_local(conn)
     return exhaust_id

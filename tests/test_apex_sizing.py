@@ -114,6 +114,20 @@ def test_compute_ladder_budget_shrinks_with_deployed_notional():
     assert reason == "portfolio_cap"
 
 
+def test_compute_ladder_budget_floors_tiny_kelly_to_min_ladder():
+    size, reason = compute_ladder_budget(
+        nav=95.0,
+        cash=95.0,
+        fractional_kelly=0.01,
+        max_position_pct=1.0,
+        market_exposure=0.0,
+        total_open_notional=0.0,
+        min_ladder_usd=5.0,
+    )
+    assert reason is None
+    assert size == pytest.approx(5.0)
+
+
 def test_resolve_min_net_edge_longshot():
     assert resolve_min_net_edge(0.50, 0.015) == pytest.approx(0.015)
     assert resolve_min_net_edge(0.03, 0.015) == pytest.approx(0.020)

@@ -28,7 +28,7 @@ from database.execution_controls_store import (
     update_execution_controls,
 )
 from database.knowledge_store import KnowledgeStore
-from database.market_state_store import is_snapshot_stale, read_latest_snapshot
+from database.market_state_store import get_fresh_snapshot
 from database.migrate_schema import ensure_replica_schema
 from database.portfolio_store import (
     maybe_restore_bankruptcy_capital,
@@ -53,6 +53,7 @@ from engine_1_apex.execution.nonce_manager import AsyncNonceManager
 from engine_1_apex.execution.rpc_proxy import RPCFailoverProxy
 from engine_1_apex.gateway import PaperGateway
 from engine_1_apex.fair_value import resolve_execution_fair_value
+from engine_1_apex.kelly_sizing import compute_fractional_kelly
 from engine_1_apex.sizing import (
     compute_ladder_budget,
     effective_min_net_edge,
@@ -68,11 +69,11 @@ from engine_1_apex.stoppage import (
     TickStats,
     cap_stall_entry_cooldown_seconds,
     cap_stall_remediate_ticks,
-    derive_dominant_block_reason,
     derive_trading_status,
     persist_trader_health,
     remediate_cap_stall,
     remediate_stoppage,
+    should_remediate_cap_stall,
     stoppage_threshold_ticks,
 )
 from engine_1_apex.trade_close import (
@@ -439,9 +440,29 @@ class ApexEdgeEngine:
                     logger.error("Strategy load failed: %s", exc)
                     return
 
-                snapshot = read_latest_snapshot(conn)
-                if is_snapshot_stale(snapshot):
-                    logger.warning("ORACLE STALE — skipping Apex execution tick")
+                snapshot, oracle_reject = get_fresh_snapshot(conn)
+                if oracle_reject:
+                    logger.warning("ORACLE STARVATION — %s", oracle_reject)
+                    sizing = load_agent_sizing_snapshot(conn, APEX_AGENT_ID)
+                    stats = TickStats(
+                        cash=sizing["cash"] if sizing else 0.0,
+                        nav=sizing["nav"] if sizing else 0.0,
+                    )
+                    self._stoppage.consecutive += 1
+                    self._stoppage.last_kind = "ORACLE_STARVATION"
+                    persist_trader_health(
+                        conn,
+                        agent_id=APEX_AGENT_ID,
+                        tracker=self._stoppage,
+                        stats=stats,
+                        status="DEGRADED",
+                        kind="ORACLE_STARVATION",
+                        detail=oracle_reject,
+                        consecutive=self._stoppage.consecutive,
+                        commit=False,
+                    )
+                    conn.commit()
+                    request_cloud_sync("oracle_starvation")
                     return
 
                 if not self._signals_enabled or is_execution_halted():
@@ -480,6 +501,7 @@ class ApexEdgeEngine:
                 skipped_cap = 0
                 skipped_cooldown = 0
                 skipped_edge = 0
+                skipped_toxicity = 0
                 skipped_already_positioned = 0
                 skipped_hold = 0
                 evaluated = 0
@@ -579,7 +601,26 @@ class ApexEdgeEngine:
 
                     signal_direction = "YES" if decision == "BUY_YES" else "NO"
                     if count_open_legs(conn, APEX_AGENT_ID, market_id) >= APEX_MAX_LEGS_PER_MARKET:
-                        skipped_already_positioned += 1
+                        open_dir = conn.execute(
+                            """
+                            SELECT direction FROM trade_execution
+                            WHERE agent_id = ? AND market_id = ? AND status = 'OPEN'
+                            LIMIT 1
+                            """,
+                            (APEX_AGENT_ID, market_id),
+                        ).fetchone()
+                        if open_dir and open_dir[0] == signal_direction:
+                            skipped_already_positioned += 1
+                            cap_reasons["max_legs_per_market"] = (
+                                cap_reasons.get("max_legs_per_market", 0) + 1
+                            )
+                            logger.debug(
+                                "APEX HOLD deployed: %s %s at max_legs=%d",
+                                market_id,
+                                signal_direction,
+                                APEX_MAX_LEGS_PER_MARKET,
+                            )
+                            continue
                         cap_reasons["max_legs_per_market"] = (
                             cap_reasons.get("max_legs_per_market", 0) + 1
                         )
@@ -675,10 +716,19 @@ class ApexEdgeEngine:
                                 n_trim,
                             )
 
+                    dynamic_kelly = compute_fractional_kelly(
+                        fair_value=fair_value,
+                        market_mid=mid,
+                        direction=direction,
+                    )
+                    signal_kelly = (
+                        dynamic_kelly if dynamic_kelly > 0 else sizing["fractional_kelly"]
+                    )
+
                     kelly_size, skip_reason = compute_ladder_budget(
                         nav=nav,
                         cash=cash,
-                        fractional_kelly=sizing["fractional_kelly"],
+                        fractional_kelly=signal_kelly,
                         max_position_pct=sizing["max_position_pct"],
                         market_exposure=exposure,
                         total_open_notional=open_notional,
@@ -711,7 +761,7 @@ class ApexEdgeEngine:
                             kelly_size, skip_reason = compute_ladder_budget(
                                 nav=nav,
                                 cash=cash,
-                                fractional_kelly=sizing["fractional_kelly"],
+                                fractional_kelly=signal_kelly,
                                 max_position_pct=sizing["max_position_pct"],
                                 market_exposure=exposure,
                                 total_open_notional=open_notional,
@@ -745,7 +795,7 @@ class ApexEdgeEngine:
                                 kelly_size, skip_reason = compute_ladder_budget(
                                     nav=nav,
                                     cash=cash,
-                                    fractional_kelly=sizing["fractional_kelly"],
+                                    fractional_kelly=signal_kelly,
                                     max_position_pct=sizing["max_position_pct"],
                                     market_exposure=exposure,
                                     total_open_notional=open_notional,
@@ -794,7 +844,9 @@ class ApexEdgeEngine:
                         )
                     elif result["status"] == "REJECTED":
                         reason = str(result.get("reason", ""))
-                        if reason.startswith("Net Edge") or reason in (
+                        if reason.startswith("semantic_toxicity"):
+                            skipped_toxicity += 1
+                        elif reason.startswith("Net Edge") or reason in (
                             "ladder_no_edge_improvement",
                         ):
                             skipped_edge += 1
@@ -824,6 +876,7 @@ class ApexEdgeEngine:
                     skipped_hold=skipped_hold,
                     skipped_cooldown=skipped_cooldown,
                     skipped_edge=skipped_edge,
+                    skipped_toxicity=skipped_toxicity,
                     skipped_already_positioned=skipped_already_positioned,
                     evaluated=evaluated,
                     signals=signals,
@@ -836,8 +889,7 @@ class ApexEdgeEngine:
                 )
                 if (
                     self._stoppage.cap_blocked_streak >= cap_stall_remediate_ticks()
-                    and derive_dominant_block_reason(tick_stats) == "cap_blocked"
-                    and cap_reasons.get("max_legs_per_market")
+                    and should_remediate_cap_stall(tick_stats)
                 ):
                     cap_stall_targets = [
                         row
@@ -845,13 +897,17 @@ class ApexEdgeEngine:
                         if time.monotonic()
                         >= self._remediate_cooldown_until.get(row[0], 0.0)
                     ]
-                    n_cap = remediate_cap_stall(
-                        conn,
-                        agent_id=APEX_AGENT_ID,
-                        cap_blocked_streak=self._stoppage.cap_blocked_streak,
-                        cap_reasons=cap_reasons,
-                        market_rows=cap_stall_targets,
-                    )
+                    n_cap = 0
+                    try:
+                        n_cap = remediate_cap_stall(
+                            conn,
+                            agent_id=APEX_AGENT_ID,
+                            cap_blocked_streak=self._stoppage.cap_blocked_streak,
+                            cap_reasons=cap_reasons,
+                            market_rows=cap_stall_targets,
+                        )
+                    except Exception as exc:
+                        logger.error("APEX CAP STALL remediate failed: %s", exc)
                     if n_cap:
                         tick_stats.closed_rebalance += n_cap
                         closed_rebalance += n_cap
@@ -967,13 +1023,14 @@ class ApexEdgeEngine:
                     )
                 logger.info(
                     "Apex tick complete filled=%d closed_flip=%d closed_rebalance=%d rejected=%d skipped_cap=%d "
-                    "skipped_cooldown=%d skipped_hold=%d nav=%.2f cash=%.2f cap_reasons=%s",
+                    "skipped_cooldown=%d skipped_toxicity=%d skipped_hold=%d nav=%.2f cash=%.2f cap_reasons=%s",
                     filled,
                     closed_flip,
                     closed_rebalance,
                     rejected,
                     skipped_cap,
                     skipped_cooldown,
+                    skipped_toxicity,
                     skipped_hold,
                     nav,
                     cash,

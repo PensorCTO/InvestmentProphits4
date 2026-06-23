@@ -19,10 +19,16 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def _runtime_columns_present(conn) -> bool:
+    rows = conn.execute("PRAGMA table_info(execution_controls)").fetchall()
+    names = {row[1] for row in rows}
+    return "apex_observed_pid" in names
+
+
 def _row_to_dict(row) -> dict[str, Any]:
     if not row:
         return {}
-    return {
+    out: dict[str, Any] = {
         "id": int(row[0]),
         "apex_state": str(row[1]),
         "crucible_state": str(row[2]),
@@ -31,18 +37,37 @@ def _row_to_dict(row) -> dict[str, Any]:
         "global_kill_switch": bool(row[5]),
         "updated_at": row[6],
     }
+    if len(row) > 7:
+        out["apex_observed_pid"] = row[7]
+        out["crucible_observed_pid"] = row[8]
+        out["supervisor_observed_pid"] = row[9]
+        out["last_reconcile_at"] = row[10]
+    return out
 
 
 def read_execution_controls(conn) -> dict[str, Any] | None:
-    row = conn.execute(
-        """
-        SELECT id, apex_state, crucible_state, target_execution_mode,
-               active_execution_mode, global_kill_switch, updated_at
-        FROM execution_controls
-        WHERE id = ?
-        """,
-        (ROW_ID,),
-    ).fetchone()
+    if _runtime_columns_present(conn):
+        row = conn.execute(
+            """
+            SELECT id, apex_state, crucible_state, target_execution_mode,
+                   active_execution_mode, global_kill_switch, updated_at,
+                   apex_observed_pid, crucible_observed_pid,
+                   supervisor_observed_pid, last_reconcile_at
+            FROM execution_controls
+            WHERE id = ?
+            """,
+            (ROW_ID,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """
+            SELECT id, apex_state, crucible_state, target_execution_mode,
+                   active_execution_mode, global_kill_switch, updated_at
+            FROM execution_controls
+            WHERE id = ?
+            """,
+            (ROW_ID,),
+        ).fetchone()
     if not row:
         return None
     return _row_to_dict(row)

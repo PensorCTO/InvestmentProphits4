@@ -25,7 +25,7 @@ IP4 is a **dual-engine paper arena** on libSQL (local sqld or Turso Cloud):
 
 ## Current State Audit
 
-*Last audited: 2026-06-22 21:45*
+*Last audited: 2026-06-23 09:38*
 
 ### Codebase (June 2026 audit refactor — landed)
 
@@ -56,16 +56,19 @@ IP4 is a **dual-engine paper arena** on libSQL (local sqld or Turso Cloud):
 - `ip4_supervisor.sh watch-bg` supervisor occasionally exits; agent should restart via `nohup .venv/bin/python scripts/supervisor_watch.py --dashboard`.
 
 ---
-
 ## Operator Runbook
 
 **Agent executes these — do not instruct the user to copy-paste unless they ask.**
 
-1. Ensure sqld: `.venv/bin/python scripts/start_local_sqld.py`
-2. Start stack: `nohup .venv/bin/python scripts/supervisor_watch.py --dashboard >> logs/supervisor.log 2>&1 &`
+**Full ritual:** `.cursor/skills/ip4-stack-lifecycle/SKILL.md`
+
+1. **Session start:** `.venv/bin/python scripts/stack_status.py` → fix or `restart_stack.py` if unhealthy
+2. Start/restart stack: `.venv/bin/python scripts/restart_stack.py`
 3. Verify: supervisor + apex + crucible + streamlit pids; dashboard HTTP 200 on :8501
-4. **Before claiming any fix done:** `.venv/bin/python scripts/acceptance_gate.py --scope full` (see `.cursor/skills/ip4-definition-of-done/SKILL.md`)
-4. Logs: `logs/supervisor.log`, `logs/apex.log`, `logs/crucible.log`, `logs/dashboard.log`
+4. **After stack restart:** `verify_trade_flow.py` must PASS (≥1 buy + ≥1 sell in current Apex session)
+5. **Before claiming any fix done:** `.venv/bin/python scripts/acceptance_gate.py --scope full`
+6. **Session end:** gate PASS + trade flow verified **OR** `stop_stack.py` + log "intentionally stopped"
+7. Logs: `logs/supervisor.log`, `logs/apex.log`, `logs/crucible.log`, `logs/dashboard.log`
 
 **Wallet STOPPED in UI:** Apex is likely still ticking. Check `trader_health.stoppage_kind` — EXECUTION_STARVATION means edge gate rejected signals, not infra failure.
 
@@ -104,11 +107,21 @@ Key modules post-audit:
 | done | Refresh `InvestmentProphits4_MASTER_BLUEPRINTS.md` via sync script (stale edge-gate docs) |
 | done | Sync Turso `active_strategy.python_source` with local champion after audit |
 | done | Enable `CROSS_VENUE_ENABLED=true` for paper cross-venue overlays |
+| done | Core Integration & Remediation refactor (5 phases — spec 2026-06-23) |
+| done | Learning loop integration (live feedback, toxicity gate, corpus refresh, scheduler, activity breakdown) |
 | todo | Harden supervisor persistence (`watch-bg` exit investigation; zombie child detection fixed) |
 
 ---
 
 ## Decisions Log
+
+### 2026-06-23 — Learning loop integration (Apex ↔ Crucible)
+
+- **Live feedback:** Crucible `build_proposal_prompt` includes Apex PnL/churn stats since last strategy KEEP via `live_trading_feedback.py` + `trading_activity_store.py`.
+- **Toxicity gate:** `should_reject_toxic_entry()` in gateway/live_gateway when `knowledge_core_vectors` ≥ 100; env `TOXICITY_GATE_ENABLED`, `TOXICITY_REJECT_THRESHOLD=0.25`.
+- **Resolved corpus:** `ensure_resolved_corpus()` always runs incremental Gamma + exhaust proxy seed (no early exit); Crucible refreshes every 50 iterations.
+- **Scheduler:** Crucible loop calls `run_due_jobs()` each iteration (genetic evolution, resurrection, janitor).
+- **Dashboard:** Activity breakdown (cap-stall vs alpha closes, churn ratio, alpha PnL) under Trading Activity.
 
 ### 2026-06-22 — Champion backtest resolved-only
 
@@ -144,6 +157,23 @@ Mirror IP2/IP3 pattern: `agent/project_wiki.py`, structured markdown sections, C
 
 ---
 
+### 2026-06-23 — 2026-06-23 — Core Integration spec (5 phases)
+shared/db_lock.py + arena_transaction savepoints; execution_controls observed PIDs; get_fresh_snapshot MTF gate + ORACLE_STARVATION; atomic strategy os.replace; OVERLAY_WEIGHTS AST gate; 10bps friction + quarter-Kelly (Apex + backtest); resolved_corpus table + slope REVERT judge.
+
+### 2026-06-23 — 2026-06-23 — Champion must include OVERLAY_WEIGHTS in Turso
+Apex loads python_source from DB; local active_strategy.py changes require write_active_strategy_source sync or strategy load fails every tick.
+
+### 2026-06-23 — Champion must include OVERLAY_WEIGHTS in Turso
+Apex loads python_source from DB; local active_strategy.py changes require write_active_strategy_source sync.
+
+### 2026-06-23 — Floor ladder to min_ladder when Kelly fraction is sub-minimum but cash allows
+Quarter-Kelly can produce cash*kelly < APEX_MIN_LADDER_USD while wallet has ample cash. compute_ladder_budget() floors to min_ladder when caps allow. classify_stoppage() treats min_ladder cap skips as healthy (kelly_below_min_ladder) unless cash < min_ladder — avoids false CAPITAL_STARVATION / STALLED / DEGRADED.
+
+### 2026-06-23 — Floor ladder to min_ladder when Kelly fraction is sub-minimum but cash allows
+Quarter-Kelly can produce cash*kelly < APEX_MIN_LADDER_USD while wallet has ample cash. compute_ladder_budget() floors to min_ladder when caps allow. classify_stoppage() treats min_ladder cap skips as healthy (kelly_below_min_ladder) unless cash < min_ladder — avoids false CAPITAL_STARVATION / STALLED / DEGRADED.
+
+### 2026-06-23 — 2026-06-23 — Cap-stall churn fix (hold deployed thesis)
+Cap-stall remediation was firing on fully_deployed ticks (max_legs=1 + aligned BUY_YES), force-closing and rebuying the same leg every ~3min (~-$0.27/cycle spread tax). Fix: is_cap_stall_tick/should_remediate_cap_stall skip fully_deployed; aligned max-leg positions stay open until thesis/TP/SL/flip. Apex logs show block=fully_deployed, zero CAP STALL remediate after restart.
 ## Lessons Learned
 
 ### 2026-06-22 — Turso champion lag caused wallet STOPPED (high)
@@ -196,6 +226,10 @@ Mirror IP2/IP3 pattern: `agent/project_wiki.py`, structured markdown sections, C
 
 ---
 
+### 2026-06-23 — Kelly-too-small min_ladder skips are not capital starvation (medium)
+- **Trigger:** Quarter-Kelly fractional_kelly too small; cap_reasons min_ladder with cash=$94
+- **Impact:** Dashboard trading stalled + wallet degraded (CAPITAL_STARVATION STOPPED)
+- **Prevention:** Floor ladder budget in sizing.py; classify min_ladder as healthy when cash >= min_ladder in stoppage.py
 ## User Preferences
 
 - 2026-06-22: **Agent executes** start/stop/fix operations — do not blather shell commands; do the work.
@@ -203,7 +237,8 @@ Mirror IP2/IP3 pattern: `agent/project_wiki.py`, structured markdown sections, C
 - 2026-06-22: Plan mode for large refactors; sequential 7-point audit build order was approved.
 
 ---
-
+- 2026-06-23: Never hand off a crashed or unverified IP4 stack. Session end must be gate PASS + stack_status --require-healthy OR clean stop_stack.py with wiki note.
+- 2026-06-23: After every stack restart: verify Apex + Crucible pids alive, then wait for verify_trade_flow.py PASS (≥1 buy + ≥1 sell in current Apex session) before handoff.
 ## Session Log
 
 ### 2026-06-22 — Priority Build Order (7-point audit refactor)
@@ -291,3 +326,49 @@ Mirror IP2/IP3 pattern: `agent/project_wiki.py`, structured markdown sections, C
 - **Live:** `restart_stack.py` → supervisor pid=48020, apex=48117; kill-test respawns in ~3s with log `Tracked Apex pid=… died — terminating stray … before respawn`. Cap remediate at 08:40:26; acceptance gate PASS (163 pytest).
 
 **Next:** Monitor supervisor through dashboard Start/Stop; soak cap cooldown cycle.
+
+### 2026-06-23 09:38 — Core Integration & Remediation refactor (Phases 1-5): db_lock, transactions, runtime PIDs, oracle_ts, get_fresh_snapshot, ORACLE_STARVATION, strategy_atomic, OVERLAY_WEIGHTS AST, 10bps friction, quarter-Kelly, resolved_corpus table, slope judge. 181 pytest pass. Champion synced Turso v93. acceptance_gate: infra OK; recent_fill FAIL only (62min, cap/edge blocked).
+
+**Next:** Monitor live fills; Crucible slope gate on next KEEP
+
+### 2026-06-23 09:43 — QA fix: trading stalled + wallet degraded from false CAPITAL_STARVATION. Root cause: quarter-Kelly fractional_kelly too small → min_ladder cap skips with $94 cash. Fixed compute_ladder_budget floor + stoppage classify. Apex restarted (pid 9649). trader_health: HEALTHY, trading_status=IDLE, zero_fill_streak=0. acceptance_gate --scope full PASS (183 pytest).
+
+**Next:** Monitor for fills when max_legs_per_market clears; investigate one-off Turso savepoint error on first post-restart tick if repeats.
+
+### 2026-06-23 09:52 — Created ip4-stack-lifecycle skill + scripts: stack_lifecycle.py, stop_stack.py, stack_status.py; refactored restart_stack.py. Session start/end ritual wired into llm-wiki.mdc and Operator Runbook. Verified restart + acceptance_gate PASS + stack_status --require-healthy.
+
+**Next:** Agents load ip4-stack-lifecycle at session start; fix Turso savepoint error if it recurs in current Apex session.
+
+### 2026-06-23 12:10 — Learning loop integration (5 recommendations)
+
+- **Live feedback:** `live_trading_feedback.py` + `trading_activity_store.py`; Crucible prompts include Apex PnL/churn since last KEEP.
+- **Toxicity gate:** `toxicity_gate.py` wired in PaperGateway/LiveGateway; `skipped_toxicity` on Apex ticks.
+- **Corpus:** `ensure_resolved_corpus()` incremental refresh; every 50 Crucible iterations.
+- **Scheduler:** `run_due_jobs()` each AutoResearch iteration.
+- **Dashboard:** cap-stall vs alpha activity breakdown.
+- **Verified:** 203 pytest; trade flow PASS in 244s (buy mkt_fed_cut, sell cap-remediate); acceptance_gate PASS.
+
+**Next:** Monitor Crucible KEEP attempts with live summary in prompts; confirm toxicity rejects once vector corpus grows.
+
+### 2026-06-23 12:45 — Dashboard honesty + auto-refresh fix
+
+- **User report:** Buy/sell figures looked phoney; heartbeat refresh broken.
+- **Root cause (refresh):** `_maybe_autorefresh()` only called `st.rerun()` when ≥5s since last load timestamp — Streamlit scripts exit after render, so nothing polled unless user clicked again. Fixed with `time.sleep(5); st.rerun()` loop.
+- **Root cause (phoney UI):** Trade Flow showed latched "Log buy/sell yes" from first session events; activity breakdown used "since strategy KEEP" (cumulative). Live Apex is mostly cap-stall buy→forced-sell churn on `mkt_fed_cut`.
+- **Fix:** `scan_apex_session_recent()` — last buy/sell with timestamps, session counts, cap-churn warning; activity scoped to Apex session; heartbeat banner at top with auto-refresh toggle.
+- **Verified:** 6 trade_flow tests pass; dashboard respawned (pid 3494).
+
+**Next:** User reload dashboard — confirm clock ticks every 5s; optional reduce cap-churn visibility in trade-flow PASS criteria separately from operator UI.
+
+### 2026-06-23 13:00 — Plumbing vs alpha verify badges
+
+- **`FlowVerdict`** in `trade_flow_verify.py`: `plumbing_ok` (log buy+sell), `alpha_ok` (thesis/flip/rebalance, not cap-stall), `stack_gate_ok` = plumbing only.
+- **CLI** `verify_trade_flow.py --snapshot` prints three lines: Plumbing / Alpha / Stack gate; JSON adds `plumbing_ok`, `alpha_ok`, `verdict`.
+- **Dashboard** Trade Flow panel: side-by-side PASS/FAIL/CHURN ONLY badges + alpha vs cap-stall metrics.
+- **Tests:** 8 pass in `test_trade_flow_verify.py`.
+
+**Next:** Optional `--require-alpha` wait flag for soak tests; document in ip4-stack-lifecycle that restart PASS is plumbing-only.
+
+### 2026-06-23 15:06 — Fixed cap-stall churn loop: stoppage.py + ip4_apex_edge.py hold aligned max-leg positions instead of remediate→rebuy. 29 stoppage tests pass; trading acceptance_gate PASS; stack HEALTHY fully_deployed; 0 cap-stall events post-restart.
+
+**Next:** Monitor NAV for alpha closes (TP/SL/thesis); fix NO stop-loss exit price bug (+ false win).

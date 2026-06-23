@@ -63,6 +63,21 @@ def test_classify_capital_starvation():
     assert kind == "CAPITAL_STARVATION"
 
 
+def test_classify_kelly_below_min_ladder_not_capital_starvation():
+    kind, detail = classify_stoppage(
+        TickStats(
+            signals=1,
+            skipped_cap=1,
+            filled=0,
+            cash=94.0,
+            min_ladder_usd=5.0,
+            cap_reasons={"min_ladder": 1},
+        )
+    )
+    assert kind is None
+    assert detail == "kelly_below_min_ladder"
+
+
 def test_healthy_on_fill():
     kind, _ = classify_stoppage(TickStats(filled=1, signals=1))
     assert kind is None
@@ -254,6 +269,19 @@ def test_derive_dominant_block_reason_all_hold():
     )
 
 
+def test_derive_dominant_block_reason_fully_deployed():
+    assert (
+        derive_dominant_block_reason(
+            TickStats(
+                signals=0,
+                skipped_already_positioned=1,
+                cap_reasons={"max_legs_per_market": 1},
+            )
+        )
+        == "fully_deployed"
+    )
+
+
 def test_derive_trading_status_stalled():
     stats = TickStats(signals=2, skipped_edge=1, filled=0)
     assert derive_trading_status(stats, zero_fill_streak=18) == "STALLED"
@@ -280,6 +308,58 @@ def test_tracker_zero_fill_streak_actionable_only():
     assert tracker.zero_fill_streak == 1
     tracker.observe(TickStats(closed_rebalance=1, signals=1, skipped_edge=1))
     assert tracker.zero_fill_streak == 0
+
+
+def test_is_cap_stall_tick_fully_deployed_not_stall():
+    stats = TickStats(
+        signals=0,
+        skipped_already_positioned=1,
+        filled=0,
+        cap_reasons={"max_legs_per_market": 1},
+    )
+    from engine_1_apex.stoppage import is_cap_stall_tick
+
+    assert is_cap_stall_tick(stats) is False
+
+
+def test_should_remediate_cap_stall_skips_fully_deployed():
+    from engine_1_apex.stoppage import should_remediate_cap_stall
+
+    stats = TickStats(
+        signals=0,
+        skipped_already_positioned=1,
+        filled=0,
+        cap_reasons={"max_legs_per_market": 1},
+    )
+    assert should_remediate_cap_stall(stats) is False
+
+
+def test_should_remediate_cap_stall_allows_cap_blocked():
+    from engine_1_apex.stoppage import should_remediate_cap_stall
+
+    stats = TickStats(
+        signals=1,
+        skipped_cap=1,
+        filled=0,
+        cap_reasons={"max_legs_per_market": 1},
+    )
+    assert should_remediate_cap_stall(stats) is True
+
+
+def test_tracker_fully_deployed_does_not_build_cap_streak():
+    from engine_1_apex.stoppage import is_cap_stall_tick
+
+    tracker = StoppageTracker()
+    stats = TickStats(
+        signals=0,
+        skipped_already_positioned=1,
+        filled=0,
+        cap_reasons={"max_legs_per_market": 1},
+    )
+    assert is_cap_stall_tick(stats) is False
+    for _ in range(25):
+        tracker.observe(stats)
+    assert tracker.cap_blocked_streak == 0
 
 
 def test_tracker_cap_blocked_streak():

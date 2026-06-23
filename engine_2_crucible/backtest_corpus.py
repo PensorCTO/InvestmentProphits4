@@ -29,6 +29,12 @@ def synthetic_resolution(market_id: str, as_of_ms: int, mid: float) -> int:
 
 
 def load_resolutions(conn) -> dict[str, int | None]:
+    from database.resolved_corpus_store import load_resolved_corpus
+
+    corpus = load_resolved_corpus(conn)
+    if corpus:
+        return {market_id: int(value) for market_id, value in corpus.items()}
+
     rows = conn.execute(
         """
         SELECT market_id, is_resolved, resolution_value, backtest_resolution_value

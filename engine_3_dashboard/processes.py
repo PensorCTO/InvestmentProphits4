@@ -99,11 +99,26 @@ def _supervisor_pid() -> int | None:
     return _first_pid("scripts/supervisor_watch.py")
 
 
-def fetch_engine_processes() -> dict[str, int | None]:
+def fetch_engine_processes(controls: dict | None = None) -> dict[str, int | None]:
+    """Return engine PIDs; prefer supervisor-observed PIDs from DB when available."""
+    supervisor = _supervisor_pid()
+    apex: int | None = None
+    crucible: int | None = None
+
+    if controls and supervisor is not None:
+        apex_db = controls.get("apex_observed_pid")
+        crucible_db = controls.get("crucible_observed_pid")
+        if apex_db is not None and _pid_alive(int(apex_db)):
+            apex = int(apex_db)
+        if crucible_db is not None and _pid_alive(int(crucible_db)):
+            crucible = int(crucible_db)
+
     return {
-        "supervisor": _supervisor_pid(),
-        "apex": _first_pid("engine_1_apex/ip4_apex_edge.py"),
-        "crucible": _first_pid("engine_2_crucible/ip4_swarm_crucible.py"),
+        "supervisor": supervisor,
+        "apex": apex if apex is not None else _first_pid("engine_1_apex/ip4_apex_edge.py"),
+        "crucible": crucible
+        if crucible is not None
+        else _first_pid("engine_2_crucible/ip4_swarm_crucible.py"),
         "dashboard_watch": _first_pid("scripts/dashboard_service.py watch"),
     }
 

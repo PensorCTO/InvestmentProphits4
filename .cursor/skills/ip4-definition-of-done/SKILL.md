@@ -29,6 +29,7 @@ Do **not** tell the user the work is complete if any of these are true:
 - Only `verify_stack.py` (infra) passed while trading is STALLED **or** zero-fill streak ≥ 18 with signals
 - Subagents reported success but **you** did not run the acceptance gate
 - Apex/Crucible/dashboard were **not restarted** after code changes
+- Stack was restarted but **verify_trade_flow.py** did not PASS (no buy + sell since restart)
 - Dashboard was not loaded or queried after UI changes
 - Trading fix claimed without `trader_health.trading_status != STALLED` (unless user scoped infra-only)
 
@@ -70,6 +71,7 @@ Copy and track:
 - [ ] 2. Baseline: acceptance_gate.py --scope full --baseline
 - [ ] 3. Implement + unit tests
 - [ ] 4. Restart affected processes (agent runs — not the user)
+- [ ] 4b. After stack restart: `verify_trade_flow.py` → buy + sell observed (see ip4-stack-lifecycle skill)
 - [ ] 5. acceptance_gate.py --scope full → PASS
 - [ ] 6. Live evidence captured (see below)
 - [ ] 7. Session log + honest summary to user
@@ -142,10 +144,15 @@ If trading is **honestly** edge-gated (live CLOB, negative net edge), say so exp
 ## Related commands
 
 ```bash
-.venv/bin/python scripts/restart_stack.py      # after stack-level changes
+.venv/bin/python scripts/stack_status.py              # session start/end snapshot
+.venv/bin/python scripts/verify_trade_flow.py           # post-restart buy+sell wait
+.venv/bin/python scripts/stop_stack.py                # clean stop (DB HALTED)
+.venv/bin/python scripts/restart_stack.py             # restart + infra + trade flow
 .venv/bin/python scripts/trader_health_audit.py --trading
 .venv/bin/pytest tests/ -q
 ```
+
+See also: `.cursor/skills/ip4-stack-lifecycle/SKILL.md` — mandatory session start/end ritual.
 
 ## Wiki
 

@@ -12,6 +12,22 @@ from typing import Callable
 
 VALID_DECISIONS = frozenset({"BUY_YES", "BUY_NO", "HOLD"})
 
+OVERLAY_WEIGHT_KEYS = frozenset(
+    {
+        "order_book_imbalance",
+        "cross_venue_adj",
+        "spread",
+        "mid_price",
+        "bid_depth",
+        "ask_depth",
+    }
+)
+
+DEFAULT_OVERLAY_WEIGHTS = {
+    "order_book_imbalance": 0.5,
+    "cross_venue_adj": 0.5,
+}
+
 BLOCKED_IMPORT_MODULES = frozenset(
     {
         "os",
@@ -134,6 +150,46 @@ def validate_strategy_ast(python_source: str) -> None:
     fn = evaluate_defs[0]
     if len(fn.args.args) < 1:
         raise StrategyLoadError("evaluate_market must accept at least one argument (market_state)")
+
+    _validate_overlay_weights(tree)
+
+
+def _validate_overlay_weights(tree: ast.AST) -> None:
+    """Require module-level OVERLAY_WEIGHTS dict summing to ~1.0."""
+    weights_node: ast.AST | None = None
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "OVERLAY_WEIGHTS":
+                    weights_node = node.value
+                    break
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            if node.target.id == "OVERLAY_WEIGHTS":
+                weights_node = node.value
+
+    if weights_node is None:
+        raise StrategyLoadError(
+            "Source must define OVERLAY_WEIGHTS dict mapping overlay keys to [0,1] weights"
+        )
+    if not isinstance(weights_node, ast.Dict):
+        raise StrategyLoadError("OVERLAY_WEIGHTS must be a literal dict")
+
+    total = 0.0
+    for key_node, val_node in zip(weights_node.keys, weights_node.values):
+        if not isinstance(key_node, ast.Constant) or not isinstance(key_node.value, str):
+            raise StrategyLoadError("OVERLAY_WEIGHTS keys must be string literals")
+        key = key_node.value
+        if key not in OVERLAY_WEIGHT_KEYS:
+            raise StrategyLoadError(f"OVERLAY_WEIGHTS unknown key: {key}")
+        if not isinstance(val_node, ast.Constant) or not isinstance(val_node.value, (int, float)):
+            raise StrategyLoadError("OVERLAY_WEIGHTS values must be numeric literals")
+        weight = float(val_node.value)
+        if weight < 0.0 or weight > 1.0:
+            raise StrategyLoadError(f"OVERLAY_WEIGHTS[{key!r}] must be in [0, 1]")
+        total += weight
+
+    if abs(total - 1.0) > 0.05:
+        raise StrategyLoadError(f"OVERLAY_WEIGHTS must sum to ~1.0 (got {total:.3f})")
 
 
 def _compile_evaluate_market(python_source: str) -> Callable[[dict], str]:

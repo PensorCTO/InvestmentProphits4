@@ -52,6 +52,7 @@ def apply_core_schema(conn, *, embedding_dims: int | None = None) -> None:
             as_of_ms INTEGER NOT NULL,
             oracle_snapshot_id TEXT,
             payload TEXT NOT NULL,
+            oracle_ts INTEGER,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
     """)
@@ -143,7 +144,11 @@ def apply_core_schema(conn, *, embedding_dims: int | None = None) -> None:
             target_execution_mode TEXT NOT NULL DEFAULT 'PAPER',
             active_execution_mode TEXT NOT NULL DEFAULT 'PAPER',
             global_kill_switch INTEGER NOT NULL DEFAULT 0,
-            updated_at TEXT
+            updated_at TEXT,
+            apex_observed_pid INTEGER,
+            crucible_observed_pid INTEGER,
+            supervisor_observed_pid INTEGER,
+            last_reconcile_at TEXT
         );
     """)
 

@@ -130,13 +130,22 @@ def fetch_trader_status(conn) -> dict:
                 f"Trading stalled: {health.get('zero_fill_streak', 0)} ticks with signals, "
                 f"0 fills — block={block_reason}{market_suffix}"
             )
-            if block_reason == "cap_blocked":
+            if block_reason in {"cap_blocked", "fully_deployed"}:
                 cap_msg = (
                     "Fully deployed at max legs — auto-remediation pending or restart wallet"
                 )
                 if open_markets:
                     cap_msg = f"{cap_msg} ({', '.join(open_markets)})"
                 trading_warnings.append(cap_msg)
+        elif health.get("dominant_block_reason") in {"cap_blocked", "fully_deployed"}:
+            open_markets = _fetch_open_market_ids(conn)
+            cap_msg = (
+                "Fully deployed at max legs per market — waiting for auto-remediation "
+                f"({os.getenv('APEX_CAP_STALL_REMEDIATE_TICKS', '18')} ticks) or thesis exit"
+            )
+            if open_markets:
+                cap_msg = f"{cap_msg} — open: {', '.join(open_markets)}"
+            trading_warnings.append(cap_msg)
 
     blockers = infra_blockers + trading_blockers
     return {
@@ -218,11 +227,44 @@ def restart_simulated_wallet(conn) -> dict:
     )
 
 
-def tail_log(path: Path, *, max_lines: int = 40) -> str:
+def tail_log(path: Path, *, max_lines: int = 40, max_bytes: int = 512_000) -> str:
+    """Return the last N lines without reading multi-MB logs whole-file."""
     if not path.is_file():
         return f"(log not found: {path})"
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(0, size - max_bytes))
+            chunk = handle.read().decode("utf-8", errors="replace")
+    except OSError as exc:
+        return f"(log read error: {exc})"
+    lines = chunk.splitlines()
     return "\n".join(lines[-max_lines:])
+
+
+def log_file_status(path: Path, *, stale_seconds: float = 30.0) -> dict:
+    """Freshness metadata for dashboard log panels."""
+    from datetime import datetime
+
+    if not path.is_file():
+        return {
+            "exists": False,
+            "stale": True,
+            "age_seconds": None,
+            "last_modified": None,
+            "last_line": "(missing)",
+        }
+    mtime = datetime.fromtimestamp(path.stat().st_mtime)
+    age = (datetime.now() - mtime).total_seconds()
+    last_line = tail_log(path, max_lines=1).splitlines()
+    return {
+        "exists": True,
+        "stale": age > stale_seconds,
+        "age_seconds": age,
+        "last_modified": mtime.strftime("%H:%M:%S"),
+        "last_line": last_line[-1] if last_line else "(empty)",
+    }
 
 
 __all__ = [
@@ -241,6 +283,7 @@ __all__ = [
     "set_crucible_state",
     "set_global_kill_switch",
     "tail_log",
+    "log_file_status",
     "update_execution_controls",
     "LOG_DIR",
 ]

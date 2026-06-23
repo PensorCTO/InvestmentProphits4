@@ -22,6 +22,7 @@ class TickStats:
     skipped_hold: int = 0
     skipped_cooldown: int = 0
     skipped_edge: int = 0
+    skipped_toxicity: int = 0
     skipped_already_positioned: int = 0
     evaluated: int = 0
     signals: int = 0
@@ -46,7 +47,17 @@ def cap_stall_remediate_ticks() -> int:
 
 
 def cap_stall_entry_cooldown_seconds() -> int:
-    return int(os.getenv("APEX_CAP_STALL_ENTRY_COOLDOWN_SECONDS", "600"))
+    default = "60" if _paper_execution() else "600"
+    return int(os.getenv("APEX_CAP_STALL_ENTRY_COOLDOWN_SECONDS", default))
+
+
+def _paper_execution() -> bool:
+    try:
+        from shared.arena_mode import is_paper_execution
+
+        return is_paper_execution()
+    except Exception:
+        return os.getenv("EXECUTION_MODE", "paper").strip().lower() != "live"
 
 
 def actionable_unfilled_signals(stats: TickStats) -> int:
@@ -60,7 +71,20 @@ def is_cap_stall_tick(stats: TickStats) -> bool:
     """Persistent max_legs_per_market block with no fill or close this tick."""
     if stats.filled > 0 or stats.closed_rebalance > 0 or stats.closed_flip > 0:
         return False
+    if derive_dominant_block_reason(stats) == "fully_deployed":
+        # Already holding max legs in the signaled direction — not a stall.
+        return False
     return bool((stats.cap_reasons or {}).get("max_legs_per_market"))
+
+
+def should_remediate_cap_stall(stats: TickStats) -> bool:
+    """True when max_legs cap block is starving *new* entries, not a held thesis."""
+    if not (stats.cap_reasons or {}).get("max_legs_per_market"):
+        return False
+    reason = derive_dominant_block_reason(stats)
+    if reason == "fully_deployed":
+        return False
+    return reason == "cap_blocked"
 
 
 def _minutes_since_iso(iso: str | None) -> float | None:
@@ -82,6 +106,9 @@ def derive_dominant_block_reason(stats: TickStats) -> str:
     if stats.evaluated > 0 and stats.skipped_hold >= stats.evaluated:
         return "all_hold"
     cap_keys = stats.cap_reasons or {}
+    if cap_keys.get("max_legs_per_market") or cap_keys.get("max_legs"):
+        if stats.signals == 0 and stats.skipped_already_positioned > 0:
+            return "fully_deployed"
     if stats.skipped_cap > 0 or cap_keys:
         return "cap_blocked"
     if stats.signals > 0 and stats.skipped_edge >= stats.signals:
@@ -143,9 +170,18 @@ def classify_stoppage(stats: TickStats) -> tuple[str | None, str]:
                 return None, "deployed_or_edge_gated"
             capital_block = stats.skipped_cap > 0 and (
                 stats.cash < stats.min_ladder_usd
-                or cap_keys.get("min_ladder", 0) > 0
                 or cap_keys.get("position_cap", 0) > 0
             )
+            if (
+                cap_keys.get("min_ladder", 0) > 0
+                and stats.cash < stats.min_ladder_usd
+            ):
+                capital_block = True
+            if (
+                cap_keys.get("min_ladder", 0) > 0
+                and stats.cash >= stats.min_ladder_usd
+            ):
+                return None, "kelly_below_min_ladder"
             if capital_block:
                 return (
                     "CAPITAL_STARVATION",

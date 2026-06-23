@@ -9,6 +9,8 @@ class PolyCostModel:
     Strictly Paper Execution.
     """
 
+    BASELINE_FRICTION_BPS = 0.001  # 10 bps — hardcoded per spec
+
     # Base spread when crossing the book (Ask - Bid)
     TIER_SPREADS = {
         "HIGH_LIQUIDITY": 0.005,  # e.g., Major US Election, >$10M volume
@@ -171,7 +173,7 @@ class PolyCostModel:
         half_spread = cls.TIER_SPREADS.get(liquidity_tier, 0.035) / 2.0
         slippage = cls._slippage(bet_size, liquidity_tier, capital=capital)
 
-        net_edge = raw_edge - (half_spread + slippage)
+        net_edge = raw_edge - (half_spread + slippage + cls.BASELINE_FRICTION_BPS)
         return net_edge
 
     @classmethod
@@ -190,8 +192,8 @@ class PolyCostModel:
             market_mid, direction, liquidity_tier, bet_size, capital=capital
         )
         if direction == "YES":
-            return fair_value - fill
-        return (1.0 - fair_value) - fill
+            return fair_value - fill - cls.BASELINE_FRICTION_BPS
+        return (1.0 - fair_value) - fill - cls.BASELINE_FRICTION_BPS
 
     @classmethod
     def get_position_exit_price(

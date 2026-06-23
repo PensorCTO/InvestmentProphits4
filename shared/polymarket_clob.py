@@ -58,6 +58,8 @@ class ClobSnapshot:
     ask_depth: float
     clob_token_ids: list[str] | None = None
     liquidity_tier: str | None = None
+    ephemeral_ratio: float = 0.0
+    mtf_applied: bool = False
 
 
 def _parse_token_ids(raw: str | None) -> list[str] | None:
@@ -352,6 +354,8 @@ class PolymarketClobClient:
             ask_depth=yes_ask + no_ask,
             clob_token_ids=token_ids,
             liquidity_tier=tier,
+            ephemeral_ratio=float(yes_book.get("ephemeral_ratio", 0.0)),
+            mtf_applied=bool(yes_book.get("mtf_applied", False)),
         )
 
 

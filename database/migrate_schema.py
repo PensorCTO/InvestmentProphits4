@@ -463,6 +463,30 @@ def migrate_system_halt(conn) -> bool:
     return True
 
 
+def migrate_execution_controls_runtime_pids(conn) -> bool:
+    """Supervisor-observed PIDs for DB↔OS reconciliation."""
+    if not _table_exists(conn, "execution_controls"):
+        return False
+    changed = False
+    columns = [
+        ("apex_observed_pid", "INTEGER"),
+        ("crucible_observed_pid", "INTEGER"),
+        ("supervisor_observed_pid", "INTEGER"),
+        ("last_reconcile_at", "TEXT"),
+    ]
+    for name, col_type in columns:
+        if _column_exists(conn, "execution_controls", name):
+            continue
+        try:
+            conn.execute(f"ALTER TABLE execution_controls ADD COLUMN {name} {col_type}")
+        except Exception as exc:
+            if "duplicate column" in str(exc).lower():
+                continue
+            raise
+        changed = True
+    return changed
+
+
 def migrate_execution_controls(conn) -> bool:
     changed = False
     if not _table_exists(conn, "execution_controls"):
@@ -788,6 +812,38 @@ def migrate_active_strategy_python_source(conn) -> bool:
         )
         changed = True
     return changed
+
+
+def migrate_resolved_corpus(conn) -> bool:
+    if _table_exists(conn, "resolved_corpus"):
+        return False
+    conn.execute(
+        """
+        CREATE TABLE resolved_corpus (
+            market_id TEXT PRIMARY KEY,
+            resolution_value INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            exhaust_points INTEGER,
+            resolved_at TEXT,
+            FOREIGN KEY(market_id) REFERENCES markets_ledger(market_id)
+        )
+        """
+    )
+    return True
+
+
+def migrate_trade_exhaust_oracle_ts(conn) -> bool:
+    if not _table_exists(conn, "trade_exhaust"):
+        return False
+    if _column_exists(conn, "trade_exhaust", "oracle_ts"):
+        return False
+    try:
+        conn.execute("ALTER TABLE trade_exhaust ADD COLUMN oracle_ts INTEGER")
+    except Exception as exc:
+        if "duplicate column" in str(exc).lower():
+            return False
+        raise
+    return True
 
 
 def migrate_trade_exhaust(conn) -> bool:
@@ -1156,6 +1212,8 @@ def migrate_connection(conn, label: str, *, quiet: bool = False) -> None:
         changes.append("system_halt")
     if migrate_execution_controls(conn):
         changes.append("execution_controls")
+    if migrate_execution_controls_runtime_pids(conn):
+        changes.append("execution_controls.runtime_pids")
     if migrate_trader_health(conn):
         changes.append("trader_health")
     if migrate_trader_health_trading_activity(conn):
@@ -1182,8 +1240,12 @@ def migrate_connection(conn, label: str, *, quiet: bool = False) -> None:
         changes.append("active_strategy")
     if migrate_active_strategy_python_source(conn):
         changes.append("active_strategy.python_source+best_score")
+    if migrate_resolved_corpus(conn):
+        changes.append("resolved_corpus")
     if migrate_trade_exhaust(conn):
         changes.append("trade_exhaust")
+    if migrate_trade_exhaust_oracle_ts(conn):
+        changes.append("trade_exhaust.oracle_ts")
     if repair_market_state_payload(conn):
         changes.append("market_state.repair_utf8_payload")
     if migrate_locked_commitments(conn):

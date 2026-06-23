@@ -17,6 +17,9 @@ from engine_1_apex.sizing import (
 )
 from shared.poly_costs import PolyCostModel
 from database.replica_store import commit_local, open_replica, request_cloud_sync, sync_replica_now
+from database.transaction import arena_transaction
+from database.knowledge_store import KnowledgeStore
+from engine_1_apex.toxicity_gate import should_reject_toxic_entry
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(_PROJECT_ROOT / ".env")
@@ -34,6 +37,7 @@ class PaperGateway:
         self.replica_path = os.getenv("LOCAL_REPLICA_PATH", "./ip4_local_replica.db")
         self.sync_url = os.getenv("TURSO_DATABASE_URL")
         self.auth_token = os.getenv("TURSO_AUTH_TOKEN")
+        self._knowledge = KnowledgeStore()
 
         # MINIMUM_NET_EDGE is absolute. Do not lower this to chase churn.
         self.MIN_NET_EDGE = effective_min_net_edge()
@@ -210,6 +214,12 @@ class PaperGateway:
                     "reason": f"Net Edge {net_edge:.4f} < {edge_threshold}",
                 }
 
+            _tox_score, tox_reason = should_reject_toxic_entry(
+                self._knowledge, entry_context, conn=own_conn
+            )
+            if tox_reason:
+                return {"status": "REJECTED", "reason": tox_reason}
+
             fill_price = PolyCostModel.get_execution_price(
                 market_mid, direction, liquidity_tier, kelly_size, capital=capital
             )
@@ -224,31 +234,31 @@ class PaperGateway:
             if not assert_market_unresolved(own_conn, market_id):
                 return {"status": "REJECTED", "reason": "market_resolved"}
 
-            own_conn.execute(
-                """
-                INSERT INTO trade_execution
-                (trade_id, agent_id, market_id, direction, entry_price, kelly_size,
-                 bracket_stop_loss, bracket_take_profit, entry_context)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    trade_id,
-                    agent_id,
-                    market_id,
-                    direction,
-                    fill_price,
-                    kelly_size,
-                    stop_loss,
-                    take_profit,
-                    PaperGateway._tag_entry_context(entry_context, net_edge),
-                ),
-            )
-            own_conn.execute(
-                "UPDATE agent_archetypes SET capital = capital - ? WHERE agent_id = ?",
-                (kelly_size, agent_id),
-            )
+            with arena_transaction(own_conn, auto_commit=close_conn):
+                own_conn.execute(
+                    """
+                    INSERT INTO trade_execution
+                    (trade_id, agent_id, market_id, direction, entry_price, kelly_size,
+                     bracket_stop_loss, bracket_take_profit, entry_context)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        trade_id,
+                        agent_id,
+                        market_id,
+                        direction,
+                        fill_price,
+                        kelly_size,
+                        stop_loss,
+                        take_profit,
+                        PaperGateway._tag_entry_context(entry_context, net_edge),
+                    ),
+                )
+                own_conn.execute(
+                    "UPDATE agent_archetypes SET capital = capital - ? WHERE agent_id = ?",
+                    (kelly_size, agent_id),
+                )
             if close_conn:
-                commit_local(own_conn)
                 request_cloud_sync("gateway_swarm_fill")
             return {
                 "status": "FILLED",

@@ -74,19 +74,30 @@ def _sortino_ratio(returns: list[float]) -> float:
     return mean_r / downside_dev
 
 
+def _fair_value_for_backtest(state: dict, direction: str) -> float:
+    """Lightweight fair value for Kelly sizing during exhaust replay."""
+    mid = float(state.get("mid_price", 0.5))
+    obi = float(state.get("order_book_imbalance", 0.0))
+    bump = abs(obi) * 0.08
+    if direction == "YES":
+        return min(0.99, mid + bump) if obi >= 0 else mid
+    return max(0.01, mid - bump) if obi <= 0 else mid
+
+
 def _score_samples(
     samples: list[tuple[dict, int]],
     evaluate_market: Callable[[dict], str],
-) -> tuple[float, int, float]:
-    """Return (score, trade_count, max_drawdown) for a sample corpus."""
+) -> tuple[float, int, float, list[float]]:
+    """Return (score, trade_count, max_drawdown, per-trade returns) for a sample corpus."""
+    from engine_1_apex.kelly_sizing import compute_fractional_kelly
+
     if not samples:
-        return 0.0, 0, 0.0
+        return 0.0, 0, 0.0, []
 
     capital = INITIAL_CAPITAL
     peak_capital = INITIAL_CAPITAL
     max_drawdown = 0.0
     trade_returns: list[float] = []
-    stake = 1.0
 
     for state, resolution in samples:
         decision = evaluate_market(state)
@@ -97,6 +108,17 @@ def _score_samples(
         spread = float(state.get("spread", 0.03))
         entry = _entry_cost(mid, spread, decision)
         if entry <= 0 or entry >= 1:
+            continue
+
+        direction = "YES" if decision == "BUY_YES" else "NO"
+        fair_value = _fair_value_for_backtest(state, direction)
+        kelly_frac = compute_fractional_kelly(
+            fair_value=fair_value,
+            market_mid=mid,
+            direction=direction,
+        )
+        stake = capital * kelly_frac
+        if stake < 1.0:
             continue
 
         ret = _trade_return(decision, entry, resolution)
@@ -117,7 +139,7 @@ def _score_samples(
     if not trade_returns and samples:
         score = total_return
 
-    return score, len(trade_returns), max_drawdown
+    return score, len(trade_returns), max_drawdown, trade_returns
 
 
 def run_backtest() -> float:
@@ -140,13 +162,13 @@ def run_backtest() -> float:
         resolved_samples = flatten_exhaust_rows(conn, BACKTEST_MAX_ROWS, use_mock=False)
         if mock_resolutions_enabled():
             dev_samples = flatten_exhaust_rows(conn, BACKTEST_MAX_ROWS, use_mock=True)
-            dev_score, dev_trades, _ = _score_samples(dev_samples, evaluate_market)
+            dev_score, dev_trades, _, _ = _score_samples(dev_samples, evaluate_market)
             print(f"RESEARCH_SCORE:{dev_score:.4f}", flush=True)
             print(f"RESEARCH_TRADES:{dev_trades}", flush=True)
     finally:
         conn.close()
 
-    score, trades, _ = _score_samples(resolved_samples, evaluate_market)
+    score, trades, _, _ = _score_samples(resolved_samples, evaluate_market)
     print(f"TRADES:{trades}", flush=True)
     print(f"SCORE:{score:.4f}", flush=True)
     return score

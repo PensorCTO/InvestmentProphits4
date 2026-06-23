@@ -73,6 +73,33 @@ def test_cap_blocked_stall_infra_ready_with_warning(db_conn):
     assert any("mkt_us_election" in w for w in status["trading_warnings"])
 
 
+def test_fully_deployed_idle_shows_caution_not_stall(db_conn):
+    controls = {
+        "active_execution_mode": "PAPER",
+        "target_execution_mode": "PAPER",
+        "apex_state": "RUNNING",
+        "global_kill_switch": False,
+    }
+    health = {
+        "status": "HEALTHY",
+        "trading_status": "IDLE",
+        "zero_fill_streak": 0,
+        "dominant_block_reason": "fully_deployed",
+    }
+    with patch.object(db, "fetch_controls", return_value=controls):
+        with patch.object(db, "read_trader_health", return_value=health):
+            with patch.object(
+                db,
+                "_fetch_open_market_ids",
+                return_value=["mkt_us_election"],
+            ):
+                status = db.fetch_trader_status(db_conn)
+    assert status["ready"] is True
+    assert status["trading_ready"] is True
+    assert status["trading_blockers"] == []
+    assert any("Fully deployed at max legs" in w for w in status["trading_warnings"])
+
+
 def test_stopped_adds_trading_blocker(db_conn):
     controls = {
         "active_execution_mode": "PAPER",

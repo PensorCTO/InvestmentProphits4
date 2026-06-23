@@ -19,6 +19,10 @@ from engine_2_crucible.strategy_loader import (
 )
 
 VALID_STRATEGY = """
+OVERLAY_WEIGHTS = {
+    "order_book_imbalance": 1.0,
+}
+
 def evaluate_market(market_state):
     obi = float(market_state.get("order_book_imbalance", 0.0))
     if obi > 0.1:
@@ -46,6 +50,8 @@ def test_validate_strategy_ast_rejects_import_os():
 
 def test_validate_strategy_ast_rejects_blocked_call():
     source = """
+OVERLAY_WEIGHTS = {"order_book_imbalance": 1.0}
+
 def evaluate_market(market_state):
     eval("1")
     return "HOLD"
@@ -66,6 +72,8 @@ def test_load_evaluate_market_from_source_subprocess():
 def test_subprocess_rejects_infinite_loop(monkeypatch):
     monkeypatch.setenv("STRATEGY_SANDBOX_TIMEOUT", "2")
     source = """
+OVERLAY_WEIGHTS = {"order_book_imbalance": 1.0}
+
 def evaluate_market(market_state):
     while True:
         pass

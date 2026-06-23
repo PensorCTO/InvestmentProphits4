@@ -179,6 +179,7 @@ def _spawn(name: str, script: Path, log_path: Path, *, reason: str) -> subproces
         stdout=log_file,
         stderr=subprocess.STDOUT,
         start_new_session=True,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
     )
     logger.info("Started %s pid=%s reason=%s", name, proc.pid, reason)
     _post_spawn_verify(name)
@@ -252,6 +253,26 @@ class SupervisorWatch:
         self._crucible_pid: int | None = None
         self._last_health_audit = 0.0
         self._lock_handle = None
+
+    def _observed_pid(self, pid: int | None) -> int | None:
+        if pid is not None and _pid_alive(pid):
+            return pid
+        return None
+
+    def _write_runtime_observation(self, conn) -> None:
+        from database.runtime_state_store import write_runtime_observation
+
+        try:
+            write_runtime_observation(
+                conn,
+                apex_observed_pid=self._observed_pid(self._apex_pid),
+                crucible_observed_pid=self._observed_pid(self._crucible_pid),
+                supervisor_observed_pid=os.getpid(),
+                commit=True,
+                sync=False,
+            )
+        except Exception as exc:
+            logger.warning("Runtime observation write failed: %s", exc)
 
     def _maybe_run_health_audit(self) -> None:
         if TRADER_HEALTH_AUDIT_SECONDS <= 0:
@@ -461,6 +482,7 @@ class SupervisorWatch:
                     self._ensure_apex(controls)
                     self._ensure_crucible(controls)
                     self._ensure_dashboard()
+                    self._write_runtime_observation(conn)
                     self._maybe_run_health_audit()
                 except Exception as exc:
                     logger.error("Supervisor tick failed: %s", exc)

@@ -155,31 +155,24 @@ def refresh_gamma_resolutions(conn, *, commit: bool = True) -> int:
 
 def ensure_resolved_corpus(conn, *, commit: bool = True) -> dict:
     """
-    Ensure at least one backtest resolution label exists for Crucible replay.
+    Incrementally refresh backtest resolution labels for Crucible replay.
 
-    Order: Gamma refresh for real closures, then exhaust mid-drift proxies.
+    Always runs Gamma refresh + exhaust proxy seed (skips already-labeled markets)
+    then syncs the materialized resolved_corpus table.
     """
-    corpus_count = _corpus_resolution_count(conn)
-    if corpus_count:
-        return {"already_resolved": corpus_count, "gamma_added": 0, "proxy_updated": 0}
-
     gamma_added = refresh_gamma_resolutions(conn, commit=False)
-    corpus_count = _corpus_resolution_count(conn)
-    if corpus_count:
-        if commit:
-            commit_local(conn)
-        return {
-            "already_resolved": 0,
-            "gamma_added": gamma_added,
-            "proxy_updated": 0,
-        }
-
     proxy = seed_resolved_corpus_from_exhaust(conn, commit=False)
+    from database.resolved_corpus_store import sync_resolved_corpus_from_ledger
+
+    synced = sync_resolved_corpus_from_ledger(conn, commit=False)
+    corpus_total = _corpus_resolution_count(conn)
     if commit:
         commit_local(conn)
     return {
-        "already_resolved": 0,
         "gamma_added": gamma_added,
         "proxy_updated": int(proxy.get("updated", 0)),
+        "proxy_skipped": int(proxy.get("skipped_insufficient_data", 0)),
+        "corpus_synced": synced,
+        "corpus_total": corpus_total,
         **proxy,
     }

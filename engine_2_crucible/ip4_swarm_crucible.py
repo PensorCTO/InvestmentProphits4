@@ -19,7 +19,8 @@ from dotenv import load_dotenv
 
 load_dotenv(PROJECT_ROOT / ".env", override=True)
 
-from database.arena_lock import arena_lock
+from shared.db_lock import arena_lock
+from database.transaction import arena_transaction
 from database.execution_controls_store import read_execution_controls
 from database.migrate_schema import ensure_replica_schema
 from database.replica_store import open_replica, request_cloud_sync, sync_replica_now
@@ -29,6 +30,7 @@ from database.strategy_store import (
     update_best_score,
     write_active_strategy_source,
 )
+from engine_2_crucible.strategy_atomic import atomic_write_strategy
 from engine_2_crucible.strategy_loader import StrategyLoadError, read_strategy_file_text
 from shared.deepseek import chat_complete
 
@@ -43,7 +45,7 @@ ARENA_LOCK_PATH = PROJECT_ROOT / ".arena_db.lock"
 CRUCIBLE_LOCK_PATH = CRUCIBLE_DIR / ".crucible_iteration.lock"
 
 SLEEP_SECONDS = int(os.getenv("AUTORESEARCH_SLEEP_SECONDS", "5"))
-BACKTEST_TIMEOUT = int(os.getenv("AUTORESEARCH_BACKTEST_TIMEOUT", "120"))
+BACKTEST_TIMEOUT = int(os.getenv("AUTORESEARCH_BACKTEST_TIMEOUT", "60"))
 PROPOSAL_MAX_TOKENS = int(os.getenv("AUTORESEARCH_PROPOSAL_MAX_TOKENS", "4096"))
 DRY_RUN = os.getenv("AUTORESEARCH_DRY_RUN", "false").lower() in ("true", "1", "yes")
 MAX_FAILURE_CONTEXT = 5
@@ -197,13 +199,19 @@ def _slice_strategy_module(text: str) -> str:
 
     lines = text.splitlines()
     start_idx: int | None = None
+    weights_idx: int | None = None
     for i, line in enumerate(lines):
         stripped = line.strip()
+        if stripped.startswith("OVERLAY_WEIGHTS"):
+            weights_idx = i
         if stripped.startswith("def evaluate_market"):
             start_idx = i
             break
     if start_idx is None:
         raise StrategyLoadError("DeepSeek response missing evaluate_market definition")
+
+    if weights_idx is not None and weights_idx < start_idx:
+        start_idx = weights_idx
 
     while start_idx > 0 and lines[start_idx - 1].strip().startswith("#"):
         start_idx -= 1
@@ -267,12 +275,21 @@ def build_proposal_prompt(
     last_trades: int | None,
     best_score: float,
     failures: list[str],
+    live_summary: str = "",
 ) -> str:
     failure_block = ""
     if failures:
         failure_block = "Recent failures:\n" + "\n".join(f"- {f}" for f in failures[-MAX_FAILURE_CONTEXT:])
 
     last_trades_text = str(last_trades) if last_trades is not None else "N/A"
+
+    live_block = ""
+    if live_summary.strip():
+        live_block = f"""
+Live Apex paper trading since last strategy KEEP:
+{live_summary}
+Reduce cap-stall churn and improve per-market PnL, not just backtest Sortino.
+"""
 
     return f"""Here is our goal (see system instructions).
 
@@ -285,7 +302,7 @@ Here is the current active_strategy.py:
 Last backtest score: {last_score if last_score is not None else 'N/A'}
 Last backtest trades: {last_trades_text}
 Historical best score (must beat this): {best_score:.4f}
-
+{live_block}
 market_state fields you may read (no imports):
 - order_book_imbalance (float, typically -0.8 to 0.8 in our replay data)
 - spread (float, typically 0.001 to 0.03 — entries cross half the spread)
@@ -300,6 +317,9 @@ Rewrite the FULL active_strategy.py file to improve the backtest Sortino score.
 
 Constraints:
 - Preserve the function signature: def evaluate_market(market_state: dict) -> str
+- Define module-level OVERLAY_WEIGHTS dict with string keys from:
+  order_book_imbalance, cross_venue_adj, spread, mid_price, bid_depth, ask_depth
+  (values in [0,1], must sum to ~1.0)
 - Return only "BUY_YES", "BUY_NO", or "HOLD"
 - Do NOT use import statements — the sandbox only allows math and basic builtins
 - Only edit logic inside evaluate_market (parameters and conditions)
@@ -373,7 +393,7 @@ class AutoResearchCrucible:
         if not STRATEGY_BACKUP_PATH.is_file():
             return
         champion = read_strategy_file_text(STRATEGY_BACKUP_PATH)
-        STRATEGY_PATH.write_text(champion, encoding="utf-8")
+        atomic_write_strategy(STRATEGY_PATH, champion)
         score, trades, stdout, stderr, rc = self._run_backtest()
         if rc != 0 or score is None:
             logging.warning(
@@ -427,15 +447,15 @@ class AutoResearchCrucible:
         with arena_lock(ARENA_LOCK_PATH):
             conn = open_replica()
             try:
-                version = write_active_strategy_source(
-                    conn,
-                    python_source,
-                    score,
-                    source="crucible",
-                    metadata={"last_score": score},
-                    commit=False,
-                )
-                conn.commit()
+                with arena_transaction(conn, auto_commit=True):
+                    version = write_active_strategy_source(
+                        conn,
+                        python_source,
+                        score,
+                        source="crucible",
+                        metadata={"last_score": score},
+                        commit=False,
+                    )
                 logging.info("KEEP v%d — pushed strategy to Turso (score=%.4f)", version, score)
                 logging.info(
                     "KEEP v%d — awaiting Apex reload; monitor next ticks for edge_reject_rate",
@@ -444,6 +464,21 @@ class AutoResearchCrucible:
             finally:
                 conn.close()
         request_cloud_sync("crucible_strategy_keep")
+
+    def _slope_reject_reason(self, python_source: str) -> str | None:
+        from engine_2_crucible.backtest_corpus import flatten_exhaust_rows
+        from engine_2_crucible.backtest_judge import slope_reject_reason
+        from engine_2_crucible.strategy_loader import load_evaluate_market_from_source
+        from engine_2_crucible.val_bpb_backtest import BACKTEST_MAX_ROWS, _score_samples
+
+        evaluate = load_evaluate_market_from_source(python_source)
+        conn = open_replica()
+        try:
+            samples = flatten_exhaust_rows(conn, BACKTEST_MAX_ROWS, use_mock=False)
+        finally:
+            conn.close()
+        _, _, _, returns = _score_samples(samples, evaluate)
+        return slope_reject_reason(returns)
 
     def _run_backtest(self) -> tuple[float | None, int | None, str, str, int]:
         proc = subprocess.run(
@@ -463,8 +498,9 @@ class AutoResearchCrucible:
 
     def _revert_strategy(self, reason: str) -> None:
         if STRATEGY_BACKUP_PATH.is_file():
-            STRATEGY_PATH.write_text(
-                STRATEGY_BACKUP_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+            atomic_write_strategy(
+                STRATEGY_PATH,
+                STRATEGY_BACKUP_PATH.read_text(encoding="utf-8"),
             )
         self._failure_context.append(reason)
         if len(self._failure_context) > MAX_FAILURE_CONTEXT:
@@ -481,12 +517,28 @@ class AutoResearchCrucible:
         current_code = read_strategy_file_text(STRATEGY_PATH)
         best_score = self._read_best_score()
 
+        live_summary_text = ""
+        with arena_lock(ARENA_LOCK_PATH):
+            conn = open_replica()
+            try:
+                from engine_2_crucible.live_trading_feedback import (
+                    fetch_apex_live_summary,
+                    format_live_summary_for_prompt,
+                )
+
+                live_summary_text = format_live_summary_for_prompt(
+                    fetch_apex_live_summary(conn)
+                )
+            finally:
+                conn.close()
+
         prompt = build_proposal_prompt(
             current_code,
             self._last_score,
             self._last_trades,
             best_score,
             self._failure_context,
+            live_summary=live_summary_text,
         )
 
         logging.info("Proposing strategy edit via DeepSeek...")
@@ -523,13 +575,13 @@ class AutoResearchCrucible:
             return
 
         if not DRY_RUN:
-            STRATEGY_PATH.write_text(proposed, encoding="utf-8")
+            atomic_write_strategy(STRATEGY_PATH, proposed)
         logging.info("Running backtest on active_strategy.py")
 
         try:
             score, trades, stdout, stderr, rc = self._run_backtest()
         except subprocess.TimeoutExpired:
-            STRATEGY_PATH.write_text(winner_code, encoding="utf-8")
+            atomic_write_strategy(STRATEGY_PATH, winner_code)
             self._revert_strategy(f"Backtest timed out after {BACKTEST_TIMEOUT}s")
             return
 
@@ -537,7 +589,7 @@ class AutoResearchCrucible:
         self._last_trades = trades
 
         if rc != 0 or score is None:
-            STRATEGY_PATH.write_text(winner_code, encoding="utf-8")
+            atomic_write_strategy(STRATEGY_PATH, winner_code)
             detail = (stderr or stdout).strip()[:500]
             self._revert_strategy(f"Backtest failed (rc={rc}): {detail}")
             return
@@ -550,11 +602,17 @@ class AutoResearchCrucible:
         )
 
         if score > best_score:
+            slope_reason = self._slope_reject_reason(proposed)
+            if slope_reason:
+                atomic_write_strategy(STRATEGY_PATH, winner_code)
+                self._revert_strategy(slope_reason)
+                return
+
             from engine_2_crucible.live_replay_gate import replay_fill_eligibility
 
             replay = replay_fill_eligibility(proposed)
             if not replay.passed:
-                STRATEGY_PATH.write_text(winner_code, encoding="utf-8")
+                atomic_write_strategy(STRATEGY_PATH, winner_code)
                 self._revert_strategy(
                     f"Replay edge gate failed: {replay.detail} "
                     f"(need>={os.getenv('AUTORESEARCH_MIN_REPLAY_FILL_ELIGIBLE', '5')} "
@@ -568,25 +626,25 @@ class AutoResearchCrucible:
             min_live = int(os.getenv("AUTORESEARCH_MIN_LIVE_SIGNALS", "1"))
             min_fill_eligible = int(os.getenv("AUTORESEARCH_MIN_LIVE_FILL_ELIGIBLE", "1"))
             if live_markets > 0 and live_signals < min_live:
-                STRATEGY_PATH.write_text(winner_code, encoding="utf-8")
+                atomic_write_strategy(STRATEGY_PATH, winner_code)
                 self._revert_strategy(
                     f"Backtest beat best but live snapshot has {live_signals}/{live_markets} "
                     f"trade signals (need>={min_live}) — strategy may not trade on live book shape"
                 )
                 return
             if live_markets > 0 and fill_eligible < min_fill_eligible:
-                STRATEGY_PATH.write_text(winner_code, encoding="utf-8")
+                atomic_write_strategy(STRATEGY_PATH, winner_code)
                 self._revert_strategy(
                     f"Backtest beat best but only {fill_eligible} live signals pass edge gate "
                     f"(need>={min_fill_eligible})"
                 )
                 return
-            STRATEGY_BACKUP_PATH.write_text(proposed, encoding="utf-8")
+            atomic_write_strategy(STRATEGY_BACKUP_PATH, proposed)
             self._keep_strategy(proposed, score)
             self._failure_context.clear()
             logging.info("Victory — new best score %.4f > %.4f", score, best_score)
         else:
-            STRATEGY_PATH.write_text(winner_code, encoding="utf-8")
+            atomic_write_strategy(STRATEGY_PATH, winner_code)
             reason = f"Score {score:.4f} did not beat best {best_score:.4f}"
             if trades == 0:
                 reason += " — 0 trades (too much HOLD or wrong market_state keys)"
@@ -627,6 +685,7 @@ class AutoResearchCrucible:
             DRY_RUN,
         )
         iteration = 0
+        maintenance_jobs = None
         while not self._shutdown:
             iteration += 1
             logging.info("--- AUTORESEARCH ITERATION %d ---", iteration)
@@ -641,6 +700,27 @@ class AutoResearchCrucible:
             except Exception as exc:
                 logging.error("Iteration failed: %s", exc)
                 self._revert_strategy(f"Unhandled error: {exc}")
+
+            if iteration % 50 == 0:
+                with arena_lock(ARENA_LOCK_PATH):
+                    conn = open_replica()
+                    try:
+                        from database.resolved_corpus_bootstrap import ensure_resolved_corpus
+
+                        result = ensure_resolved_corpus(conn, commit=False)
+                        conn.commit()
+                        request_cloud_sync("crucible_corpus_refresh")
+                        logging.info("Resolved corpus refresh: %s", result)
+                    finally:
+                        conn.close()
+
+            if maintenance_jobs is None:
+                from engine_2_crucible.scheduler import build_maintenance_jobs
+
+                maintenance_jobs = build_maintenance_jobs()
+            from engine_2_crucible.scheduler import run_due_jobs
+
+            run_due_jobs(iteration, maintenance_jobs)
 
             for _ in range(SLEEP_SECONDS):
                 if self._shutdown:

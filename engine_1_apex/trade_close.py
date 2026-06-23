@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from shared.poly_costs import PolyCostModel
+from database.transaction import arena_transaction
 
 
 def calculate_pnl(entry_price: float, exit_price: float, size: float) -> float:
@@ -71,23 +72,24 @@ def close_open_trade(
     closed_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     status = f"CLOSED_{exit_reason}"
 
-    conn.execute(
-        """
-        UPDATE trade_execution
-        SET status = ?, exit_price = ?, closed_at = ?
-        WHERE trade_id = ?
-        """,
-        (status, exit_price, closed_at, trade_id),
-    )
+    with arena_transaction(conn, auto_commit=False):
+        conn.execute(
+            """
+            UPDATE trade_execution
+            SET status = ?, exit_price = ?, closed_at = ?
+            WHERE trade_id = ?
+            """,
+            (status, exit_price, closed_at, trade_id),
+        )
 
-    conn.execute(
-        """
-        UPDATE agent_archetypes
-        SET capital = capital + ? + ?
-        WHERE agent_id = ?
-        """,
-        (size, pnl, agent_id),
-    )
+        conn.execute(
+            """
+            UPDATE agent_archetypes
+            SET capital = capital + ? + ?
+            WHERE agent_id = ?
+            """,
+            (size, pnl, agent_id),
+        )
 
     del market_id, category, entry_context
     return pnl

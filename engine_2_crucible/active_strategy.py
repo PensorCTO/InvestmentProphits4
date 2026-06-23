@@ -1,3 +1,12 @@
+OVERLAY_WEIGHTS = {
+    "order_book_imbalance": 0.30,
+    "cross_venue_adj": 0.30,
+    "spread": 0.15,
+    "mid_price": 0.10,
+    "bid_depth": 0.075,
+    "ask_depth": 0.075,
+}
+
 def evaluate_market(market_state: dict) -> str:
     obi = float(market_state.get("order_book_imbalance", 0.0))
     cross = float(market_state.get("cross_venue_adj", 0.0))
@@ -6,55 +15,57 @@ def evaluate_market(market_state: dict) -> str:
     bid_depth = float(market_state.get("bid_depth", 0.0))
     ask_depth = float(market_state.get("ask_depth", 0.0))
     liquidity_tier = market_state.get("liquidity_tier", "LOW")
-    
-    # Filter extreme prices and wide spreads
-    if mid_price > 0.92 or mid_price < 0.08:
+
+    # Avoid extreme prices where spread crossing destroys edge
+    if mid_price > 0.95 or mid_price < 0.05:
         return "HOLD"
-    if spread > 0.02:
+
+    # Tight spread filter to reduce cap-stall churn
+    if spread > 0.015:
         return "HOLD"
-    
-    # Require cross-venue alignment with tighter threshold
-    if abs(cross) < 0.02:
+
+    # Require meaningful cross-venue consensus
+    if abs(cross) < 0.006:
         return "HOLD"
-    
-    # Calculate effective depth and imbalance
+
     total_depth = bid_depth + ask_depth
-    if total_depth < 50:
+    if total_depth < 40:
         return "HOLD"
-    
-    # Normalize depth imbalance
+
+    # Compute depth imbalance as a fraction
     depth_imbalance = (bid_depth - ask_depth) / max(total_depth, 1)
-    
-    # Combined signal with spread penalty
-    spread_penalty = spread * 2.5
-    raw_signal = obi * 0.5 + depth_imbalance * 0.5 - spread_penalty
-    
-    # Consensus check
-    consensus_yes = obi > 0.01 and cross > 0.01
-    consensus_no = obi < -0.01 and cross < -0.01
-    
-    # Adaptive thresholds based on liquidity
-    if liquidity_tier == "HIGH_LIQUIDITY":
-        if total_depth > 200 and spread < 0.006:
-            if consensus_yes and obi > 0.05 and ask_depth > 100:
-                return "BUY_YES"
-            if consensus_no and obi < -0.05 and bid_depth > 100:
-                return "BUY_NO"
-        if total_depth > 400 and spread < 0.01:
-            if consensus_yes and raw_signal > 0.06 and ask_depth > 150:
-                return "BUY_YES"
-            if consensus_no and raw_signal < -0.06 and bid_depth > 150:
-                return "BUY_NO"
-    else:
-        if total_depth > 80 and spread < 0.005:
-            if consensus_yes and obi > 0.15 and ask_depth > 50 and bid_depth > 100:
-                return "BUY_YES"
-            if consensus_no and obi < -0.15 and bid_depth > 50 and ask_depth > 100:
-                return "BUY_NO"
-        if total_depth > 150 and spread < 0.008:
-            if consensus_yes and raw_signal > 0.08 and ask_depth > 60:
-                return "BUY_YES"
-            if consensus_no and raw_signal < -0.08 and bid_depth > 60:
-                return "BUY_NO"
-    
+
+    # Scale OBI by depth quality to avoid flickering
+    depth_quality = min(total_depth / 150.0, 1.0)
+    adjusted_obi = obi * depth_quality
+
+    # Consensus check: both signals must agree direction
+    consensus_yes = adjusted_obi > 0.008 and cross > 0.006
+    consensus_no = adjusted_obi < -0.008 and cross < -0.006
+
+    # Asymmetric thresholds: require stronger signal on the side with less depth
+    if consensus_yes:
+        # Buying YES: need sufficient ask depth to absorb
+        if ask_depth < 50:
+            return "HOLD"
+        # Stronger OBI required when spread is wider
+        obi_threshold = 0.015 + spread * 1.5
+        if adjusted_obi > obi_threshold and depth_imbalance > 0.04:
+            return "BUY_YES"
+
+    if consensus_no:
+        # Buying NO: need sufficient bid depth to absorb
+        if bid_depth < 50:
+            return "HOLD"
+        obi_threshold = 0.015 + spread * 1.5
+        if adjusted_obi < -obi_threshold and depth_imbalance < -0.04:
+            return "BUY_NO"
+
+    # Second pass: higher liquidity tier allows slightly relaxed thresholds
+    if liquidity_tier == "HIGH_LIQUIDITY" and total_depth > 150 and spread < 0.008:
+        if consensus_yes and adjusted_obi > 0.012 and ask_depth > 80:
+            return "BUY_YES"
+        if consensus_no and adjusted_obi < -0.012 and bid_depth > 80:
+            return "BUY_NO"
+
     return "HOLD"

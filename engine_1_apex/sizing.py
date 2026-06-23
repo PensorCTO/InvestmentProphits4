@@ -170,7 +170,14 @@ def compute_ladder_budget(
 
     kelly = min(cash * fractional_kelly, market_remaining, portfolio_remaining)
     if kelly < min_ladder_usd:
-        return None, "min_ladder"
+        if (
+            cash >= min_ladder_usd
+            and market_remaining >= min_ladder_usd
+            and portfolio_remaining >= min_ladder_usd
+        ):
+            kelly = min_ladder_usd
+        else:
+            return None, "min_ladder"
     return kelly, None
 
 

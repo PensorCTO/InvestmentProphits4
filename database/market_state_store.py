@@ -155,6 +155,49 @@ def is_snapshot_stale(snapshot: dict | None) -> bool:
     return snapshot_age_seconds(snapshot) > stale_seconds
 
 
+def _mtf_max_ephemeral() -> float:
+    return float(os.getenv("ORACLE_MTF_MAX_EPHEMERAL", os.getenv("OBI_EPHEMERAL_RATIO", "0.5")))
+
+
+def _mtf_min_stable_markets() -> int:
+    return int(os.getenv("ORACLE_MTF_MIN_STABLE_MARKETS", "1"))
+
+
+def _market_mtf_stable(blob: dict) -> bool:
+    clob = blob.get("clob") or {}
+    ephemeral = float(clob.get("ephemeral_ratio", 0.0))
+    if ephemeral > _mtf_max_ephemeral():
+        return False
+    if not clob.get("mtf_applied", True):
+        return False
+    return True
+
+
+def get_fresh_snapshot(conn) -> tuple[dict | None, str | None]:
+    """
+    Return (snapshot, reject_reason).
+
+    Rejects stale snapshots or books failing MTF stability gate.
+    """
+    snapshot = read_latest_snapshot(conn)
+    if snapshot is None:
+        return None, "no_snapshot"
+    if is_snapshot_stale(snapshot):
+        age = snapshot_age_seconds(snapshot)
+        return None, f"stale_oracle age={age:.0f}s"
+
+    markets = (snapshot.get("payload") or {}).get("markets") or {}
+    if not markets:
+        return None, "empty_snapshot"
+
+    stable = sum(1 for blob in markets.values() if isinstance(blob, dict) and _market_mtf_stable(blob))
+    min_stable = _mtf_min_stable_markets()
+    if stable < min_stable:
+        return None, f"mtf_unstable stable={stable}/{len(markets)} need>={min_stable}"
+
+    return snapshot, None
+
+
 def build_snapshot_payload(
     *,
     snapshot_id: str,
@@ -196,6 +239,8 @@ def build_snapshot_payload(
                 "bid_depth": clob.bid_depth,
                 "ask_depth": clob.ask_depth,
                 "clob_token_ids": clob.clob_token_ids,
+                "ephemeral_ratio": getattr(clob, "ephemeral_ratio", 0.0),
+                "mtf_applied": getattr(clob, "mtf_applied", False),
             },
             "overlays": overlays,
         }

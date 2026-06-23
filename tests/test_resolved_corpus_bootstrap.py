@@ -101,7 +101,8 @@ def test_ensure_resolved_corpus_idempotent(db_conn):
     first = ensure_resolved_corpus(db_conn, commit=True)
     second = ensure_resolved_corpus(db_conn, commit=True)
     assert first["proxy_updated"] == 1
-    assert second["already_resolved"] == 1
+    assert second["proxy_updated"] == 0
+    assert second["corpus_total"] >= 1
 
 
 def test_flatten_exhaust_after_bootstrap(db_conn):
