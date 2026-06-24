@@ -104,6 +104,38 @@ def slope_reject_reason(returns: list[float]) -> str | None:
     return None
 
 
+def sharpe_slope_reject_reason(returns: list[float]) -> str | None:
+    """Return REVERT reason when Sharpe slopes deteriorate below threshold."""
+    if not returns:
+        return None
+    window = judge_slope_window()
+    horizons = judge_horizons()
+    min_slope = judge_min_return_slope()
+    sharpe_slopes = rolling_sharpe_slopes(returns, window=window, horizons=horizons)
+
+    for h in horizons:
+        s_slope = sharpe_slopes.get(h, 0.0)
+        if s_slope < min_slope:
+            return (
+                f"SHARPE_SLOPE_REJECT sharpe_slope_h{h}={s_slope:.6f} < {min_slope} "
+                f"(window={window})"
+            )
+    return None
+
+
+def score_beats_baseline(proposed_score: float, baseline_score: float) -> bool:
+    """Proposed score must beat baseline by execution friction (10 bps)."""
+    from shared.poly_costs import PolyCostModel
+
+    margin = PolyCostModel.BASELINE_FRICTION_BPS
+    return proposed_score > baseline_score + margin
+
+
+def combined_slope_reject_reason(returns: list[float]) -> str | None:
+    """Return or Sharpe slope reject reason."""
+    return slope_reject_reason(returns) or sharpe_slope_reject_reason(returns)
+
+
 def score_samples_with_slopes(
     samples: list[tuple[dict, int]],
     evaluate_market: Callable[[dict], str],

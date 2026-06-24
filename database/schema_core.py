@@ -170,6 +170,72 @@ def apply_core_schema(conn, *, embedding_dims: int | None = None) -> None:
         ON portfolio_snapshots (agent_id, captured_at);
     """)
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS oracle_health (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            last_success_at TEXT,
+            last_error TEXT,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            circuit_state TEXT NOT NULL DEFAULT 'HEALTHY',
+            updated_at TEXT
+        );
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS book_buffer (
+            market_id TEXT PRIMARY KEY,
+            token_id TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            as_of TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS strategy_proposals (
+            proposal_id TEXT PRIMARY KEY,
+            python_source TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'quarantined',
+            proposed_at TEXT NOT NULL,
+            gate_results TEXT,
+            reject_reason TEXT
+        );
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS strategy_history (
+            version INTEGER PRIMARY KEY,
+            python_source TEXT NOT NULL,
+            best_score REAL NOT NULL,
+            kept_at TEXT NOT NULL,
+            baseline_version INTEGER,
+            baseline_slopes_json TEXT
+        );
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS audit_events (
+            event_id TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            source TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            violations TEXT,
+            action_taken TEXT,
+            created_at TEXT NOT NULL
+        );
+    """)
+
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_audit_events_created
+        ON audit_events (created_at);
+    """)
+
+    conn.execute("""
+        INSERT OR IGNORE INTO oracle_health
+        (id, consecutive_failures, circuit_state, updated_at)
+        VALUES (1, 0, 'HEALTHY', CURRENT_TIMESTAMP)
+    """)
+
 
 def seed_minimal_rows(conn) -> None:
     default_strategy = {
@@ -187,7 +253,7 @@ def seed_minimal_rows(conn) -> None:
         INSERT OR IGNORE INTO agent_archetypes
         (agent_id, quadrant, profile_name, capital, fractional_kelly,
          max_position_pct, liquidity_floor, is_active)
-        VALUES ('APEX_EDGE', 'Apex', 'Apex Edge Executor', 100.0, 0.35, 0.15, 50000.0, 1)
+        VALUES ('APEX_EDGE', 'Apex', 'Apex Edge Executor', 100.0, 0.05, 0.05, 50000.0, 1)
     """)
 
     conn.execute(

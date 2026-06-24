@@ -19,6 +19,30 @@ jobs:
       - name: Run pytest
         run: pytest tests/ -q --tb=short
 
+  safety-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Offline safety gates
+        run: python scripts/acceptance_gate.py --scope offline
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Bandit scan
+        run: |
+          pip install bandit
+          bandit -r engine_1_apex engine_2_crucible shared -ll -q
+
   preflight:
     runs-on: ubuntu-latest
     steps:
@@ -33,4 +57,4 @@ jobs:
           PREFLIGHT_SKIP_LATENCY: "true"
           IP4_ALLOW_MOCK_ORACLE: "true"
           EDGE_MODEL_MOCKED: "true"
-        run: python scripts/preflight.py || true
+        run: python scripts/preflight.py

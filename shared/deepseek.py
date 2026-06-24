@@ -8,6 +8,8 @@ import os
 import requests
 from dotenv import load_dotenv
 
+from shared.adversarial_filter import audit_text
+
 load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,24 @@ def chat_complete(
     timeout: float = 120,
 ) -> str | None:
     """Single-shot completion via DeepSeek OpenAI-compatible chat API."""
+    sys_audit = audit_text(system, context="deepseek_system")
+    user_audit = audit_text(user, context="deepseek_user")
+    if sys_audit.hard_reject or user_audit.hard_reject:
+        logger.error(
+            "DeepSeek blocked — adversarial filter: %s %s",
+            sys_audit.violations,
+            user_audit.violations,
+        )
+        return None
+    if not sys_audit.passed or not user_audit.passed:
+        logger.warning(
+            "DeepSeek prompt soft violations: %s %s",
+            sys_audit.violations,
+            user_audit.violations,
+        )
+    system = sys_audit.sanitized_text
+    user = user_audit.sanitized_text
+
     payload = {
         "model": model_name(),
         "messages": [

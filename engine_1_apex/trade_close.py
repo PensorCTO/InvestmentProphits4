@@ -49,6 +49,18 @@ def count_open_legs(conn, agent_id: str, market_id: str) -> int:
     return int(row[0]) if row else 0
 
 
+def count_agent_open_legs(conn, agent_id: str) -> int:
+    row = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM trade_execution
+        WHERE agent_id = ? AND status = 'OPEN'
+        """,
+        (agent_id,),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
 def close_open_trade(
     conn,
     *,
@@ -134,6 +146,55 @@ def close_smallest_market_leg(
         exit_reason=exit_reason,
     )
     return True
+
+
+def close_smallest_open_leg(
+    conn,
+    *,
+    agent_id: str,
+    exit_reason: str = "PORTFOLIO_CAP_ROTATE",
+) -> tuple[bool, str | None]:
+    """Close the smallest OPEN leg across all markets. Returns (closed, market_id)."""
+    row = conn.execute(
+        """
+        SELECT t.trade_id, t.market_id, t.direction, t.entry_price, t.kelly_size,
+               t.entry_context, m.category, m.market_mid, m.liquidity_tier
+        FROM trade_execution t
+        LEFT JOIN markets_ledger m ON t.market_id = m.market_id
+        WHERE t.agent_id = ? AND t.status = 'OPEN'
+        ORDER BY t.kelly_size ASC
+        LIMIT 1
+        """,
+        (agent_id,),
+    ).fetchone()
+    if not row:
+        return False, None
+    (
+        trade_id,
+        market_id,
+        direction,
+        entry_price,
+        kelly_size,
+        entry_context,
+        category,
+        market_mid,
+        liq_tier,
+    ) = row
+    close_open_trade(
+        conn,
+        trade_id=trade_id,
+        agent_id=agent_id,
+        market_id=market_id,
+        direction=direction,
+        entry_price=float(entry_price),
+        size=float(kelly_size),
+        category=category or "",
+        market_mid=float(market_mid or 0.5),
+        liquidity_tier=liq_tier or "MED_LIQUIDITY",
+        entry_context=entry_context,
+        exit_reason=exit_reason,
+    )
+    return True, str(market_id)
 
 
 def trim_market_exposure_to_cap(

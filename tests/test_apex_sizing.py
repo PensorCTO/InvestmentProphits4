@@ -318,7 +318,49 @@ def test_stop_loss_cooldown_escalates_with_repeats(db_conn, monkeypatch):
 
 
 def test_default_max_portfolio_pct():
-    assert max_portfolio_pct() == pytest.approx(0.0)
+    assert max_portfolio_pct() == pytest.approx(0.50)
+
+
+def test_default_sizing_five_pct_nav_per_market():
+    size, reason = compute_ladder_budget(
+        nav=100.0,
+        cash=100.0,
+        fractional_kelly=0.05,
+        max_position_pct=0.05,
+        market_exposure=0.0,
+        total_open_notional=0.0,
+        min_ladder_usd=5.0,
+    )
+    assert reason is None
+    assert size == pytest.approx(5.0)
+
+
+def test_sizing_at_sub100_nav_uses_position_cap():
+    size, reason = compute_ladder_budget(
+        nav=99.87,
+        cash=95.0,
+        fractional_kelly=0.05,
+        max_position_pct=0.05,
+        market_exposure=0.0,
+        total_open_notional=5.0,
+        min_ladder_usd=5.0,
+    )
+    assert reason is None
+    assert size == pytest.approx(99.87 * 0.05, rel=1e-3)
+
+
+def test_portfolio_cap_blocks_when_half_nav_deployed():
+    size, reason = compute_ladder_budget(
+        nav=100.0,
+        cash=50.0,
+        fractional_kelly=0.05,
+        max_position_pct=0.05,
+        market_exposure=0.0,
+        total_open_notional=50.0,
+        min_ladder_usd=5.0,
+    )
+    assert size is None
+    assert reason == "portfolio_cap"
 
 
 def test_compute_ladder_budget_no_portfolio_cap():

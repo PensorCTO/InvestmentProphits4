@@ -101,6 +101,12 @@ def load_news_headlines(*, market_id: str | None = None, limit: int = 50) -> Lis
     seen: set[str] = set()
     combined: list[str] = []
     for headline in pool:
+        from shared.adversarial_filter import audit_text
+
+        audit = audit_text(headline, context="news_headline")
+        if not audit.passed or audit.hard_reject:
+            continue
+        headline = audit.sanitized_text
         key = headline.lower().strip()
         if not key or key in seen:
             continue

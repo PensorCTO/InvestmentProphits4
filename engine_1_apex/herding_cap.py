@@ -17,10 +17,14 @@ def herding_cap_nav_pct(max_position_pct: float) -> float:
 
 
 def resolve_herding_cap(nav: float, max_position_pct: float) -> float:
-    """Per-market/direction swarm cap: max(floor, NAV × pct)."""
+    """Per-market swarm cap: NAV × pct; institutional floor only when pct meets/exceeds it."""
     if nav <= 0:
         return herding_cap_floor()
-    return max(herding_cap_floor(), nav * herding_cap_nav_pct(max_position_pct))
+    pct_cap = nav * herding_cap_nav_pct(max_position_pct)
+    floor = herding_cap_floor()
+    if pct_cap >= floor:
+        return max(pct_cap, floor)
+    return pct_cap
 
 
 def apply_herding_cap_to_kelly(
@@ -39,17 +43,21 @@ def apply_herding_cap_to_kelly(
     """
     cap = resolve_herding_cap(nav, max_position_pct)
     headroom = max(0.0, cap - current_exposure)
+    ladder_floor = min(min_ladder_usd, cap)
     meta = {
         "cap": cap,
         "headroom": headroom,
         "current_exposure": current_exposure,
         "requested_kelly": kelly_size,
     }
-    if headroom < min_ladder_usd:
+    if headroom < ladder_floor - 1e-6:
         return None, "herding_headroom_insufficient", meta
     clipped = min(kelly_size, headroom)
-    if clipped < min_ladder_usd:
-        return None, "herding_headroom_insufficient", meta
+    if clipped < ladder_floor - 1e-6:
+        if headroom > 0:
+            clipped = headroom
+        else:
+            return None, "herding_headroom_insufficient", meta
     meta["herding_clipped"] = clipped + 1e-9 < kelly_size
     meta["clipped_kelly"] = clipped
     return clipped, None, meta

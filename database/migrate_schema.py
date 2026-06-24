@@ -1188,6 +1188,103 @@ def migrate_backfill_capital_injections(conn) -> bool:
     return bool(agents)
 
 
+def migrate_qa_audit_tables(conn) -> bool:
+    """QA audit remediation tables: oracle_health, book_buffer, proposals, history, audit."""
+    changed = False
+    if not _table_exists(conn, "oracle_health"):
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS oracle_health (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                last_success_at TEXT,
+                last_error TEXT,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                circuit_state TEXT NOT NULL DEFAULT 'HEALTHY',
+                updated_at TEXT
+            )
+            """
+        )
+        changed = True
+    row = conn.execute("SELECT 1 FROM oracle_health WHERE id = 1").fetchone()
+    if not row:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO oracle_health
+            (id, consecutive_failures, circuit_state, updated_at)
+            VALUES (1, 0, 'HEALTHY', datetime('now'))
+            """
+        )
+        changed = True
+
+    if not _table_exists(conn, "book_buffer"):
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS book_buffer (
+                market_id TEXT PRIMARY KEY,
+                token_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                as_of TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        changed = True
+
+    if not _table_exists(conn, "strategy_proposals"):
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS strategy_proposals (
+                proposal_id TEXT PRIMARY KEY,
+                python_source TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'quarantined',
+                proposed_at TEXT NOT NULL,
+                gate_results TEXT,
+                reject_reason TEXT
+            )
+            """
+        )
+        changed = True
+
+    if not _table_exists(conn, "strategy_history"):
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS strategy_history (
+                version INTEGER PRIMARY KEY,
+                python_source TEXT NOT NULL,
+                best_score REAL NOT NULL,
+                kept_at TEXT NOT NULL,
+                baseline_version INTEGER,
+                baseline_slopes_json TEXT
+            )
+            """
+        )
+        changed = True
+
+    if not _table_exists(conn, "audit_events"):
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                source TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                violations TEXT,
+                action_taken TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        changed = True
+
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_audit_events_created
+        ON audit_events (created_at)
+        """
+    )
+    return changed
+
+
 def migrate_connection(conn, label: str, *, quiet: bool = False) -> None:
     from database.schema_core import apply_core_schema
 
@@ -1236,6 +1333,8 @@ def migrate_connection(conn, label: str, *, quiet: bool = False) -> None:
         changes.append("markets_ledger.repair_proxy_is_resolved")
     if migrate_market_state(conn):
         changes.append("market_state")
+    if migrate_qa_audit_tables(conn):
+        changes.append("qa_audit_tables")
     if migrate_active_strategy(conn):
         changes.append("active_strategy")
     if migrate_active_strategy_python_source(conn):

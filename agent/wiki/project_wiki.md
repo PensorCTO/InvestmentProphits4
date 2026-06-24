@@ -116,6 +116,14 @@ Key modules post-audit:
 
 ## Decisions Log
 
+### 2026-06-24 — Stop-loss cooldown before signals++ (false STALLED fix)
+
+`is_stop_loss_cooldown_active()` ran **after** `signals += 1`, inflating `signals_last_tick` while blocking fill. With one edge-gated signal (fed_cut) + one stop-loss-blocked signal (us_election), `actionable_unfilled_signals` stayed > 0 → `trading_status=STALLED`, `zero_fill_streak` 270+, and idle/FULLY_DEPLOYED rotate never fired. Moved stop-loss check before signal count.
+
+### 2026-06-24 — Six-market deployment headroom + faster idle rotate
+
+`APEX_MAX_LADDER_LEGS=6` with `APEX_MAX_LEGS_PER_MARKET=1` allows six single-leg markets; portfolio-wide cap enforced via `count_agent_open_legs()` before entry. `APEX_CAP_STALL_REMEDIATE_TICKS=6` (~1 min) speeds FULLY_DEPLOYED / idle rotation when cash sits idle.
+
 ### 2026-06-23 — V2 Signal Stack & Adaptive MTF
 
 - **BookWatcher:** Sub-second asyncio poller (`shared/book_watcher.py`, default 250ms) in Apex; feeds live `SignalStack` per CLOB token.
@@ -186,6 +194,23 @@ Cap-stall remediation was firing on fully_deployed ticks (max_legs=1 + aligned B
 
 ### 2026-06-23 — Cap-churn guard + acceptance NAV/churn checks
 Runtime CapChurnGuard pauses trim/refill when same-tick rebalance+fill pattern or NAV drawdown with rebalance activity. acceptance_gate adds nav_session_floor, session_cap_churn, and trading_ready (fail when dashboard trading_blockers).
+
+### 2026-06-24 — Idle deployment rotation for fully-deployed idle cash
+Cap-stall remediation only closes cap_stall_rows (opposite-direction signals). When all capacity is deployed and remaining signals are edge-gated, idle cash never rotates. New IDLE_DEPLOYMENT_ROTATE closes smallest leg on deployed/HOLD markets after cap_blocked_streak threshold.
+
+### 2026-06-24 — Idle-rotate churn guard: HOLD-only targets + cross-tick rotate/fill detection
+Deployed markets still signaling BUY were rotation targets, causing rotate→refill spread bleed. Only HOLD legs rotate; note_market_rebalance/fill detects cross-tick pairs; 900s re-entry cooldown after idle rotate.
+
+### 2026-06-24 — Default sizing: 5% NAV per market + 50% portfolio cap
+Ladder budget now defaults to min(5% cash, 5% NAV per market) with APEX_MAX_PORTFOLIO_PCT=0.50 so a $100 wallet makes ~$5 bets and cannot deploy more than half NAV across open legs.
+
+### 2026-06-24 — QA Audit Remediation (4 pillars)
+
+- **Pillar 1:** `oracle_health` + `book_buffer` tables; `oracle_circuit_breaker.py` trips on ingest failures (not per-tick stale reads); BookWatcher debounced DB writes; oracle thread migrates replica only (avoids sqld primary timeout).
+- **Pillar 2:** `strategy_proposals` quarantine; `validate_deployment()` scheduled every 50 Crucible iterations; structured JSON live feedback in prompts.
+- **Pillar 3:** Sharpe slope + 10bps friction KEEP gate; `strategy_history` append on KEEP; `live_performance_monitor.py` auto-revert (default `LIVE_AUDIT_ENABLED=false`, shadow mode).
+- **Pillar 4:** `shared/adversarial_filter.py` on DeepSeek/news/prompt assembly; `audit_events` table; `TOXICITY_FAIL_CLOSED` option.
+- **CI:** `safety-gates` + `security` (bandit) jobs; `acceptance_gate --scope offline`; preflight blocking in CI.
 ## Lessons Learned
 
 ### 2026-06-22 — Turso champion lag caused wallet STOPPED (high)
@@ -242,6 +267,11 @@ Runtime CapChurnGuard pauses trim/refill when same-tick rebalance+fill pattern o
 - **Trigger:** Quarter-Kelly fractional_kelly too small; cap_reasons min_ladder with cash=$94
 - **Impact:** Dashboard trading stalled + wallet degraded (CAPITAL_STARVATION STOPPED)
 - **Prevention:** Floor ladder budget in sizing.py; classify min_ladder as healthy when cash >= min_ladder in stoppage.py
+
+### 2026-06-24 — Idle rotation must not target still-signaling deployed legs (high)
+- **Trigger:** idle_rotation_rows included max-legs markets still returning BUY_YES
+- **Impact:** rotate→refill loop on mkt_us_election bled ~$0.14/cycle (~$2/hr)
+- **Prevention:** Only HOLD+open positions are rotation targets; churn guard detects cross-tick rotate+fill pairs
 ## User Preferences
 
 - 2026-06-22: **Agent executes** start/stop/fix operations — do not blather shell commands; do the work.
@@ -414,3 +444,45 @@ Runtime CapChurnGuard pauses trim/refill when same-tick rebalance+fill pattern o
 - **Validation:** 235 pytest pass; master blueprints synced via DeepSeek.
 
 **Next:** Monitor post-reset trading; optional `--require-alpha` for soak gate.
+
+### 2026-06-24 08:29 — QA stall fix: idle deployment rotation + ORACLE starvation no longer DEGRADED. Apex respawned; verify_trade_flow PASS; acceptance_gate full PASS (238 pytest).
+
+**Next:** Monitor overnight fully-deployed idle; tune APEX_CAP_STALL_REMEDIATE_TICKS if rotation feels slow.
+
+### 2026-06-24 — QA plumbing FAIL (buy+sell since restart)
+
+- Fixed herding cap for $100 wallets: NAV×pct cap (not 2500 floor); ladder_floor allows ~$5 deploy
+- Added portfolio-cap trim/remediate and fully-deployed rotate sell path
+- trade_flow_verify counts TRIM + remediate log lines as sells
+- restart_stack --reset-wallet → verify_trade_flow PASS (202s); acceptance_gate full PASS; stack healthy
+
+**Next:** Watch fully_deployed rotate churn; tune remediate ticks if QA wait is too long.
+
+### 2026-06-24 — QA Audit Risk Remediation (full plan)
+
+- **Schema:** `oracle_health`, `book_buffer`, `strategy_proposals`, `strategy_history`, `audit_events` via `migrate_qa_audit_tables`.
+- **Runtime:** Oracle circuit breaker + book buffer merge in Apex tick; Crucible quarantine + overlay validation scheduler; adversarial filter on LLM/news inputs.
+- **Fixes during validation:** Circuit breaker no longer increments failures on execution-side stale reads; BookWatcher debounced (`BOOK_BUFFER_PERSIST_INTERVAL_S=1`); oracle `_ensure_schema_once` uses replica migrate only (fixes sqld TRANSACTION_TIMEOUT on startup).
+- **Validation:** 258 pytest pass; `acceptance_gate --scope offline` PASS; stack restart + `verify_trade_flow` PASS (buy+sell, 63s).
+
+**Next:** Enable `LIVE_AUDIT_ENABLED=true` after shadow soak; monitor oracle circuit trips in production.
+
+### 2026-06-24 — Deployment headroom: 6-leg ladder + faster fully-deployed rotate
+
+- **Tuning:** `APEX_MAX_LADDER_LEGS=6`, `APEX_MAX_LEGS_PER_MARKET=1`, `APEX_CAP_STALL_REMEDIATE_TICKS=6` (~1 min at 10s ticks vs 3 min).
+- **Code:** `count_agent_open_legs()` enforces portfolio-wide ladder budget before new entries; idle/FULLY_DEPLOYED rotate fires sooner when cash is idle.
+
+**Next:** Monitor for 6th-market fills and rotate churn at 6-tick threshold.
+
+### 2026-06-24 — Micro-bleed fix: exploration off + thesis re-entry cooldown
+
+- **Root cause:** `APEX_EDGE_MODE=exploration` (0.008 edge) allowed marginal entries; `thesis_expired` on 3 HOLD ticks closed legs but **no re-entry cooldown** → buy/close loop on `mkt_fed_cut` (~$0.10 spread tax per $5 leg every ~2min).
+- **Fix:** Commented `APEX_EDGE_MODE` in `.env` (0.015 bar); `APEX_THESIS_REENTRY_COOLDOWN_SECONDS=900` blocks re-entry after THESIS_EXPIRED; `thesis_reentry_cooldown_seconds()` in stoppage.py.
+
+### 2026-06-24 — False STALLED: stop-loss cooldown after signals++
+
+- **Symptom:** `trading_status=STALLED`, `zero_fill_streak=270+`, `block=cap_blocked`, ~90% cash idle; 3 HOLD legs deployed.
+- **Root cause:** `mkt_fed_cut` BUY_NO edge-gated + `mkt_us_election` stop-loss cooldown counted as 2 signals but only 1 could fill → idle/FULLY_DEPLOYED rotate blocked.
+- **Fix:** Move `is_stop_loss_cooldown_active()` before `signals += 1` in `ip4_apex_edge.py`. Post-restart: `trading=IDLE`, `streak=0`, FULLY_DEPLOYED rotate cleared all legs; only fed_cut edge-gated NO remains.
+
+**Next:** Wait for strategy BUY with ≥0.015 edge on uncooled markets; trade-flow buy pending (all-HOLD + fed_cut reject).

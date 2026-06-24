@@ -57,7 +57,15 @@ def _ensure_schema_once() -> None:
     global _schema_ready
     if _schema_ready:
         return
-    ensure_replica_schema()
+    from database.migrate_schema import migrate_connection
+    from database.replica_store import open_replica
+
+    with arena_lock(ARENA_LOCK_PATH):
+        conn = open_replica()
+        try:
+            migrate_connection(conn, "oracle_replica", quiet=True)
+        finally:
+            conn.close()
     _schema_ready = True
 
 
@@ -82,6 +90,16 @@ async def sync_cycle() -> bool:
     """One oracle cycle: network I/O outside lock, DB read/write inside lock."""
     global _archive_counter
 
+    def _record_failure(reason: str) -> None:
+        with arena_lock(ARENA_LOCK_PATH):
+            conn = get_replica_connection()
+            try:
+                from engine_1_apex.oracle_circuit_breaker import record_sync_failure
+
+                record_sync_failure(conn, reason, commit=True)
+            finally:
+                conn.close()
+
     cycle_start = time.perf_counter()
     reset_kalshi_cycle_cache()
 
@@ -97,6 +115,7 @@ async def sync_cycle() -> bool:
 
     if not markets:
         logging.warning("No unresolved markets in markets_ledger — skipping sync.")
+        _record_failure("no_unresolved_markets")
         return False
 
     if not _edge_model_mocked():
@@ -106,6 +125,7 @@ async def sync_cycle() -> bool:
                 "Live oracle cannot fetch CLOB books for unmapped markets: %s",
                 ", ".join(unmapped),
             )
+            _record_failure(f"unmapped_clob:{','.join(unmapped[:5])}")
             return False
 
     feed = overlay_feed_from_env()
@@ -166,6 +186,15 @@ async def sync_cycle() -> bool:
             conn.close()
         db_ms = int((time.perf_counter() - db_start) * 1000)
     write_ms = int((time.perf_counter() - lock_wait_start) * 1000)
+
+    with arena_lock(ARENA_LOCK_PATH):
+        conn = get_replica_connection()
+        try:
+            from engine_1_apex.oracle_circuit_breaker import record_sync_success
+
+            record_sync_success(conn, commit=True)
+        finally:
+            conn.close()
 
     record_mids_from_snapshot(
         payload.get("markets") or {},

@@ -8,6 +8,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -38,6 +39,8 @@ class BookWatcher:
         self._token_tiers: dict[str, str] = {}
         self._shutdown = asyncio.Event()
         self._lock = threading.Lock()
+        self._last_persist: dict[str, float] = {}
+        self._persist_interval_s = float(os.getenv("BOOK_BUFFER_PERSIST_INTERVAL_S", "1.0"))
 
     def set_market_tokens(self, mapping: dict[str, tuple[str, str]]) -> None:
         """Map market_id -> (yes_token_id, liquidity_tier)."""
@@ -111,6 +114,46 @@ class BookWatcher:
         )
         with self._lock:
             self._snapshots[token_id] = stack
+
+        self._persist_buffer(token_id, stack)
+
+    def _persist_buffer(self, token_id: str, stack: SignalStack) -> None:
+        """Write BookWatcher snapshot to local book_buffer table (debounced)."""
+        now = time.monotonic()
+        last = self._last_persist.get(token_id, 0.0)
+        if now - last < self._persist_interval_s:
+            return
+        self._last_persist[token_id] = now
+        try:
+            from database.arena_lock import arena_lock
+            from database.market_state_store import get_replica_connection
+            from database.book_buffer_store import upsert_book_buffer
+
+            project_root = Path(__file__).resolve().parents[1]
+            lock_path = project_root / ".arena_db.lock"
+            market_id: str | None = None
+            with self._lock:
+                for mid, tok in self._market_tokens.items():
+                    if tok == token_id:
+                        market_id = mid
+                        break
+            if not market_id:
+                return
+            payload = stack.to_dict()
+            with arena_lock(lock_path):
+                conn = get_replica_connection()
+                try:
+                    upsert_book_buffer(
+                        conn,
+                        market_id=market_id,
+                        token_id=token_id,
+                        payload=payload,
+                        commit=True,
+                    )
+                finally:
+                    conn.close()
+        except Exception as exc:
+            logger.debug("book_buffer persist skipped: %s", exc)
 
     async def run_once(self, token_map: dict[str, tuple[str, str]]) -> None:
         if not token_map:

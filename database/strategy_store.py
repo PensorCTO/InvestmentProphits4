@@ -153,6 +153,84 @@ def write_active_strategy_source(
     return version
 
 
+def append_strategy_history(
+    conn,
+    *,
+    version: int,
+    python_source: str,
+    best_score: float,
+    baseline_version: int | None = None,
+    baseline_slopes_json: str | None = None,
+    commit: bool = True,
+) -> None:
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO strategy_history
+        (version, python_source, best_score, kept_at, baseline_version, baseline_slopes_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            version,
+            python_source,
+            best_score,
+            _utc_now_iso(),
+            baseline_version,
+            baseline_slopes_json,
+        ),
+    )
+    if commit:
+        commit_local(conn)
+
+
+def revert_active_strategy(
+    conn,
+    current_version: int,
+    *,
+    commit: bool = True,
+) -> dict[str, Any] | None:
+    """Restore prior strategy_history row; return restored record or None."""
+    row = conn.execute(
+        """
+        SELECT version, python_source, best_score
+        FROM strategy_history
+        WHERE version < ?
+        ORDER BY version DESC
+        LIMIT 1
+        """,
+        (current_version,),
+    ).fetchone()
+    if not row:
+        return None
+    prior_version, python_source, best_score = int(row[0]), row[1], float(row[2])
+    meta = {"mode": "evaluate_market", "best_score": best_score, "reverted_from": current_version}
+    conn.execute(
+        """
+        UPDATE active_strategy SET
+            strategy_json = ?,
+            python_source = ?,
+            best_score = ?,
+            source = 'revert',
+            version = ?,
+            updated_at = ?
+        WHERE id = 1
+        """,
+        (
+            json.dumps(meta),
+            python_source,
+            best_score,
+            prior_version,
+            _utc_now_iso(),
+        ),
+    )
+    if commit:
+        commit_local(conn)
+    return {
+        "version": prior_version,
+        "python_source": python_source,
+        "best_score": best_score,
+    }
+
+
 def seed_active_strategy_if_empty(
     conn,
     defaults: dict[str, Any] | None = None,

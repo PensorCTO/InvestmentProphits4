@@ -35,6 +35,14 @@ def cap_churn_nav_drawdown_pct() -> float:
     return float(os.getenv("APEX_CAP_CHURN_NAV_DRAWDOWN_PCT", "0.12"))
 
 
+def cap_churn_rotate_fill_window_seconds() -> int:
+    return int(os.getenv("APEX_CAP_CHURN_ROTATE_FILL_WINDOW_SECONDS", "180"))
+
+
+def cap_churn_min_rotate_fill_pairs() -> int:
+    return int(os.getenv("APEX_CAP_CHURN_MIN_ROTATE_FILL_PAIRS", "2"))
+
+
 def acceptance_min_nav_pct_of_session() -> float:
     return float(os.getenv("ACCEPTANCE_MIN_NAV_PCT_OF_SESSION", "0.85"))
 
@@ -52,6 +60,13 @@ class _TickSample:
     filled: int
     closed_rebalance: int
     nav: float
+    monotonic: float
+
+
+@dataclass
+class _MarketEvent:
+    market_id: str
+    kind: str
     monotonic: float
 
 
@@ -107,7 +122,7 @@ def analyze_session_churn(session_lines: list[str]) -> SessionChurnMetrics:
             metrics.alpha_sell_count += 1
             continue
 
-        if "APEX CAP STALL remediate" in line:
+        if "APEX CAP STALL remediate" in line or "APEX IDLE DEPLOYMENT remediate" in line:
             metrics.rebalance_sell_count += 1
 
     return metrics
@@ -129,6 +144,7 @@ class CapChurnGuard:
 
     def __init__(self) -> None:
         self._samples: deque[_TickSample] = deque(maxlen=cap_churn_window_ticks())
+        self._market_events: deque[_MarketEvent] = deque(maxlen=64)
         self._active_until: float = 0.0
         self._session_peak_nav: float = 0.0
         self._last_activation_detail: str = ""
@@ -147,6 +163,29 @@ class CapChurnGuard:
 
     def blocks_new_entries(self) -> bool:
         return self.is_active()
+
+    def note_market_rebalance(self, market_id: str) -> None:
+        """Record a remediation sell (cap-stall / idle-rotate / trim)."""
+        if not cap_churn_guard_enabled():
+            return
+        self._market_events.append(
+            _MarketEvent(market_id, "rebalance", time.monotonic())
+        )
+
+    def note_market_fill(self, market_id: str) -> bool:
+        """Record a fill; activate guard when rotate→refill churn is detected."""
+        if not cap_churn_guard_enabled():
+            return False
+        now = time.monotonic()
+        self._market_events.append(_MarketEvent(market_id, "fill", now))
+        if self.is_active():
+            return False
+        detail = self._rotate_fill_churn_reason(trigger_market=market_id, now=now)
+        if detail:
+            self._active_until = now + cap_churn_cooldown_seconds()
+            self._last_activation_detail = detail
+            return True
+        return False
 
     def observe(
         self,
@@ -211,8 +250,54 @@ class CapChurnGuard:
                 )
         return None
 
+    def _rotate_fill_churn_reason(
+        self,
+        *,
+        trigger_market: str,
+        now: float,
+    ) -> str | None:
+        """Detect remediation sell followed by refill on the same market (cross-tick)."""
+        window = cap_churn_rotate_fill_window_seconds()
+        min_pairs = cap_churn_min_rotate_fill_pairs()
+        pairs_by_market: dict[str, int] = {}
+
+        for market_id in {event.market_id for event in self._market_events}:
+            rebalances = [
+                event.monotonic
+                for event in self._market_events
+                if event.market_id == market_id
+                and event.kind == "rebalance"
+                and now - event.monotonic <= window
+            ]
+            fills = [
+                event.monotonic
+                for event in self._market_events
+                if event.market_id == market_id
+                and event.kind == "fill"
+                and now - event.monotonic <= window
+            ]
+            if not rebalances or not fills:
+                continue
+            pair_count = 0
+            for rebalance_at in rebalances:
+                if any(fill_at >= rebalance_at for fill_at in fills):
+                    pair_count += 1
+            if pair_count:
+                pairs_by_market[market_id] = pair_count
+
+        total_pairs = sum(pairs_by_market.values())
+        if total_pairs < min_pairs:
+            return None
+        if trigger_market not in pairs_by_market:
+            return None
+        return (
+            f"rotate+fill churn {trigger_market}: {total_pairs} pair(s) in "
+            f"{window}s (threshold={min_pairs})"
+        )
+
     def reset_session(self) -> None:
         self._samples.clear()
+        self._market_events.clear()
         self._active_until = 0.0
         self._session_peak_nav = 0.0
         self._last_activation_detail = ""

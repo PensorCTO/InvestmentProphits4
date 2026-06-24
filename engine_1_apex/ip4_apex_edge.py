@@ -29,6 +29,8 @@ from database.execution_controls_store import (
 )
 from database.knowledge_store import KnowledgeStore
 from database.market_state_store import get_fresh_snapshot
+from engine_1_apex.live_performance_monitor import run_live_audit_tick
+from engine_1_apex.oracle_circuit_breaker import evaluate_execution_gate
 from database.migrate_schema import ensure_replica_schema
 from database.portfolio_store import (
     maybe_restore_bankruptcy_capital,
@@ -72,15 +74,25 @@ from engine_1_apex.stoppage import (
     cap_stall_entry_cooldown_seconds,
     cap_stall_remediate_ticks,
     derive_trading_status,
+    idle_rotate_reentry_cooldown_seconds,
+    thesis_reentry_cooldown_seconds,
     persist_trader_health,
     remediate_cap_stall,
+    remediate_fully_deployed,
+    remediate_idle_deployment,
+    remediate_portfolio_cap,
     remediate_stoppage,
     should_remediate_cap_stall,
+    should_remediate_fully_deployed,
+    should_remediate_idle_deployment,
+    should_remediate_portfolio_cap,
     stoppage_threshold_ticks,
 )
 from engine_1_apex.trade_close import (
     close_agent_market_positions,
     close_smallest_market_leg,
+    close_smallest_open_leg,
+    count_agent_open_legs,
     count_open_legs,
     trim_market_exposure_to_cap,
 )
@@ -104,8 +116,8 @@ RISK_INTERVAL = int(os.getenv("ARENA_RISK_INTERVAL", "45"))
 APEX_EXEC_INTERVAL = int(os.getenv("APEX_EXEC_INTERVAL", "10"))
 
 APEX_AGENT_ID = os.getenv("APEX_AGENT_ID", "APEX_EDGE")
-APEX_FRACTIONAL_KELLY = float(os.getenv("APEX_FRACTIONAL_KELLY", "0.35"))
-APEX_MAX_POSITION_PCT = float(os.getenv("APEX_MAX_POSITION_PCT", "0.15"))
+APEX_FRACTIONAL_KELLY = float(os.getenv("APEX_FRACTIONAL_KELLY", "0.05"))
+APEX_MAX_POSITION_PCT = float(os.getenv("APEX_MAX_POSITION_PCT", "0.05"))
 APEX_LIQUIDITY_FLOOR = float(os.getenv("APEX_LIQUIDITY_FLOOR", "50000.0"))
 APEX_MIN_LADDER_USD = float(os.getenv("APEX_MIN_LADDER_USD", "5.0"))
 APEX_CLOSE_ON_HOLD = os.getenv("APEX_CLOSE_ON_HOLD", "true").lower() in ("true", "1", "yes")
@@ -205,6 +217,7 @@ class ApexEdgeEngine:
         self._stoppage = StoppageTracker()
         self._hold_streak: dict[str, int] = {}
         self._remediate_cooldown_until: dict[str, float] = {}
+        self._idle_rotate_reentry_until: dict[str, float] = {}
         self._churn_guard = CapChurnGuard()
         self._book_watcher_runtime = None
 
@@ -438,9 +451,28 @@ class ApexEdgeEngine:
         async def loop() -> None:
             while not self._shutdown.is_set():
                 try:
-                    await sync_cycle()
+                    success = await sync_cycle()
+                    if not success:
+                        with arena_lock(ARENA_LOCK_PATH):
+                            from database.replica_store import open_replica
+                            from engine_1_apex.oracle_circuit_breaker import record_sync_failure
+
+                            conn = open_replica()
+                            try:
+                                record_sync_failure(conn, "sync_cycle_returned_false", commit=True)
+                            finally:
+                                conn.close()
                 except Exception as exc:
                     logger.error("Oracle cycle failed: %s", exc)
+                    with arena_lock(ARENA_LOCK_PATH):
+                        from database.replica_store import open_replica
+                        from engine_1_apex.oracle_circuit_breaker import record_sync_failure
+
+                        conn = open_replica()
+                        try:
+                            record_sync_failure(conn, str(exc), commit=True)
+                        finally:
+                            conn.close()
                 for _ in range(ORACLE_INTERVAL):
                     if self._shutdown.is_set():
                         return
@@ -478,35 +510,35 @@ class ApexEdgeEngine:
                     logger.error("Strategy load failed: %s", exc)
                     return
 
-                snapshot, oracle_reject = get_fresh_snapshot(conn)
-                if oracle_reject:
-                    logger.warning("ORACLE STARVATION — %s", oracle_reject)
-                    sizing = load_agent_sizing_snapshot(conn, APEX_AGENT_ID)
-                    stats = TickStats(
-                        cash=sizing["cash"] if sizing else 0.0,
-                        nav=sizing["nav"] if sizing else 0.0,
+                allowed, oracle_reject = evaluate_execution_gate(conn)
+                if not allowed:
+                    logger.warning(
+                        "ORACLE STARVATION — %s (skip tick, wallet unchanged)",
+                        oracle_reject,
                     )
-                    self._stoppage.consecutive += 1
-                    self._stoppage.last_kind = "ORACLE_STARVATION"
-                    persist_trader_health(
-                        conn,
-                        agent_id=APEX_AGENT_ID,
-                        tracker=self._stoppage,
-                        stats=stats,
-                        status="DEGRADED",
-                        kind="ORACLE_STARVATION",
-                        detail=oracle_reject,
-                        consecutive=self._stoppage.consecutive,
-                        commit=False,
-                    )
-                    conn.commit()
-                    request_cloud_sync("oracle_starvation")
+                    return
+
+                run_live_audit_tick(conn)
+
+                snapshot, _ = get_fresh_snapshot(conn)
+                if snapshot is None:
+                    logger.warning("ORACLE STARVATION — no_snapshot after gate pass")
                     return
 
                 if not self._signals_enabled or is_execution_halted():
                     return
 
                 market_data = snapshot["payload"].get("markets") or {}
+                from database.book_buffer_store import merge_book_buffer_into_blob, read_book_buffer
+
+                enriched_market_data: dict = {}
+                for mid, blob in market_data.items():
+                    if isinstance(blob, dict):
+                        book_row = read_book_buffer(conn, mid)
+                        enriched_market_data[mid] = merge_book_buffer_into_blob(mid, blob, book_row)
+                    else:
+                        enriched_market_data[mid] = blob
+                market_data = enriched_market_data
 
                 sizing = load_agent_sizing_snapshot(conn, APEX_AGENT_ID)
                 if not sizing:
@@ -546,6 +578,7 @@ class ApexEdgeEngine:
                 signals = 0
                 cap_reasons: dict[str, int] = {}
                 cap_stall_rows: list[tuple[str, str, float, str]] = []
+                idle_rotation_rows: list[tuple[str, str, float, str]] = []
                 for market_id, data in market_data.items():
                     if not isinstance(data, dict):
                         continue
@@ -587,6 +620,11 @@ class ApexEdgeEngine:
                                 (APEX_AGENT_ID, market_id),
                             ).fetchone()
                             if open_row:
+                                category = state.get("category", "")
+                                mid = float(state.get("mid_price", 0.5))
+                                idle_rotation_rows.append(
+                                    (market_id, category, mid, liq_tier)
+                                )
                                 hold_streak = self._hold_streak[market_id]
                                 min_hold_ok = True
                                 if open_row[0] and APEX_MIN_HOLD_SECONDS > 0:
@@ -619,6 +657,10 @@ class ApexEdgeEngine:
                                     if n_closed:
                                         closed_flip += n_closed
                                         self._hold_streak.pop(market_id, None)
+                                        self._remediate_cooldown_until[market_id] = (
+                                            time.monotonic()
+                                            + thesis_reentry_cooldown_seconds()
+                                        )
                                         sizing = load_agent_sizing_snapshot(
                                             conn, APEX_AGENT_ID
                                         )
@@ -643,11 +685,27 @@ class ApexEdgeEngine:
                     self._hold_streak.pop(market_id, None)
 
                     cooldown_until = self._remediate_cooldown_until.get(market_id, 0.0)
-                    if time.monotonic() < cooldown_until:
+                    idle_rotate_until = self._idle_rotate_reentry_until.get(market_id, 0.0)
+                    if time.monotonic() < max(cooldown_until, idle_rotate_until):
                         skipped_cooldown += 1
+                        logger.debug(
+                            "APEX entry cooldown: %s until=%.0fs",
+                            market_id,
+                            max(cooldown_until, idle_rotate_until) - time.monotonic(),
+                        )
                         continue
 
                     signal_direction = "YES" if decision == "BUY_YES" else "NO"
+                    if (
+                        count_open_legs(conn, APEX_AGENT_ID, market_id)
+                        < APEX_MAX_LEGS_PER_MARKET
+                        and count_agent_open_legs(conn, APEX_AGENT_ID)
+                        >= APEX_MAX_LADDER_LEGS
+                    ):
+                        skipped_cap += 1
+                        cap_reasons["max_legs"] = cap_reasons.get("max_legs", 0) + 1
+                        continue
+
                     if count_open_legs(conn, APEX_AGENT_ID, market_id) >= APEX_MAX_LEGS_PER_MARKET:
                         open_dir = conn.execute(
                             """
@@ -679,6 +737,14 @@ class ApexEdgeEngine:
                                 float(state.get("mid_price", 0.5)),
                                 liq_tier,
                             )
+                        )
+                        continue
+
+                    if is_stop_loss_cooldown_active(conn, APEX_AGENT_ID, market_id):
+                        skipped_cooldown += 1
+                        logger.debug(
+                            "APEX stop-loss cooldown: %s",
+                            market_id,
                         )
                         continue
 
@@ -728,10 +794,6 @@ class ApexEdgeEngine:
                         state=state,
                         direction=direction,
                     )
-
-                    if is_stop_loss_cooldown_active(conn, APEX_AGENT_ID, market_id):
-                        skipped_cooldown += 1
-                        continue
 
                     position_cap = nav * sizing["max_position_pct"]
                     exposure = PaperGateway._get_agent_market_exposure(
@@ -862,6 +924,41 @@ class ApexEdgeEngine:
                         continue
 
                     if kelly_size is None:
+                        if skip_reason == "portfolio_cap" and open_notional > 0:
+                            if self._churn_guard.blocks_rebalance():
+                                skipped_cap += 1
+                                cap_reasons["churn_guard"] = (
+                                    cap_reasons.get("churn_guard", 0) + 1
+                                )
+                                continue
+                            closed, _ = close_smallest_open_leg(
+                                conn,
+                                agent_id=APEX_AGENT_ID,
+                                exit_reason="PORTFOLIO_CAP_ROTATE",
+                            )
+                            if closed:
+                                closed_rebalance += 1
+                                sizing = load_agent_sizing_snapshot(conn, APEX_AGENT_ID)
+                                if sizing:
+                                    cash = sizing["cash"]
+                                    nav = sizing["nav"]
+                                    open_notional = sizing["open_notional"]
+                                exposure = PaperGateway._get_agent_market_exposure(
+                                    conn, APEX_AGENT_ID, market_id
+                                )
+                                kelly_size, skip_reason = compute_ladder_budget(
+                                    nav=nav,
+                                    cash=cash,
+                                    fractional_kelly=signal_kelly,
+                                    max_position_pct=sizing["max_position_pct"],
+                                    market_exposure=exposure,
+                                    total_open_notional=open_notional,
+                                    min_ladder_usd=APEX_MIN_LADDER_USD,
+                                    portfolio_pct=max_portfolio_pct(),
+                                )
+                                logger.info(
+                                    "APEX TRIM portfolio_cap: closed smallest leg for headroom",
+                                )
                         if skip_reason == "position_cap" and exposure > 0:
                             if self._churn_guard.blocks_rebalance():
                                 skipped_cap += 1
@@ -926,6 +1023,12 @@ class ApexEdgeEngine:
                     )
                     if result["status"] == "FILLED":
                         filled += 1
+                        if self._churn_guard.note_market_fill(market_id):
+                            logger.warning(
+                                "APEX CAP CHURN GUARD activated on fill %s — %s",
+                                market_id,
+                                self._churn_guard.last_activation_detail,
+                            )
                         sizing = load_agent_sizing_snapshot(conn, APEX_AGENT_ID)
                         if sizing:
                             cash = sizing["cash"]
@@ -1020,6 +1123,8 @@ class ApexEdgeEngine:
                             "APEX CAP STALL remediate paused: %s",
                             pause_reason,
                         )
+                    elif self._churn_guard.blocks_rebalance():
+                        logger.info("APEX CAP STALL remediate paused: churn_guard")
                     else:
                         try:
                             n_cap = remediate_cap_stall(
@@ -1034,8 +1139,10 @@ class ApexEdgeEngine:
                     if n_cap:
                         tick_stats.closed_rebalance += n_cap
                         closed_rebalance += n_cap
-                        for mid, _, _, _ in cap_stall_targets[:1]:
-                            self._remediate_cooldown_until[mid] = (
+                        rotated_mid = cap_stall_targets[0][0] if cap_stall_targets else None
+                        if rotated_mid:
+                            self._churn_guard.note_market_rebalance(rotated_mid)
+                            self._remediate_cooldown_until[rotated_mid] = (
                                 time.monotonic() + cap_stall_entry_cooldown_seconds()
                             )
                         sizing = load_agent_sizing_snapshot(conn, APEX_AGENT_ID)
@@ -1048,6 +1155,137 @@ class ApexEdgeEngine:
                         logger.warning(
                             "APEX CAP STALL remediate: closed %d leg(s) on max_legs_per_market",
                             n_cap,
+                        )
+                if (
+                    self._stoppage.cap_blocked_streak >= cap_stall_remediate_ticks()
+                    and should_remediate_portfolio_cap(tick_stats)
+                ):
+                    n_port = 0
+                    rotated_mid: str | None = None
+                    if self._churn_guard.blocks_rebalance():
+                        logger.info(
+                            "APEX PORTFOLIO CAP remediate paused: churn_guard"
+                        )
+                    else:
+                        try:
+                            n_port, rotated_mid = remediate_portfolio_cap(
+                                conn,
+                                agent_id=APEX_AGENT_ID,
+                                cap_blocked_streak=self._stoppage.cap_blocked_streak,
+                                cap_reasons=cap_reasons,
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                "APEX PORTFOLIO CAP remediate failed: %s", exc
+                            )
+                    if n_port and rotated_mid:
+                        tick_stats.closed_rebalance += n_port
+                        closed_rebalance += n_port
+                        self._churn_guard.note_market_rebalance(rotated_mid)
+                        self._remediate_cooldown_until[rotated_mid] = (
+                            time.monotonic() + cap_stall_entry_cooldown_seconds()
+                        )
+                        sizing = load_agent_sizing_snapshot(conn, APEX_AGENT_ID)
+                        if sizing:
+                            cash = sizing["cash"]
+                            nav = sizing["nav"]
+                            open_notional = sizing["open_notional"]
+                            tick_stats.cash = cash
+                            tick_stats.nav = nav
+                        logger.warning(
+                            "APEX PORTFOLIO CAP remediate: closed %d leg(s) for portfolio headroom",
+                            n_port,
+                        )
+                if (
+                    self._stoppage.cap_blocked_streak >= cap_stall_remediate_ticks()
+                    and should_remediate_idle_deployment(tick_stats)
+                ):
+                    idle_targets = [
+                        row
+                        for row in idle_rotation_rows
+                        if time.monotonic()
+                        >= self._remediate_cooldown_until.get(row[0], 0.0)
+                    ]
+                    n_idle = 0
+                    rotated_mid: str | None = None
+                    if self._churn_guard.blocks_rebalance():
+                        logger.info(
+                            "APEX IDLE DEPLOYMENT remediate paused: churn_guard"
+                        )
+                    elif not idle_targets:
+                        logger.debug(
+                            "APEX IDLE DEPLOYMENT remediate skipped: no HOLD legs"
+                        )
+                    else:
+                        try:
+                            n_idle, rotated_mid = remediate_idle_deployment(
+                                conn,
+                                agent_id=APEX_AGENT_ID,
+                                cap_blocked_streak=self._stoppage.cap_blocked_streak,
+                                market_rows=idle_targets,
+                            )
+                        except Exception as exc:
+                            logger.error("APEX IDLE DEPLOYMENT remediate failed: %s", exc)
+                    if n_idle and rotated_mid:
+                        tick_stats.closed_rebalance += n_idle
+                        closed_rebalance += n_idle
+                        self._churn_guard.note_market_rebalance(rotated_mid)
+                        reentry_until = (
+                            time.monotonic() + idle_rotate_reentry_cooldown_seconds()
+                        )
+                        self._idle_rotate_reentry_until[rotated_mid] = reentry_until
+                        self._remediate_cooldown_until[rotated_mid] = reentry_until
+                        sizing = load_agent_sizing_snapshot(conn, APEX_AGENT_ID)
+                        if sizing:
+                            cash = sizing["cash"]
+                            nav = sizing["nav"]
+                            open_notional = sizing["open_notional"]
+                            tick_stats.cash = cash
+                            tick_stats.nav = nav
+                        logger.warning(
+                            "APEX IDLE DEPLOYMENT remediate: closed %d leg(s) on HOLD thesis",
+                            n_idle,
+                        )
+                if (
+                    self._stoppage.cap_blocked_streak >= cap_stall_remediate_ticks()
+                    and should_remediate_fully_deployed(tick_stats)
+                ):
+                    n_fd = 0
+                    rotated_mid: str | None = None
+                    if self._churn_guard.blocks_rebalance():
+                        logger.info(
+                            "APEX FULLY DEPLOYED remediate paused: churn_guard"
+                        )
+                    else:
+                        try:
+                            n_fd, rotated_mid = remediate_fully_deployed(
+                                conn,
+                                agent_id=APEX_AGENT_ID,
+                                cap_blocked_streak=self._stoppage.cap_blocked_streak,
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                "APEX FULLY DEPLOYED remediate failed: %s", exc
+                            )
+                    if n_fd and rotated_mid:
+                        tick_stats.closed_rebalance += n_fd
+                        closed_rebalance += n_fd
+                        self._churn_guard.note_market_rebalance(rotated_mid)
+                        reentry_until = (
+                            time.monotonic() + idle_rotate_reentry_cooldown_seconds()
+                        )
+                        self._idle_rotate_reentry_until[rotated_mid] = reentry_until
+                        self._remediate_cooldown_until[rotated_mid] = reentry_until
+                        sizing = load_agent_sizing_snapshot(conn, APEX_AGENT_ID)
+                        if sizing:
+                            cash = sizing["cash"]
+                            nav = sizing["nav"]
+                            open_notional = sizing["open_notional"]
+                            tick_stats.cash = cash
+                            tick_stats.nav = nav
+                        logger.warning(
+                            "APEX FULLY DEPLOYED remediate: closed %d leg(s) for deployment rotation",
+                            n_fd,
                         )
                 status, kind, detail, consecutive = self._stoppage.observe(tick_stats)
                 if kind == "CAPITAL_STARVATION":

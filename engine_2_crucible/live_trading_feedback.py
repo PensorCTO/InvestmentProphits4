@@ -79,3 +79,23 @@ def format_live_summary_for_prompt(summary: dict) -> str:
         lines.append(f"Close statuses: {', '.join(status_parts[:6])}")
 
     return "\n".join(f"- {line}" for line in lines)
+
+
+def format_live_summary_structured(summary: dict) -> str:
+    """JSON-safe live summary for Crucible prompts (adversarial-filter friendly)."""
+    import json
+
+    payload = {
+        "since_iso": summary.get("since_iso"),
+        "open_count": summary.get("open_count", 0),
+        "open_markets": (summary.get("open_markets") or [])[:10],
+        "total_closes": summary.get("total_closes", 0),
+        "cap_stall_closes": summary.get("cap_stall_closes", 0),
+        "thesis_closes": summary.get("thesis_closes", 0),
+        "signal_flip_closes": summary.get("signal_flip_closes", 0),
+        "churn_ratio": round(float(summary.get("churn_ratio", 0.0)), 4),
+        "total_pnl": round(float(summary.get("total_pnl", 0.0)), 4),
+        "alpha_pnl": round(float(summary.get("alpha_pnl", 0.0)), 4),
+        "win_rate": round(float(summary.get("win_rate", 0.0)), 4),
+    }
+    return json.dumps(payload, indent=2)

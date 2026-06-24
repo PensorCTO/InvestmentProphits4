@@ -28,6 +28,29 @@ def test_guard_activates_on_same_tick_trim_and_fill(monkeypatch):
     assert guard.blocks_rebalance() is True
 
 
+def test_guard_activates_on_cross_tick_rotate_and_fill(monkeypatch):
+    monkeypatch.setenv("APEX_CAP_CHURN_GUARD", "true")
+    monkeypatch.setenv("APEX_CAP_CHURN_MIN_ROTATE_FILL_PAIRS", "1")
+    monkeypatch.setenv("APEX_CAP_CHURN_ROTATE_FILL_WINDOW_SECONDS", "300")
+    guard = CapChurnGuard()
+
+    guard.note_market_rebalance("mkt_us_election")
+    assert guard.observe(filled=0, closed_rebalance=1, nav=100.0) is False
+    assert guard.note_market_fill("mkt_us_election") is True
+    assert guard.blocks_new_entries() is True
+    assert "rotate+fill churn" in guard.last_activation_detail
+
+
+def test_analyze_session_churn_counts_idle_deployment():
+    lines = [
+        "2026-06-24 08:27:20 - ORACLE SYNC - APEX IDLE DEPLOYMENT remediate: closed 1 leg(s)",
+        "2026-06-24 08:28:22 - ORACLE SYNC - APEX FILL: APEX_EDGE mkt_us_election YES @ 0.2034",
+    ]
+    metrics = analyze_session_churn(lines)
+    assert metrics.rebalance_sell_count == 1
+    assert metrics.buy_count == 1
+
+
 def test_guard_disabled_when_env_off(monkeypatch):
     monkeypatch.setenv("APEX_CAP_CHURN_GUARD", "false")
     guard = CapChurnGuard()

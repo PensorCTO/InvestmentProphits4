@@ -8,7 +8,7 @@ from engine_1_apex.kelly_sizing import compute_fractional_kelly
 def test_kelly_positive_for_favorable_yes():
     kelly = compute_fractional_kelly(fair_value=0.65, market_mid=0.5, direction="YES")
     assert kelly > 0.0
-    assert kelly <= 0.35
+    assert kelly <= 0.05
 
 
 def test_kelly_zero_for_unfavorable_yes():

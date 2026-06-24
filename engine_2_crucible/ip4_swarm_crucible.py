@@ -25,11 +25,14 @@ from database.execution_controls_store import read_execution_controls
 from database.migrate_schema import ensure_replica_schema
 from database.replica_store import open_replica, request_cloud_sync, sync_replica_now
 from database.strategy_store import (
+    append_strategy_history,
+    read_active_strategy_version,
     read_best_score,
     seed_active_strategy_if_empty,
     update_best_score,
     write_active_strategy_source,
 )
+from database.strategy_proposals_store import insert_proposal, update_proposal_status
 from engine_2_crucible.strategy_atomic import atomic_write_strategy
 from engine_2_crucible.strategy_loader import StrategyLoadError, read_strategy_file_text
 from shared.deepseek import chat_complete
@@ -111,7 +114,7 @@ def _count_live_fill_eligible(proposed: str) -> tuple[int, int, int]:
     """Signals that pass gateway edge on latest live snapshot (fill_eligible, signals, markets)."""
     from engine_1_apex.fair_value import resolve_execution_fair_value
     from engine_1_apex.sizing import crucible_min_net_edge, resolve_min_net_edge
-    from database.market_state_store import read_latest_snapshot
+    from database.market_state_store import get_fresh_snapshot
     from engine_2_crucible.strategy_loader import build_market_state, load_evaluate_market_from_source
     from shared.poly_costs import PolyCostModel
 
@@ -120,8 +123,8 @@ def _count_live_fill_eligible(proposed: str) -> tuple[int, int, int]:
     evaluate = load_evaluate_market_from_source(proposed)
     conn = open_replica()
     try:
-        snap = read_latest_snapshot(conn)
-        if not snap:
+        snap, reject = get_fresh_snapshot(conn)
+        if reject or not snap:
             return 1, 0, 0
         markets = snap["payload"].get("markets") or {}
         signals = 0
@@ -162,7 +165,7 @@ def _count_live_fill_eligible(proposed: str) -> tuple[int, int, int]:
 
 def _count_live_signals(proposed: str) -> tuple[int, int]:
     """Non-HOLD decisions on the latest oracle snapshot (Apex-shaped evaluation)."""
-    from database.market_state_store import read_latest_snapshot
+    from database.market_state_store import get_fresh_snapshot
     from engine_2_crucible.strategy_loader import build_market_state, load_evaluate_market_from_source
     from shared.poly_costs import PolyCostModel
 
@@ -170,8 +173,8 @@ def _count_live_signals(proposed: str) -> tuple[int, int]:
     evaluate = load_evaluate_market_from_source(proposed)
     conn = open_replica()
     try:
-        snap = read_latest_snapshot(conn)
-        if not snap:
+        snap, reject = get_fresh_snapshot(conn)
+        if reject or not snap:
             return 1, 0
         markets = snap["payload"].get("markets") or {}
         signals = 0
@@ -277,17 +280,28 @@ def build_proposal_prompt(
     failures: list[str],
     live_summary: str = "",
 ) -> str:
+    from shared.adversarial_filter import audit_text
+
     failure_block = ""
-    if failures:
-        failure_block = "Recent failures:\n" + "\n".join(f"- {f}" for f in failures[-MAX_FAILURE_CONTEXT:])
+    safe_failures: list[str] = []
+    for f in failures[-MAX_FAILURE_CONTEXT:]:
+        audit = audit_text(f, context="crucible_failure")
+        if audit.passed:
+            safe_failures.append(audit.sanitized_text[:500])
+    if safe_failures:
+        failure_block = "Recent failures:\n" + "\n".join(f"- {f}" for f in safe_failures)
 
     last_trades_text = str(last_trades) if last_trades is not None else "N/A"
 
     live_block = ""
     if live_summary.strip():
+        live_audit = audit_text(live_summary, context="crucible_live_summary")
+        live_text = live_audit.sanitized_text if live_audit.passed else "{}"
         live_block = f"""
-Live Apex paper trading since last strategy KEEP:
-{live_summary}
+Live Apex paper trading since last strategy KEEP (structured):
+```json
+{live_text}
+```
 Reduce cap-stall churn and improve per-market PnL, not just backtest Sortino.
 """
 
@@ -443,10 +457,20 @@ class AutoResearchCrucible:
             finally:
                 conn.close()
 
-    def _keep_strategy(self, python_source: str, score: float) -> None:
+    def _keep_strategy(self, python_source: str, score: float, *, proposal_id: str | None = None) -> None:
+        import json
+
+        from engine_2_crucible.backtest_judge import (
+            judge_horizons,
+            judge_slope_window,
+            rolling_return_slopes,
+            rolling_sharpe_slopes,
+        )
+
         with arena_lock(ARENA_LOCK_PATH):
             conn = open_replica()
             try:
+                prior_version = read_active_strategy_version(conn)
                 with arena_transaction(conn, auto_commit=True):
                     version = write_active_strategy_source(
                         conn,
@@ -456,6 +480,37 @@ class AutoResearchCrucible:
                         metadata={"last_score": score},
                         commit=False,
                     )
+                returns_slopes = {}
+                sharpe_slopes = {}
+                _, _, _, returns = self._score_returns_for_source(python_source)
+                if returns:
+                    window = judge_slope_window()
+                    horizons = judge_horizons()
+                    returns_slopes = rolling_return_slopes(returns, window=window, horizons=horizons)
+                    sharpe_slopes = rolling_sharpe_slopes(returns, window=window, horizons=horizons)
+                baseline_json = json.dumps(
+                    {"return_slopes": returns_slopes, "sharpe_slopes": sharpe_slopes}
+                )
+                append_strategy_history(
+                    conn,
+                    version=version,
+                    python_source=python_source,
+                    best_score=score,
+                    baseline_version=prior_version if prior_version > 0 else None,
+                    baseline_slopes_json=baseline_json,
+                    commit=False,
+                )
+                if proposal_id:
+                    update_proposal_status(
+                        conn,
+                        proposal_id,
+                        status="promoted",
+                        gate_results={"score": score, "version": version},
+                        commit=False,
+                    )
+                from database.replica_store import commit_local
+
+                commit_local(conn)
                 logging.info("KEEP v%d — pushed strategy to Turso (score=%.4f)", version, score)
                 logging.info(
                     "KEEP v%d — awaiting Apex reload; monitor next ticks for edge_reject_rate",
@@ -465,9 +520,8 @@ class AutoResearchCrucible:
                 conn.close()
         request_cloud_sync("crucible_strategy_keep")
 
-    def _slope_reject_reason(self, python_source: str) -> str | None:
+    def _score_returns_for_source(self, python_source: str) -> tuple[float, int, float, list[float]]:
         from engine_2_crucible.backtest_corpus import flatten_exhaust_rows
-        from engine_2_crucible.backtest_judge import slope_reject_reason
         from engine_2_crucible.strategy_loader import load_evaluate_market_from_source
         from engine_2_crucible.val_bpb_backtest import BACKTEST_MAX_ROWS, _score_samples
 
@@ -477,8 +531,13 @@ class AutoResearchCrucible:
             samples = flatten_exhaust_rows(conn, BACKTEST_MAX_ROWS, use_mock=False)
         finally:
             conn.close()
-        _, _, _, returns = _score_samples(samples, evaluate)
-        return slope_reject_reason(returns)
+        return _score_samples(samples, evaluate)
+
+    def _slope_reject_reason(self, python_source: str) -> str | None:
+        from engine_2_crucible.backtest_judge import combined_slope_reject_reason
+
+        _, _, _, returns = self._score_returns_for_source(python_source)
+        return combined_slope_reject_reason(returns)
 
     def _run_backtest(self) -> tuple[float | None, int | None, str, str, int]:
         proc = subprocess.run(
@@ -523,10 +582,10 @@ class AutoResearchCrucible:
             try:
                 from engine_2_crucible.live_trading_feedback import (
                     fetch_apex_live_summary,
-                    format_live_summary_for_prompt,
+                    format_live_summary_structured,
                 )
 
-                live_summary_text = format_live_summary_for_prompt(
+                live_summary_text = format_live_summary_structured(
                     fetch_apex_live_summary(conn)
                 )
             finally:
@@ -569,8 +628,28 @@ class AutoResearchCrucible:
             self._revert_strategy(f"Parse/validate failed: {exc}")
             return
 
+        proposal_id: str | None = None
+        with arena_lock(ARENA_LOCK_PATH):
+            qconn = open_replica()
+            try:
+                proposal_id = insert_proposal(qconn, proposed, status="quarantined")
+            finally:
+                qconn.close()
+
         ok, preview = _sanity_check_proposal(proposed)
         if not ok:
+            if proposal_id:
+                with arena_lock(ARENA_LOCK_PATH):
+                    qconn = open_replica()
+                    try:
+                        update_proposal_status(
+                            qconn,
+                            proposal_id,
+                            status="rejected",
+                            reject_reason=preview,
+                        )
+                    finally:
+                        qconn.close()
             self._revert_strategy(f"Proposal rejected before backtest: {preview}")
             return
 
@@ -602,6 +681,14 @@ class AutoResearchCrucible:
         )
 
         if score > best_score:
+            from engine_2_crucible.backtest_judge import score_beats_baseline
+
+            if not score_beats_baseline(score, best_score):
+                atomic_write_strategy(STRATEGY_PATH, winner_code)
+                self._revert_strategy(
+                    f"Score {score:.4f} did not beat best {best_score:.4f} by friction margin"
+                )
+                return
             slope_reason = self._slope_reject_reason(proposed)
             if slope_reason:
                 atomic_write_strategy(STRATEGY_PATH, winner_code)
@@ -655,7 +742,7 @@ class AutoResearchCrucible:
                 )
                 return
             atomic_write_strategy(STRATEGY_BACKUP_PATH, proposed)
-            self._keep_strategy(proposed, score)
+            self._keep_strategy(proposed, score, proposal_id=proposal_id)
             self._failure_context.clear()
             logging.info("Victory — new best score %.4f > %.4f", score, best_score)
         else:
@@ -721,11 +808,17 @@ class AutoResearchCrucible:
                     conn = open_replica()
                     try:
                         from database.resolved_corpus_bootstrap import ensure_resolved_corpus
+                        from engine_2_crucible.validate import validate_deployment
 
                         result = ensure_resolved_corpus(conn, commit=False)
+                        verdict = validate_deployment(conn, write=True)
                         conn.commit()
                         request_cloud_sync("crucible_corpus_refresh")
-                        logging.info("Resolved corpus refresh: %s", result)
+                        logging.info(
+                            "Resolved corpus refresh: %s overlay_deploy=%s",
+                            result,
+                            verdict.get("deploy"),
+                        )
                     finally:
                         conn.close()
 

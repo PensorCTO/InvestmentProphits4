@@ -68,13 +68,25 @@ def actionable_unfilled_signals(stats: TickStats) -> int:
 
 
 def is_cap_stall_tick(stats: TickStats) -> bool:
-    """Persistent max_legs_per_market block with no fill or close this tick."""
+    """Persistent cap block with no fill or close this tick."""
     if stats.filled > 0 or stats.closed_rebalance > 0 or stats.closed_flip > 0:
         return False
-    if derive_dominant_block_reason(stats) == "fully_deployed":
-        # Already holding max legs in the signaled direction — not a stall.
+    cap_keys = stats.cap_reasons or {}
+    if cap_keys.get("portfolio_cap"):
+        return (
+            stats.cash >= stats.min_ladder_usd
+            and actionable_unfilled_signals(stats) > 0
+        )
+    if not cap_keys.get("max_legs_per_market"):
         return False
-    return bool((stats.cap_reasons or {}).get("max_legs_per_market"))
+    reason = derive_dominant_block_reason(stats)
+    if reason == "fully_deployed":
+        # Deployed with idle cash and no actionable entries — rotate a HOLD leg.
+        return (
+            stats.cash >= stats.min_ladder_usd
+            and actionable_unfilled_signals(stats) == 0
+        )
+    return True
 
 
 def should_remediate_cap_stall(stats: TickStats) -> bool:
@@ -85,6 +97,17 @@ def should_remediate_cap_stall(stats: TickStats) -> bool:
     if reason == "fully_deployed":
         return False
     return reason == "cap_blocked"
+
+
+def should_remediate_portfolio_cap(stats: TickStats) -> bool:
+    """True when portfolio cap blocks new entries while signals remain."""
+    if not (stats.cap_reasons or {}).get("portfolio_cap"):
+        return False
+    if stats.cash < stats.min_ladder_usd:
+        return False
+    if actionable_unfilled_signals(stats) <= 0:
+        return False
+    return derive_dominant_block_reason(stats) == "cap_blocked"
 
 
 def _minutes_since_iso(iso: str | None) -> float | None:
@@ -107,6 +130,8 @@ def derive_dominant_block_reason(stats: TickStats) -> str:
         return "all_hold"
     cap_keys = stats.cap_reasons or {}
     if cap_keys.get("max_legs_per_market") or cap_keys.get("max_legs"):
+        if stats.skipped_already_positioned > 0 and actionable_unfilled_signals(stats) == 0:
+            return "fully_deployed"
         if stats.signals == 0 and stats.skipped_already_positioned > 0:
             return "fully_deployed"
     if stats.skipped_cap > 0 or cap_keys:
@@ -157,10 +182,15 @@ def classify_stoppage(stats: TickStats) -> tuple[str | None, str]:
         blocked = stats.rejected + stats.skipped_cap
         if blocked >= actionable_signals:
             cap_keys = stats.cap_reasons or {}
+            if cap_keys.get("position_cap") and stats.cash >= stats.min_ladder_usd:
+                return None, "position_capped"
+            if cap_keys.get("portfolio_cap") and stats.cash >= stats.min_ladder_usd:
+                return None, "portfolio_capped"
             if (
                 stats.cash >= stats.min_ladder_usd
                 and not cap_keys.get("min_ladder")
                 and not cap_keys.get("position_cap")
+                and not cap_keys.get("portfolio_cap")
                 and (
                     stats.skipped_edge >= stats.rejected
                     or cap_keys.get("max_legs_per_market")
@@ -168,10 +198,7 @@ def classify_stoppage(stats: TickStats) -> tuple[str | None, str]:
                 )
             ):
                 return None, "deployed_or_edge_gated"
-            capital_block = stats.skipped_cap > 0 and (
-                stats.cash < stats.min_ladder_usd
-                or cap_keys.get("position_cap", 0) > 0
-            )
+            capital_block = stats.skipped_cap > 0 and stats.cash < stats.min_ladder_usd
             if (
                 cap_keys.get("min_ladder", 0) > 0
                 and stats.cash < stats.min_ladder_usd
@@ -361,6 +388,62 @@ def cap_stall_remediation_paused(
     return False, None
 
 
+def idle_rotate_reentry_cooldown_seconds() -> int:
+    """Block re-entry on a market after idle-rotate remediation."""
+    floor = max(cap_stall_entry_cooldown_seconds(), 900)
+    return int(os.getenv("APEX_IDLE_ROTATE_REENTRY_COOLDOWN_SECONDS", str(floor)))
+
+
+def thesis_reentry_cooldown_seconds() -> int:
+    """Block re-entry after THESIS_EXPIRED close (prevents buy→HOLD→close churn loops)."""
+    default = max(cap_stall_entry_cooldown_seconds(), 900)
+    return int(os.getenv("APEX_THESIS_REENTRY_COOLDOWN_SECONDS", str(default)))
+
+
+def should_remediate_idle_deployment(stats: TickStats) -> bool:
+    """True when max legs are deployed, cash is idle, and no signal can fill."""
+    if not (stats.cap_reasons or {}).get("max_legs_per_market"):
+        return False
+    if stats.cash < stats.min_ladder_usd:
+        return False
+    if actionable_unfilled_signals(stats) > 0:
+        return False
+    return derive_dominant_block_reason(stats) == "fully_deployed"
+
+
+def remediate_idle_deployment(
+    conn,
+    *,
+    agent_id: str,
+    cap_blocked_streak: int,
+    market_rows: list[tuple[str, str, float, str]],
+) -> tuple[int, str | None]:
+    """
+    Rotate capital off a HOLD thesis when fully deployed with idle cash.
+    Closes the smallest leg on a market that returned HOLD this tick.
+    Returns (legs_closed, market_id closed).
+    """
+    if cap_blocked_streak < cap_stall_remediate_ticks():
+        return 0, None
+    if not market_rows:
+        return 0, None
+
+    from engine_1_apex.trade_close import close_smallest_market_leg
+
+    for market_id, category, market_mid, liq_tier in market_rows:
+        if close_smallest_market_leg(
+            conn,
+            agent_id=agent_id,
+            market_id=market_id,
+            category=category,
+            market_mid=market_mid,
+            liquidity_tier=liq_tier,
+            exit_reason="IDLE_DEPLOYMENT_ROTATE",
+        ):
+            return 1, market_id
+    return 0, None
+
+
 def remediate_cap_stall(
     conn,
     *,
@@ -393,6 +476,66 @@ def remediate_cap_stall(
         ):
             return 1
     return 0
+
+
+def remediate_portfolio_cap(
+    conn,
+    *,
+    agent_id: str,
+    cap_blocked_streak: int,
+    cap_reasons: dict[str, int] | None,
+) -> tuple[int, str | None]:
+    """
+    Rotate capital when portfolio cap blocks new entries.
+    Closes the globally smallest leg. Returns (legs_closed, market_id).
+    """
+    if cap_blocked_streak < cap_stall_remediate_ticks():
+        return 0, None
+    if not (cap_reasons or {}).get("portfolio_cap"):
+        return 0, None
+
+    from engine_1_apex.trade_close import close_smallest_open_leg
+
+    closed, market_id = close_smallest_open_leg(
+        conn,
+        agent_id=agent_id,
+        exit_reason="PORTFOLIO_CAP_ROTATE",
+    )
+    return 0, None
+
+
+def should_remediate_fully_deployed(stats: TickStats) -> bool:
+    """Rotate smallest leg when max legs are deployed, cash is idle, and nothing can fill."""
+    if stats.cash < stats.min_ladder_usd:
+        return False
+    if actionable_unfilled_signals(stats) > 0:
+        return False
+    if not (stats.cap_reasons or {}).get("max_legs_per_market"):
+        return False
+    return derive_dominant_block_reason(stats) == "fully_deployed"
+
+
+def remediate_fully_deployed(
+    conn,
+    *,
+    agent_id: str,
+    cap_blocked_streak: int,
+) -> tuple[int, str | None]:
+    """
+    Rotate capital off the smallest deployed leg when fully deployed with idle cash.
+    Returns (legs_closed, market_id).
+    """
+    if cap_blocked_streak < cap_stall_remediate_ticks():
+        return 0, None
+
+    from engine_1_apex.trade_close import close_smallest_open_leg
+
+    closed, market_id = close_smallest_open_leg(
+        conn,
+        agent_id=agent_id,
+        exit_reason="FULLY_DEPLOYED_ROTATE",
+    )
+    return (1, market_id) if closed else (0, None)
 
 
 def persist_trader_health(

@@ -269,6 +269,77 @@ def test_derive_dominant_block_reason_all_hold():
     )
 
 
+def test_derive_dominant_block_reason_fully_deployed_edge_gated():
+    assert (
+        derive_dominant_block_reason(
+            TickStats(
+                signals=1,
+                skipped_edge=1,
+                skipped_already_positioned=4,
+                cap_reasons={"max_legs_per_market": 4},
+                cash=52.0,
+                min_ladder_usd=5.0,
+            )
+        )
+        == "fully_deployed"
+    )
+
+
+def test_tracker_zero_fill_streak_stop_loss_precheck():
+    """Stop-loss cooldown must not inflate signals / actionable unfilled."""
+    tracker = StoppageTracker()
+    stats = TickStats(
+        signals=1,
+        skipped_edge=1,
+        skipped_cooldown=1,
+        filled=0,
+        cash=100.0,
+        min_ladder_usd=5.0,
+    )
+    tracker.observe(stats)
+    assert tracker.zero_fill_streak == 0
+    assert derive_trading_status(stats, zero_fill_streak=tracker.zero_fill_streak) == "IDLE"
+
+
+def test_should_remediate_idle_deployment_edge_gated_only():
+    from engine_1_apex.stoppage import should_remediate_idle_deployment
+
+    stats = TickStats(
+        signals=1,
+        skipped_edge=1,
+        skipped_already_positioned=4,
+        cap_reasons={"max_legs_per_market": 4},
+        cash=52.0,
+        min_ladder_usd=5.0,
+    )
+    assert should_remediate_idle_deployment(stats) is True
+
+
+def test_remediate_idle_deployment_closes_hold_leg(monkeypatch):
+    from engine_1_apex import stoppage as stoppage_mod
+    from engine_1_apex import trade_close
+
+    calls: list[str] = []
+
+    def fake_close(conn, **kwargs):
+        calls.append(kwargs["market_id"])
+        assert kwargs["exit_reason"] == "IDLE_DEPLOYMENT_ROTATE"
+        return True
+
+    monkeypatch.setattr(trade_close, "close_smallest_market_leg", fake_close)
+    monkeypatch.setattr(stoppage_mod, "cap_stall_remediate_ticks", lambda: 18)
+
+    n, rotated = stoppage_mod.remediate_idle_deployment(
+        None,
+        agent_id="APEX_EDGE",
+        cap_blocked_streak=18,
+        market_rows=[("mkt_recession", "Macro", 0.42, "HIGH_LIQUIDITY")],
+    )
+    assert n == 1
+    assert rotated == "mkt_recession"
+    assert calls == ["mkt_recession"]
+
+
 def test_derive_dominant_block_reason_fully_deployed():
     assert (
         derive_dominant_block_reason(
@@ -344,6 +415,34 @@ def test_should_remediate_cap_stall_allows_cap_blocked():
         cap_reasons={"max_legs_per_market": 1},
     )
     assert should_remediate_cap_stall(stats) is True
+
+
+def test_should_remediate_portfolio_cap():
+    from engine_1_apex.stoppage import should_remediate_portfolio_cap
+
+    stats = TickStats(
+        signals=2,
+        skipped_cap=1,
+        skipped_edge=0,
+        filled=0,
+        cash=50.0,
+        min_ladder_usd=5.0,
+        cap_reasons={"portfolio_cap": 1},
+    )
+    assert should_remediate_portfolio_cap(stats) is True
+
+
+def test_is_cap_stall_tick_portfolio_cap():
+    from engine_1_apex.stoppage import is_cap_stall_tick
+
+    stats = TickStats(
+        signals=1,
+        skipped_cap=1,
+        cash=50.0,
+        min_ladder_usd=5.0,
+        cap_reasons={"portfolio_cap": 1},
+    )
+    assert is_cap_stall_tick(stats) is True
 
 
 def test_tracker_fully_deployed_does_not_build_cap_streak():

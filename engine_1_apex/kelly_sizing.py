@@ -10,7 +10,7 @@ def _clamp(value: float, low: float, high: float) -> float:
 
 
 def max_fractional_kelly() -> float:
-    return float(os.getenv("APEX_MAX_FRACTIONAL_KELLY", "0.35"))
+    return float(os.getenv("APEX_MAX_FRACTIONAL_KELLY", "0.05"))
 
 
 def _edge_slope_scale(edge_slope: float | None) -> float:

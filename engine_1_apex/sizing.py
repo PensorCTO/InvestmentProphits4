@@ -10,8 +10,9 @@ from database.portfolio_store import compute_agent_nav
 from shared.capital_injection import EVENT_WALLET_RESET
 
 # 0 = disabled (no portfolio-wide deployment cap)
-DEFAULT_MAX_PORTFOLIO_PCT = 0.0
-DEFAULT_MAX_POSITION_PCT = 1.0
+DEFAULT_MAX_PORTFOLIO_PCT = 0.50
+DEFAULT_MAX_POSITION_PCT = 0.05
+DEFAULT_FRACTIONAL_KELLY = 0.05
 DEFAULT_STOP_LOSS_COOLDOWN_SECONDS = 900
 DEFAULT_STOP_LOSS_ESCALATION_MAX = 4
 DEFAULT_STOP_LOSS_REENTRY_EDGE_MARGIN = 0.01
@@ -26,13 +27,23 @@ def max_portfolio_pct() -> float:
 
 
 def effective_max_position_pct(db_pct: float) -> float:
-    """Env override for per-market NAV cap; default allows full NAV per market."""
+    """Env override for per-market NAV cap; default 5% of NAV per market."""
     override = os.getenv("APEX_MAX_POSITION_PCT", "").strip()
     if override:
         return float(override)
     if db_pct > 0:
         return db_pct
     return DEFAULT_MAX_POSITION_PCT
+
+
+def effective_fractional_kelly(db_pct: float) -> float:
+    """Env override for ladder Kelly fraction; default 5% of cash per ladder step."""
+    override = os.getenv("APEX_FRACTIONAL_KELLY", "").strip()
+    if override:
+        return float(override)
+    if db_pct > 0:
+        return db_pct
+    return DEFAULT_FRACTIONAL_KELLY
 
 
 def stop_loss_cooldown_seconds() -> int:
@@ -295,29 +306,34 @@ def compute_ladder_budget(
     active_portfolio_pct = (
         portfolio_pct if portfolio_pct is not None else max_portfolio_pct()
     )
+    position_cap = nav * max_position_pct
+    market_remaining = position_cap - market_exposure
+    ladder_floor = min(min_ladder_usd, position_cap)
     if active_portfolio_pct > 0:
         portfolio_cap = nav * active_portfolio_pct
         portfolio_remaining = portfolio_cap - total_open_notional
-        if portfolio_remaining < min_ladder_usd:
+        portfolio_floor = min(min_ladder_usd, portfolio_cap)
+        if portfolio_remaining < portfolio_floor:
             return None, "portfolio_cap"
     else:
         portfolio_remaining = cash
+        portfolio_floor = ladder_floor
 
-    position_cap = nav * max_position_pct
-    market_remaining = position_cap - market_exposure
-    if market_remaining < min_ladder_usd:
+    if market_remaining < ladder_floor - 1e-6:
         return None, "position_cap"
 
     kelly = min(cash * fractional_kelly, market_remaining, portfolio_remaining)
-    if kelly < min_ladder_usd:
+    if kelly < ladder_floor:
         if (
-            cash >= min_ladder_usd
-            and market_remaining >= min_ladder_usd
-            and portfolio_remaining >= min_ladder_usd
+            cash >= ladder_floor
+            and market_remaining >= ladder_floor - 1e-6
+            and portfolio_remaining >= portfolio_floor - 1e-6
         ):
-            kelly = min_ladder_usd
+            kelly = min(ladder_floor, market_remaining, portfolio_remaining)
+        elif market_remaining > 0:
+            kelly = min(market_remaining, portfolio_remaining)
         else:
-            return None, "min_ladder"
+            return None, "position_cap"
     return kelly, None
 
 
@@ -335,7 +351,7 @@ def load_agent_sizing_snapshot(conn, agent_id: str) -> dict | None:
         return None
     cash = float(row[0])
     max_position_pct = effective_max_position_pct(float(row[1]))
-    fractional_kelly = float(row[2])
+    fractional_kelly = effective_fractional_kelly(float(row[2]))
     nav, _, _ = compute_agent_nav(conn, agent_id)
     return {
         "cash": cash,

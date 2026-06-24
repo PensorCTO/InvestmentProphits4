@@ -330,7 +330,7 @@ def main() -> None:
             INSERT OR IGNORE INTO agent_archetypes
             (agent_id, quadrant, profile_name, capital, fractional_kelly,
              max_position_pct, liquidity_floor, is_active)
-            VALUES ('APEX_EDGE', 'Apex', 'Apex Edge Executor', 100.0, 0.35, 0.15, 50000.0, 1)
+            VALUES ('APEX_EDGE', 'Apex', 'Apex Edge Executor', 100.0, 0.05, 0.05, 50000.0, 1)
             """
         )
 

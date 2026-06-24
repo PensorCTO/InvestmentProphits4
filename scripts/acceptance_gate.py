@@ -345,11 +345,47 @@ def load_baseline() -> dict | None:
     return json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
 
 
+def check_offline_safety(result: GateResult) -> None:
+    tests = [
+        "tests/test_adversarial_filter.py",
+        "tests/test_backtest_judge_slope.py",
+        "tests/test_strategy_sandbox.py",
+        "tests/test_execution_controls.py",
+        "tests/test_oracle_circuit_breaker.py",
+        "tests/test_strategy_history_revert.py",
+    ]
+    code, out = _run([sys.executable, "-m", "pytest", *tests, "-q"])
+    tail = "\n".join(out.strip().splitlines()[-3:])
+    result.add("offline_safety_pytest", code == 0, tail or f"exit {code}")
+
+    code2, out2 = _run(
+        [sys.executable, "scripts/sync_master_blueprints.py", "--validate-only"]
+    )
+    result.add(
+        "offline_blueprint_validate",
+        code2 == 0,
+        out2.strip()[-200:] if out2 else f"exit {code2}",
+    )
+
+
 def run_gate(*, scope: str, skip_pytest: bool = False) -> GateResult:
     result = GateResult(
         passed=True,
         timestamp=datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
     )
+
+    if scope == "offline":
+        if not skip_pytest:
+            check_pytest(result)
+        check_offline_safety(result)
+        return result
+
+    if scope == "infra":
+        check_verify_infra(result)
+        check_apex_no_traceback(result)
+        check_dashboard_http(result)
+        check_apex_recent_tick(result)
+        return result
 
     if not skip_pytest:
         check_pytest(result)
@@ -388,9 +424,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="IP4 definition-of-done acceptance gate")
     parser.add_argument(
         "--scope",
-        choices=("infra", "trading", "dashboard", "full"),
+        choices=("infra", "offline", "trading", "dashboard", "full"),
         default="full",
-        help="infra=processes only; trading=includes verify --trading; full=all checks",
+        help="offline=pytest+safety gates; infra=processes only; trading=includes verify --trading; full=all checks",
     )
     parser.add_argument("--baseline", action="store_true", help="Write baseline JSON and exit")
     parser.add_argument("--skip-pytest", action="store_true")

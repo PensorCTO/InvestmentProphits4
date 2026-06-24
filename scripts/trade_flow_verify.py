@@ -20,7 +20,12 @@ CRUCIBLE_START_MARK = "AutoResearch Crucible"
 BUY_FILL_RE = re.compile(r"APEX FILL:")
 BUY_TICK_RE = re.compile(r"Apex tick complete filled=([1-9]\d*)")
 SELL_CLOSE_RE = re.compile(r"APEX CLOSE ")
-SELL_REMEDIATE_RE = re.compile(r"APEX CAP STALL remediate:")
+SELL_REMEDIATE_RE = re.compile(
+    r"APEX (CAP STALL|IDLE DEPLOYMENT|PORTFOLIO CAP|FULLY DEPLOYED) remediate:"
+)
+SELL_TRIM_RE = re.compile(
+    r"APEX TRIM (cap_headroom|cap_rebalance|portfolio_cap|cash_recycle):"
+)
 SELL_TICK_RE = re.compile(
     r"Apex tick complete filled=\d+ closed_flip=(\d+) closed_rebalance=(\d+)"
 )
@@ -217,6 +222,10 @@ def scan_apex_session_for_trades(session_lines: list[str]) -> TradeFlowStatus:
             sell_seen = True
             sell_evidence = line.strip()[-200:]
             continue
+        if not sell_seen and SELL_TRIM_RE.search(line):
+            sell_seen = True
+            sell_evidence = line.strip()[-200:]
+            continue
         tick_sell = SELL_TICK_RE.search(line)
         if not sell_seen and tick_sell:
             flip, rebalance = int(tick_sell.group(1)), int(tick_sell.group(2))
@@ -263,6 +272,12 @@ def scan_apex_session_recent(session_lines: list[str]) -> ApexSessionRecent:
 
         if SELL_REMEDIATE_RE.search(line):
             last_sell = _event_from_line(line, event_type="cap_stall")
+            sell_count += 1
+            cap_stall_sell_count += 1
+            continue
+
+        if SELL_TRIM_RE.search(line):
+            last_sell = _event_from_line(line, event_type="rebalance")
             sell_count += 1
             cap_stall_sell_count += 1
             continue
