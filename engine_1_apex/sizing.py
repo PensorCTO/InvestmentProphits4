@@ -7,11 +7,15 @@ import re
 from datetime import datetime, timezone
 
 from database.portfolio_store import compute_agent_nav
+from shared.capital_injection import EVENT_WALLET_RESET
 
 # 0 = disabled (no portfolio-wide deployment cap)
 DEFAULT_MAX_PORTFOLIO_PCT = 0.0
 DEFAULT_MAX_POSITION_PCT = 1.0
 DEFAULT_STOP_LOSS_COOLDOWN_SECONDS = 900
+DEFAULT_STOP_LOSS_ESCALATION_MAX = 4
+DEFAULT_STOP_LOSS_REENTRY_EDGE_MARGIN = 0.01
+DEFAULT_STOP_LOSS_LOOKBACK_HOURS = 24
 DEFAULT_LONGSHOT_MID_THRESHOLD = 0.05
 DEFAULT_LONGSHOT_MIN_NET_EDGE = 0.020
 
@@ -37,6 +41,33 @@ def stop_loss_cooldown_seconds() -> int:
     )
 
 
+def stop_loss_escalation_max() -> int:
+    return int(
+        os.getenv(
+            "APEX_STOP_LOSS_ESCALATION_MAX",
+            str(DEFAULT_STOP_LOSS_ESCALATION_MAX),
+        )
+    )
+
+
+def stop_loss_reentry_edge_margin() -> float:
+    return float(
+        os.getenv(
+            "APEX_STOP_LOSS_REENTRY_EDGE_MARGIN",
+            str(DEFAULT_STOP_LOSS_REENTRY_EDGE_MARGIN),
+        )
+    )
+
+
+def stop_loss_lookback_hours() -> int:
+    return int(
+        os.getenv(
+            "APEX_STOP_LOSS_LOOKBACK_HOURS",
+            str(DEFAULT_STOP_LOSS_LOOKBACK_HOURS),
+        )
+    )
+
+
 def longshot_mid_threshold() -> float:
     return float(
         os.getenv("APEX_LONGSHOT_MID_THRESHOLD", str(DEFAULT_LONGSHOT_MID_THRESHOLD))
@@ -51,6 +82,38 @@ def longshot_min_net_edge() -> float:
 
 def _parse_utc_iso(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def last_wallet_reset_at(conn, agent_id: str) -> datetime | None:
+    """Most recent simulated wallet reset for this agent (UTC)."""
+    row = conn.execute(
+        """
+        SELECT created_at FROM capital_injection_ledger
+        WHERE agent_id = ? AND event_type = ?
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        (agent_id, EVENT_WALLET_RESET),
+    ).fetchone()
+    if not row or not row[0]:
+        return None
+    raw = str(row[0]).strip()
+    try:
+        if "T" in raw:
+            dt = _parse_utc_iso(raw)
+        else:
+            dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
+
+
+def _wallet_reset_cutoff_iso(conn, agent_id: str) -> str | None:
+    reset_at = last_wallet_reset_at(conn, agent_id)
+    if reset_at is None:
+        return None
+    return reset_at.replace(microsecond=0).isoformat()
 
 
 def _extract_net_edge(entry_context: str | None) -> float | None:
@@ -99,18 +162,83 @@ def resolve_min_net_edge(market_mid: float, base_min_edge: float) -> float:
     return base_min_edge
 
 
+def recent_stop_loss_count(
+    conn,
+    agent_id: str,
+    market_id: str,
+    *,
+    lookback_hours: int | None = None,
+) -> int:
+    hours = (
+        lookback_hours
+        if lookback_hours is not None
+        else stop_loss_lookback_hours()
+    )
+    reset_cutoff = _wallet_reset_cutoff_iso(conn, agent_id)
+    if reset_cutoff:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) FROM trade_execution
+            WHERE agent_id = ? AND market_id = ? AND status = 'CLOSED_STOP_LOSS'
+              AND closed_at IS NOT NULL
+              AND closed_at >= ?
+              AND closed_at >= datetime('now', ?)
+            """,
+            (agent_id, market_id, reset_cutoff, f"-{hours} hours"),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) FROM trade_execution
+            WHERE agent_id = ? AND market_id = ? AND status = 'CLOSED_STOP_LOSS'
+              AND closed_at IS NOT NULL
+              AND closed_at >= datetime('now', ?)
+            """,
+            (agent_id, market_id, f"-{hours} hours"),
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def effective_stop_loss_cooldown_seconds(
+    conn,
+    agent_id: str,
+    market_id: str,
+) -> int:
+    """Escalating cooldown after repeated stop-outs on the same market."""
+    base = stop_loss_cooldown_seconds()
+    if base <= 0:
+        return 0
+    count = recent_stop_loss_count(conn, agent_id, market_id)
+    if count <= 1:
+        return base
+    exponent = min(count - 1, stop_loss_escalation_max())
+    return base * (2**exponent)
+
+
 def is_stop_loss_cooldown_active(conn, agent_id: str, market_id: str) -> bool:
-    cooldown = stop_loss_cooldown_seconds()
+    cooldown = effective_stop_loss_cooldown_seconds(conn, agent_id, market_id)
     if cooldown <= 0:
         return False
-    row = conn.execute(
-        """
-        SELECT closed_at FROM trade_execution
-        WHERE agent_id = ? AND market_id = ? AND status = 'CLOSED_STOP_LOSS'
-        ORDER BY closed_at DESC LIMIT 1
-        """,
-        (agent_id, market_id),
-    ).fetchone()
+    reset_cutoff = _wallet_reset_cutoff_iso(conn, agent_id)
+    if reset_cutoff:
+        row = conn.execute(
+            """
+            SELECT closed_at FROM trade_execution
+            WHERE agent_id = ? AND market_id = ? AND status = 'CLOSED_STOP_LOSS'
+              AND closed_at >= ?
+            ORDER BY closed_at DESC LIMIT 1
+            """,
+            (agent_id, market_id, reset_cutoff),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """
+            SELECT closed_at FROM trade_execution
+            WHERE agent_id = ? AND market_id = ? AND status = 'CLOSED_STOP_LOSS'
+            ORDER BY closed_at DESC LIMIT 1
+            """,
+            (agent_id, market_id),
+        ).fetchone()
     if not row or not row[0]:
         return False
     closed_at = _parse_utc_iso(str(row[0]))
@@ -121,14 +249,26 @@ def is_stop_loss_cooldown_active(conn, agent_id: str, market_id: str) -> bool:
 
 
 def last_stop_loss_net_edge(conn, agent_id: str, market_id: str) -> float | None:
-    row = conn.execute(
-        """
-        SELECT entry_context FROM trade_execution
-        WHERE agent_id = ? AND market_id = ? AND status = 'CLOSED_STOP_LOSS'
-        ORDER BY closed_at DESC LIMIT 1
-        """,
-        (agent_id, market_id),
-    ).fetchone()
+    reset_cutoff = _wallet_reset_cutoff_iso(conn, agent_id)
+    if reset_cutoff:
+        row = conn.execute(
+            """
+            SELECT entry_context FROM trade_execution
+            WHERE agent_id = ? AND market_id = ? AND status = 'CLOSED_STOP_LOSS'
+              AND closed_at >= ?
+            ORDER BY closed_at DESC LIMIT 1
+            """,
+            (agent_id, market_id, reset_cutoff),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """
+            SELECT entry_context FROM trade_execution
+            WHERE agent_id = ? AND market_id = ? AND status = 'CLOSED_STOP_LOSS'
+            ORDER BY closed_at DESC LIMIT 1
+            """,
+            (agent_id, market_id),
+        ).fetchone()
     if not row:
         return None
     return _extract_net_edge(row[0])

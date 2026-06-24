@@ -24,6 +24,8 @@ SELL_REMEDIATE_RE = re.compile(r"APEX CAP STALL remediate:")
 SELL_TICK_RE = re.compile(
     r"Apex tick complete filled=\d+ closed_flip=(\d+) closed_rebalance=(\d+)"
 )
+TRIM_CAP_REBALANCE_RE = re.compile(r"APEX TRIM cap_rebalance:")
+CAP_HEADROOM_RE = re.compile(r"APEX TRIM cap_headroom:")
 
 
 @dataclass
@@ -274,11 +276,26 @@ def scan_apex_session_recent(session_lines: list[str]) -> ApexSessionRecent:
         tick_sell = SELL_TICK_RE.search(line)
         if tick_sell:
             flip, rebalance = int(tick_sell.group(1)), int(tick_sell.group(2))
-            if flip > 0 or rebalance > 0:
-                kind = "signal_close" if flip > 0 else "rebalance"
-                last_sell = _event_from_line(line, event_type=kind)
+            if flip > 0:
+                last_sell = _event_from_line(line, event_type="signal_close")
                 sell_count += 1
-                alpha_sell_count += 1
+                alpha_sell_count += flip
+            if rebalance > 0:
+                last_sell = _event_from_line(line, event_type="rebalance")
+                sell_count += rebalance
+                cap_stall_sell_count += rebalance
+            continue
+
+        if TRIM_CAP_REBALANCE_RE.search(line):
+            last_sell = _event_from_line(line, event_type="rebalance")
+            sell_count += 1
+            cap_stall_sell_count += 1
+            continue
+
+        if CAP_HEADROOM_RE.search(line):
+            last_sell = _event_from_line(line, event_type="rebalance")
+            sell_count += 1
+            cap_stall_sell_count += 1
 
     return ApexSessionRecent(
         session_started_display=session_started_display,

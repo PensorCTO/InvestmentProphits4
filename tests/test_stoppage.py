@@ -398,3 +398,25 @@ def test_stoppage_tracker_hydrates_from_db():
     assert tracker.zero_fill_streak == 12
     assert tracker.last_fill_at_iso == "2026-06-23T11:05:15+00:00"
     assert tracker.minutes_since_last_fill() is not None
+
+
+def test_cap_stall_remediation_paused_on_stop_loss_cooldown(monkeypatch):
+    from engine_1_apex.stoppage import cap_stall_remediation_paused
+
+    monkeypatch.setattr(
+        "engine_1_apex.sizing.is_stop_loss_cooldown_active",
+        lambda _conn, _agent_id, market_id: market_id == "mkt_us_election",
+    )
+    paused, reason = cap_stall_remediation_paused(
+        None,
+        agent_id="APEX_EDGE",
+        nav=1000.0,
+        cash=900.0,
+        fractional_kelly=0.35,
+        max_position_pct=0.12,
+        total_open_notional=0.0,
+        min_ladder_usd=5.0,
+        market_rows=[("mkt_us_election", "Politics", 0.15, "MED_LIQUIDITY")],
+    )
+    assert paused is True
+    assert reason == "stop_loss_cooldown:mkt_us_election"

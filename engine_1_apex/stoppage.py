@@ -319,6 +319,48 @@ def remediate_stoppage(
     return closed
 
 
+def cap_stall_remediation_paused(
+    conn,
+    *,
+    agent_id: str,
+    nav: float,
+    cash: float,
+    fractional_kelly: float,
+    max_position_pct: float,
+    total_open_notional: float,
+    min_ladder_usd: float,
+    market_rows: list[tuple[str, str, float, str]],
+) -> tuple[bool, str | None]:
+    """
+    Pause cap-stall remediation when Kelly exceeds herding headroom or targets
+    are in an escalated stop-loss cooldown (prevents churn-then-deadlock loops).
+    """
+    from engine_1_apex.herding_cap import kelly_exceeds_herding_cap
+    from engine_1_apex.sizing import compute_ladder_budget, is_stop_loss_cooldown_active
+
+    for market_id, _, _, _ in market_rows:
+        if is_stop_loss_cooldown_active(conn, agent_id, market_id):
+            return True, f"stop_loss_cooldown:{market_id}"
+
+    kelly, _ = compute_ladder_budget(
+        nav=nav,
+        cash=cash,
+        fractional_kelly=fractional_kelly,
+        max_position_pct=max_position_pct,
+        market_exposure=0.0,
+        total_open_notional=total_open_notional,
+        min_ladder_usd=min_ladder_usd,
+    )
+    if kelly is not None and kelly_exceeds_herding_cap(
+        kelly,
+        nav=nav,
+        max_position_pct=max_position_pct,
+    ):
+        return True, "kelly_exceeds_herding_cap"
+
+    return False, None
+
+
 def remediate_cap_stall(
     conn,
     *,

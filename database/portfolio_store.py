@@ -438,6 +438,15 @@ def reset_apex_wallet(
         commit=False,
         sync=False,
     )
+    from database.trader_health_store import reset_trader_health_session
+
+    reset_trader_health_session(
+        conn,
+        agent_id=agent_id,
+        cash=seed,
+        nav=seed,
+        commit=False,
+    )
     if commit:
         commit_local(conn)
     if sync:

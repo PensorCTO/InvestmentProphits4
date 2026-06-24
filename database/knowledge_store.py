@@ -49,11 +49,9 @@ class KnowledgeStore:
         )
 
     def get_client(self):
-        return libsql.connect(
-            self.replica_path,
-            sync_url=self.sync_url,
-            auth_token=self.auth_token,
-        )
+        from database.replica_store import open_replica
+
+        return open_replica()
 
     def count_swarm_vectors(self, conn=None) -> int:
         own_conn = conn or self.get_client()

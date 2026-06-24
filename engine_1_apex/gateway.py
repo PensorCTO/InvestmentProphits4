@@ -7,15 +7,26 @@ import libsql
 from dotenv import load_dotenv
 
 from engine_1_apex.commit_reveal import assert_market_unresolved
+from engine_1_apex.herding_cap import apply_herding_cap_to_kelly, kelly_exceeds_herding_cap
 from engine_1_apex.sizing import (
     compute_ladder_budget,
     effective_min_net_edge,
     is_stop_loss_cooldown_active,
+    last_stop_loss_net_edge,
     load_agent_sizing_snapshot,
     max_portfolio_pct,
     resolve_min_net_edge,
+    stop_loss_reentry_edge_margin,
 )
+from shared.obi_execution_gate import check_obi_execution_gate
 from shared.poly_costs import PolyCostModel
+from shared.regime_classifier import circuit_breaker_holds
+from engine_1_apex.execution_edge import (
+    boosted_net_edge,
+    compute_composite_edge,
+    composite_edge_passes,
+    v2_cost_multiplier,
+)
 from database.replica_store import commit_local, open_replica, request_cloud_sync, sync_replica_now
 from database.transaction import arena_transaction
 from database.knowledge_store import KnowledgeStore
@@ -130,6 +141,7 @@ class PaperGateway:
         entry_context: str,
         min_net_edge: float | None = None,
         conn=None,
+        market_state: dict | None = None,
     ) -> dict:
         """
         The gatekeeper. Rejects trades without mathematical edge.
@@ -152,6 +164,21 @@ class PaperGateway:
                 liquidity_tier, liquidity_floor
             ):
                 return {"status": "REJECTED", "reason": "liquidity_floor"}
+
+            state = market_state or {}
+            hold, regime_reason = circuit_breaker_holds(state)
+            if hold:
+                return {"status": "REJECTED", "reason": regime_reason}
+
+            book_gate = {
+                "ephemeral_ratio": state.get("ephemeral_ratio", 0.0),
+                "depth_imbalance": state.get(
+                    "order_book_imbalance", state.get("depth_imbalance", 0.0)
+                ),
+            }
+            obi_ok, obi_reason = check_obi_execution_gate(book_gate, direction)
+            if not obi_ok:
+                return {"status": "REJECTED", "reason": obi_reason}
 
             sizing = load_agent_sizing_snapshot(own_conn, agent_id)
             if sizing is None:
@@ -176,26 +203,35 @@ class PaperGateway:
             current_exposure = PaperGateway._get_swarm_side_exposure(
                 own_conn, market_id, direction
             )
-            if current_exposure + kelly_size > MAX_SWARM_MARKET_EXPOSURE:
+            kelly_size, herding_reason, herding_meta = apply_herding_cap_to_kelly(
+                kelly_size,
+                current_exposure,
+                nav=sizing["nav"],
+                max_position_pct=sizing["max_position_pct"],
+                min_ladder_usd=MIN_LADDER_USD,
+            )
+            if kelly_size is None:
                 return {
                     "status": "REJECTED",
-                    "reason": "HERDING_CAP_EXCEEDED",
-                    "current_exposure": current_exposure,
-                    "cap": MAX_SWARM_MARKET_EXPOSURE,
+                    "reason": herding_reason or "herding_headroom_insufficient",
+                    **herding_meta,
                 }
 
+            edge_result = compute_composite_edge(
+                fair_value=fair_value,
+                market_mid=market_mid,
+                direction=direction,
+                liquidity_tier=liquidity_tier,
+                kelly_size=kelly_size,
+                capital=capital,
+                state=state,
+            )
+            net_edge = boosted_net_edge(edge_result)
             edge_threshold = resolve_min_net_edge(
                 market_mid,
                 min_net_edge if min_net_edge is not None else self.MIN_NET_EDGE,
             )
-            net_edge = PolyCostModel.calculate_directional_net_edge(
-                fair_value,
-                market_mid,
-                direction,
-                liquidity_tier,
-                kelly_size,
-                capital=capital,
-            )
+            required_edge = max(edge_threshold, v2_cost_multiplier() * edge_result.tx_cost)
 
             prior_edge = (
                 PaperGateway._prior_net_edge(own_conn, agent_id, market_id)
@@ -208,10 +244,19 @@ class PaperGateway:
                     "reason": "ladder_no_edge_improvement",
                 }
 
-            if net_edge < edge_threshold:
+            sl_prior_edge = last_stop_loss_net_edge(own_conn, agent_id, market_id)
+            if sl_prior_edge is not None:
+                min_reentry = sl_prior_edge + stop_loss_reentry_edge_margin()
+                if net_edge <= min_reentry:
+                    return {
+                        "status": "REJECTED",
+                        "reason": "stop_loss_reentry_edge",
+                    }
+
+            if not composite_edge_passes(edge_result, min_net_edge=edge_threshold):
                 return {
                     "status": "REJECTED",
-                    "reason": f"Net Edge {net_edge:.4f} < {edge_threshold}",
+                    "reason": f"Net Edge {net_edge:.4f} < {required_edge:.4f}",
                 }
 
             _tox_score, tox_reason = should_reject_toxic_entry(

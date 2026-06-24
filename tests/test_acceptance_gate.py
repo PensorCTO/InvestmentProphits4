@@ -10,6 +10,75 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
+def test_gate_fails_when_trading_not_ready():
+    from scripts import acceptance_gate as gate
+
+    with patch.object(gate, "check_pytest"):
+        with patch.object(gate, "check_verify_infra"):
+            with patch.object(gate, "check_apex_no_traceback"):
+                with patch.object(gate, "check_dashboard_http"):
+                    with patch.object(gate, "check_apex_recent_tick"):
+                        with patch.object(gate, "check_verify_trading"):
+                            with patch.object(gate, "check_trader_health"):
+                                with patch.object(gate, "check_apex_sustained_no_fills"):
+                                    with patch.object(gate, "check_nav_session_floor"):
+                                        with patch.object(gate, "check_session_cap_churn"):
+                                            with patch.object(
+                                                gate, "check_dashboard_semantics"
+                                            ) as mock_dash:
+
+                                                def fail_trading(result):
+                                                    result.add(
+                                                        "trading_ready",
+                                                        False,
+                                                        "Trading stalled: 18 ticks",
+                                                    )
+
+                                                mock_dash.side_effect = fail_trading
+                                                result = gate.run_gate(
+                                                    scope="full", skip_pytest=True
+                                                )
+    assert result.passed is False
+    assert any(
+        c["name"] == "trading_ready" and not c["passed"] for c in result.checks
+    )
+
+
+def test_gate_fails_when_nav_below_session_floor():
+    from scripts import acceptance_gate as gate
+
+    with patch.object(gate, "check_pytest"):
+        with patch.object(gate, "check_verify_infra"):
+            with patch.object(gate, "check_apex_no_traceback"):
+                with patch.object(gate, "check_dashboard_http"):
+                    with patch.object(gate, "check_apex_recent_tick"):
+                        with patch.object(gate, "check_verify_trading"):
+                            with patch.object(gate, "check_trader_health"):
+                                with patch.object(gate, "check_apex_sustained_no_fills"):
+                                    with patch.object(gate, "check_session_cap_churn"):
+                                        with patch.object(gate, "check_dashboard_semantics"):
+                                            with patch.object(
+                                                gate, "check_nav_session_floor"
+                                            ) as mock_nav:
+
+                                                def fail_nav(result):
+                                                    result.add(
+                                                        "nav_session_floor",
+                                                        False,
+                                                        "nav=$41.55 floor=$85.00",
+                                                    )
+
+                                                mock_nav.side_effect = fail_nav
+                                                result = gate.run_gate(
+                                                    scope="full", skip_pytest=True
+                                                )
+    assert result.passed is False
+    assert any(
+        c["name"] == "nav_session_floor" and not c["passed"]
+        for c in result.checks
+    )
+
+
 def test_gate_fails_when_trader_stalled():
     from scripts import acceptance_gate as gate
 
@@ -25,17 +94,24 @@ def test_gate_fails_when_trader_stalled():
                 with patch.object(gate, "check_dashboard_http"):
                     with patch.object(gate, "check_apex_recent_tick"):
                         with patch.object(gate, "check_verify_trading"):
-                            with patch.object(gate, "check_dashboard_semantics"):
-                                with patch.object(gate, "check_trader_health") as mock_health:
-                                    def fail_stalled(result):
-                                        result.add(
-                                            "trader_not_stalled",
-                                            False,
-                                            "trading_status=STALLED",
-                                        )
+                            with patch.object(gate, "check_nav_session_floor"):
+                                with patch.object(gate, "check_session_cap_churn"):
+                                    with patch.object(gate, "check_dashboard_semantics"):
+                                        with patch.object(
+                                            gate, "check_trader_health"
+                                        ) as mock_health:
 
-                                    mock_health.side_effect = fail_stalled
-                                    result = gate.run_gate(scope="full", skip_pytest=True)
+                                            def fail_stalled(result):
+                                                result.add(
+                                                    "trader_not_stalled",
+                                                    False,
+                                                    "trading_status=STALLED",
+                                                )
+
+                                            mock_health.side_effect = fail_stalled
+                                            result = gate.run_gate(
+                                                scope="full", skip_pytest=True
+                                            )
     assert result.passed is False
     assert any(c["name"] == "trader_not_stalled" and not c["passed"] for c in result.checks)
 

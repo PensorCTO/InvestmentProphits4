@@ -64,9 +64,11 @@ from engine_1_apex.sizing import (
 )
 from engine_1_apex.oracle_sync import _ensure_schema_once, _maybe_auto_map_clob, sync_cycle
 from engine_1_apex.risk_daemon import RiskDaemon
+from engine_1_apex.cap_churn_guard import CapChurnGuard, cap_churn_cooldown_seconds
 from engine_1_apex.stoppage import (
     StoppageTracker,
     TickStats,
+    cap_stall_remediation_paused,
     cap_stall_entry_cooldown_seconds,
     cap_stall_remediate_ticks,
     derive_trading_status,
@@ -85,10 +87,14 @@ from engine_1_apex.trade_close import (
 from engine_2_crucible.strategy_loader import (
     StrategyLoadError,
     build_market_state,
+    enrich_state_from_signal_stack,
     load_evaluate_market_from_source,
     read_strategy_file_text,
 )
+from shared.book_watcher import get_book_watcher_runtime
+from shared.mock_clob_signals import edge_model_mocked
 from shared.poly_costs import PolyCostModel
+from shared.regime_classifier import circuit_breaker_holds
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +205,36 @@ class ApexEdgeEngine:
         self._stoppage = StoppageTracker()
         self._hold_streak: dict[str, int] = {}
         self._remediate_cooldown_until: dict[str, float] = {}
+        self._churn_guard = CapChurnGuard()
+        self._book_watcher_runtime = None
+
+    def _ensure_book_watcher(self) -> None:
+        if edge_model_mocked():
+            return
+        if self._book_watcher_runtime is None:
+            runtime = get_book_watcher_runtime()
+
+            def _token_provider() -> dict[str, tuple[str, str]]:
+                conn = open_replica()
+                try:
+                    from database.market_state_store import load_active_markets
+
+                    markets = load_active_markets(conn)
+                    mapping: dict[str, tuple[str, str]] = {}
+                    for m in markets:
+                        if m.clob_token_ids:
+                            mapping[m.market_id] = (
+                                str(m.clob_token_ids[0]),
+                                m.liquidity_tier,
+                            )
+                    return mapping
+                finally:
+                    conn.close()
+
+            runtime.set_token_provider(_token_provider)
+            runtime.start()
+            self._book_watcher_runtime = runtime
+            logger.info("BookWatcher started (poll_ms=%s)", os.getenv("MTF_POLL_MS", "250"))
 
     def _validate_live_credentials(self) -> None:
         if not os.getenv("ALCHEMY_API_KEY", "").strip() and not os.getenv(
@@ -369,6 +405,8 @@ class ApexEdgeEngine:
 
             ensure_clob()
 
+        self._ensure_book_watcher()
+
     def _load_evaluate_fn(self, conn):
         version = read_active_strategy_version(conn)
         if self._evaluate_fn is not None and version == self._cached_version:
@@ -513,6 +551,16 @@ class ApexEdgeEngine:
                         continue
 
                     state = build_market_state(market_id, data)
+                    if self._book_watcher_runtime is not None:
+                        stack = self._book_watcher_runtime.watcher.get_by_market(market_id)
+                        if stack is not None:
+                            state = enrich_state_from_signal_stack(state, stack.to_dict())
+
+                    hold_regime, regime_reason = circuit_breaker_holds(state)
+                    if hold_regime:
+                        skipped_hold += 1
+                        continue
+
                     liq_tier = state.get("liquidity_tier", "MED_LIQUIDITY")
                     if not PolyCostModel.tier_meets_liquidity_floor(
                         liq_tier, APEX_LIQUIDITY_FLOOR
@@ -690,16 +738,23 @@ class ApexEdgeEngine:
                         conn, APEX_AGENT_ID, market_id
                     )
                     if exposure >= position_cap - 1e-6:
-                        n_trim = trim_market_exposure_to_cap(
-                            conn,
-                            agent_id=APEX_AGENT_ID,
-                            market_id=market_id,
-                            category=category,
-                            market_mid=mid,
-                            liquidity_tier=liq_tier,
-                            position_cap=position_cap,
-                            min_ladder_usd=APEX_MIN_LADDER_USD,
-                        )
+                        n_trim = 0
+                        if not self._churn_guard.blocks_rebalance():
+                            n_trim = trim_market_exposure_to_cap(
+                                conn,
+                                agent_id=APEX_AGENT_ID,
+                                market_id=market_id,
+                                category=category,
+                                market_mid=mid,
+                                liquidity_tier=liq_tier,
+                                position_cap=position_cap,
+                                min_ladder_usd=APEX_MIN_LADDER_USD,
+                            )
+                        elif signals > 0:
+                            skipped_cap += 1
+                            cap_reasons["churn_guard"] = (
+                                cap_reasons.get("churn_guard", 0) + 1
+                            )
                         if n_trim:
                             closed_rebalance += n_trim
                             sizing = load_agent_sizing_snapshot(conn, APEX_AGENT_ID)
@@ -716,10 +771,34 @@ class ApexEdgeEngine:
                                 n_trim,
                             )
 
-                    dynamic_kelly = compute_fractional_kelly(
+                    from engine_1_apex.execution_edge import (
+                        compute_composite_edge,
+                        signal_execution_fair,
+                    )
+
+                    edge_preview = compute_composite_edge(
                         fair_value=fair_value,
                         market_mid=mid,
                         direction=direction,
+                        liquidity_tier=liq_tier,
+                        kelly_size=APEX_MIN_LADDER_USD,
+                        capital=nav,
+                        state=state,
+                    )
+                    kelly_fair = signal_execution_fair(
+                        mid, direction, edge_preview.composite_score
+                    )
+                    if direction == "YES":
+                        kelly_fair = max(fair_value, kelly_fair)
+                    else:
+                        kelly_fair = min(fair_value, kelly_fair)
+
+                    dynamic_kelly = compute_fractional_kelly(
+                        fair_value=kelly_fair,
+                        market_mid=mid,
+                        direction=direction,
+                        edge_slope=float(state.get("flow_imbalance_5s", 0.0))
+                        - float(state.get("flow_imbalance_30s", 0.0)),
                     )
                     signal_kelly = (
                         dynamic_kelly if dynamic_kelly > 0 else sizing["fractional_kelly"]
@@ -772,8 +851,24 @@ class ApexEdgeEngine:
                                 "APEX TRIM cash_recycle: %s freed cash for ladder",
                                 market_id,
                             )
+                    if self._churn_guard.blocks_new_entries():
+                        skipped_cap += 1
+                        cap_reasons["churn_guard"] = cap_reasons.get("churn_guard", 0) + 1
+                        logger.warning(
+                            "APEX CAP CHURN GUARD: block entry %s (%s)",
+                            market_id,
+                            self._churn_guard.last_activation_detail or "active",
+                        )
+                        continue
+
                     if kelly_size is None:
                         if skip_reason == "position_cap" and exposure > 0:
+                            if self._churn_guard.blocks_rebalance():
+                                skipped_cap += 1
+                                cap_reasons["churn_guard"] = (
+                                    cap_reasons.get("churn_guard", 0) + 1
+                                )
+                                continue
                             if close_smallest_market_leg(
                                 conn,
                                 agent_id=APEX_AGENT_ID,
@@ -827,6 +922,7 @@ class ApexEdgeEngine:
                         entry_context=entry_context,
                         min_net_edge=min_edge,
                         conn=conn,
+                        market_state=state,
                     )
                     if result["status"] == "FILLED":
                         filled += 1
@@ -887,6 +983,16 @@ class ApexEdgeEngine:
                     min_ladder_usd=APEX_MIN_LADDER_USD,
                     cap_reasons=cap_reasons,
                 )
+                if self._churn_guard.observe(
+                    filled=filled,
+                    closed_rebalance=closed_rebalance,
+                    nav=nav,
+                ):
+                    logger.warning(
+                        "APEX CAP CHURN GUARD activated for %ds — %s",
+                        cap_churn_cooldown_seconds(),
+                        self._churn_guard.last_activation_detail,
+                    )
                 if (
                     self._stoppage.cap_blocked_streak >= cap_stall_remediate_ticks()
                     and should_remediate_cap_stall(tick_stats)
@@ -897,17 +1003,34 @@ class ApexEdgeEngine:
                         if time.monotonic()
                         >= self._remediate_cooldown_until.get(row[0], 0.0)
                     ]
+                    paused, pause_reason = cap_stall_remediation_paused(
+                        conn,
+                        agent_id=APEX_AGENT_ID,
+                        nav=nav,
+                        cash=cash,
+                        fractional_kelly=sizing["fractional_kelly"],
+                        max_position_pct=sizing["max_position_pct"],
+                        total_open_notional=open_notional,
+                        min_ladder_usd=APEX_MIN_LADDER_USD,
+                        market_rows=cap_stall_targets,
+                    )
                     n_cap = 0
-                    try:
-                        n_cap = remediate_cap_stall(
-                            conn,
-                            agent_id=APEX_AGENT_ID,
-                            cap_blocked_streak=self._stoppage.cap_blocked_streak,
-                            cap_reasons=cap_reasons,
-                            market_rows=cap_stall_targets,
+                    if paused:
+                        logger.info(
+                            "APEX CAP STALL remediate paused: %s",
+                            pause_reason,
                         )
-                    except Exception as exc:
-                        logger.error("APEX CAP STALL remediate failed: %s", exc)
+                    else:
+                        try:
+                            n_cap = remediate_cap_stall(
+                                conn,
+                                agent_id=APEX_AGENT_ID,
+                                cap_blocked_streak=self._stoppage.cap_blocked_streak,
+                                cap_reasons=cap_reasons,
+                                market_rows=cap_stall_targets,
+                            )
+                        except Exception as exc:
+                            logger.error("APEX CAP STALL remediate failed: %s", exc)
                     if n_cap:
                         tick_stats.closed_rebalance += n_cap
                         closed_rebalance += n_cap
@@ -1081,6 +1204,9 @@ class ApexEdgeEngine:
 
         if self._async_runtime is not None:
             self._async_runtime.stop()
+        if self._book_watcher_runtime is not None:
+            self._book_watcher_runtime.stop()
+            self._book_watcher_runtime = None
         logger.info("Apex Edge Engine stopped")
         return 0
 

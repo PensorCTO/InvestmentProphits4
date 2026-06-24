@@ -75,13 +75,35 @@ def _sortino_ratio(returns: list[float]) -> float:
 
 
 def _fair_value_for_backtest(state: dict, direction: str) -> float:
-    """Lightweight fair value for Kelly sizing during exhaust replay."""
+    """Overlay-style fair value for Kelly sizing during exhaust replay."""
     mid = float(state.get("mid_price", 0.5))
+    mp_dev = float(state.get("microprice_deviation", 0.0))
+    flow = float(state.get("flow_imbalance_5s", 0.0))
     obi = float(state.get("order_book_imbalance", 0.0))
-    bump = abs(obi) * 0.08
+    sign = 1.0 if direction == "YES" else -1.0
+    composite = sign * (0.25 * mp_dev + 0.25 * flow + 0.20 * obi)
     if direction == "YES":
-        return min(0.99, mid + bump) if obi >= 0 else mid
-    return max(0.01, mid - bump) if obi <= 0 else mid
+        return min(0.99, mid + composite)
+    return max(0.01, mid + composite)
+
+
+def _fill_probability(state: dict) -> float:
+    """Model fill probability from liquidity quality and committed depth."""
+    liq_q = float(state.get("liquidity_quality", 0.5))
+    spoof = float(state.get("spoof_penalty", state.get("ephemeral_ratio", 0.0)))
+    depth = float(state.get("bid_depth", 0.0)) + float(state.get("ask_depth", 0.0))
+    depth_factor = min(1.0, depth / 80.0)
+    return max(0.05, min(1.0, liq_q * depth_factor * (1.0 - 0.5 * spoof)))
+
+
+def _stress_entry_cost(mid: float, spread: float, decision: str, *, stress_mult: float = 1.0) -> float:
+    return _entry_cost(mid, spread * stress_mult, decision)
+
+
+def _max_adverse_excursion(entry: float, decision: str, resolution: int) -> float:
+    """Worst path proxy: full loss magnitude before resolution."""
+    ret = _trade_return(decision, entry, resolution)
+    return max(0.0, -ret)
 
 
 def _score_samples(
@@ -98,15 +120,27 @@ def _score_samples(
     peak_capital = INITIAL_CAPITAL
     max_drawdown = 0.0
     trade_returns: list[float] = []
+    mae_values: list[float] = []
+    slippage_stress_mult = float(os.getenv("BACKTEST_SLIPPAGE_STRESS_MULT", "2.0"))
 
     for state, resolution in samples:
         decision = evaluate_market(state)
         if decision == "HOLD":
             continue
 
+        fill_prob = _fill_probability(state)
+        if random_fill := float(os.getenv("BACKTEST_FILL_PROB_FLOOR", "0.15")):
+            if fill_prob < random_fill:
+                continue
+
         mid = float(state.get("mid_price", 0.5))
         spread = float(state.get("spread", 0.03))
-        entry = _entry_cost(mid, spread, decision)
+        liq_q = float(state.get("liquidity_quality", 0.5))
+        if liq_q < 0.2:
+            spread *= float(os.getenv("BACKTEST_RESOLUTION_SPREAD_MULT", "2.5"))
+
+        entry = _stress_entry_cost(mid, spread, decision)
+        stress_entry = _stress_entry_cost(mid, spread, decision, stress_mult=slippage_stress_mult)
         if entry <= 0 or entry >= 1:
             continue
 
@@ -116,14 +150,20 @@ def _score_samples(
             fair_value=fair_value,
             market_mid=mid,
             direction=direction,
+            edge_slope=float(state.get("flow_imbalance_5s", 0.0))
+            - float(state.get("flow_imbalance_30s", 0.0)),
         )
-        stake = capital * kelly_frac
+        stake = capital * kelly_frac * fill_prob
         if stake < 1.0:
             continue
 
         ret = _trade_return(decision, entry, resolution)
+        stress_ret = _trade_return(decision, stress_entry, resolution)
         trade_returns.append(ret)
+        mae_values.append(_max_adverse_excursion(entry, decision, resolution))
         capital += ret * stake
+        if stress_ret < ret:
+            capital += (stress_ret - ret) * stake * 0.25
         peak_capital = max(peak_capital, capital)
         if peak_capital > 0:
             dd = (peak_capital - capital) / peak_capital
@@ -135,6 +175,11 @@ def _score_samples(
 
     if max_drawdown > DRAWDOWN_PENALTY_THRESHOLD:
         score -= max_drawdown * 10.0
+
+    if mae_values:
+        avg_mae = sum(mae_values) / len(mae_values)
+        mae_penalty = float(os.getenv("BACKTEST_MAE_PENALTY", "2.0"))
+        score -= avg_mae * mae_penalty
 
     if not trade_returns and samples:
         score = total_return
@@ -161,10 +206,7 @@ def run_backtest() -> float:
             return 0.0
         resolved_samples = flatten_exhaust_rows(conn, BACKTEST_MAX_ROWS, use_mock=False)
         if mock_resolutions_enabled():
-            dev_samples = flatten_exhaust_rows(conn, BACKTEST_MAX_ROWS, use_mock=True)
-            dev_score, dev_trades, _, _ = _score_samples(dev_samples, evaluate_market)
-            print(f"RESEARCH_SCORE:{dev_score:.4f}", flush=True)
-            print(f"RESEARCH_TRADES:{dev_trades}", flush=True)
+            print("WARNING:BACKTEST_MOCK_RESOLUTIONS ignored for champion SCORE", flush=True)
     finally:
         conn.close()
 

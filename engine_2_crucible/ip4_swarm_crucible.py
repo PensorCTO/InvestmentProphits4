@@ -609,6 +609,7 @@ class AutoResearchCrucible:
                 return
 
             from engine_2_crucible.live_replay_gate import replay_fill_eligibility
+            from engine_2_crucible.walk_forward_pipeline import run_walk_forward_pipeline
 
             replay = replay_fill_eligibility(proposed)
             if not replay.passed:
@@ -619,6 +620,20 @@ class AutoResearchCrucible:
                     f"fill-eligible, reject_rate<="
                     f"{os.getenv('AUTORESEARCH_MAX_REPLAY_EDGE_REJECT_RATE', '0.5')})"
                 )
+                return
+
+            with arena_lock(ARENA_LOCK_PATH):
+                wf_conn = open_replica()
+                try:
+                    wf = run_walk_forward_pipeline(
+                        load_evaluate_market_from_source(proposed),
+                        wf_conn,
+                    )
+                finally:
+                    wf_conn.close()
+            if not wf.passed:
+                atomic_write_strategy(STRATEGY_PATH, winner_code)
+                self._revert_strategy(f"Walk-forward failed at {wf.stage}: {wf.detail}")
                 return
 
             live_signals, live_markets = _count_live_signals(proposed)

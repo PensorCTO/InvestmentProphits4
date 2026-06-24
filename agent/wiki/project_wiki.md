@@ -109,11 +109,20 @@ Key modules post-audit:
 | done | Enable `CROSS_VENUE_ENABLED=true` for paper cross-venue overlays |
 | done | Core Integration & Remediation refactor (5 phases — spec 2026-06-23) |
 | done | Learning loop integration (live feedback, toxicity gate, corpus refresh, scheduler, activity breakdown) |
+| done | V2 Signal Stack + Adaptive MTF (BookWatcher, composite edge, Crucible hardening, regime breaker) |
 | todo | Harden supervisor persistence (`watch-bg` exit investigation; zombie child detection fixed) |
 
 ---
 
 ## Decisions Log
+
+### 2026-06-23 — V2 Signal Stack & Adaptive MTF
+
+- **BookWatcher:** Sub-second asyncio poller (`shared/book_watcher.py`, default 250ms) in Apex; feeds live `SignalStack` per CLOB token.
+- **Adaptive MTF:** No fixed μs cutoff. `τ_MTF = max(MTF_TAU_FLOOR_MS, MTF_BETA × median_cancel_ms) × ψ_spasm` with L1 tier factor 0.5 and trade-confirmed exemption.
+- **Fair value decoupled:** `resolve_execution_fair_value()` is overlay-only; OBI bump removed. Edge lives in `engine_1_apex/execution_edge.py` composite gate (25/25/20/15/10 weights).
+- **Regime circuit breaker:** `shared/regime_classifier.py` returns HOLD path in Apex when `POOR_LIQUIDITY` (≥2 of wide spread, high ephemeral, low liquidity quality, thin book).
+- **Crucible hardening:** Scorer adds MAE penalty, fill-prob filter, slippage stress; walk-forward pipeline before KEEP; `BACKTEST_MOCK_RESOLUTIONS` ignored for champion SCORE.
 
 ### 2026-06-23 — Learning loop integration (Apex ↔ Crucible)
 
@@ -174,6 +183,9 @@ Quarter-Kelly can produce cash*kelly < APEX_MIN_LADDER_USD while wallet has ampl
 
 ### 2026-06-23 — 2026-06-23 — Cap-stall churn fix (hold deployed thesis)
 Cap-stall remediation was firing on fully_deployed ticks (max_legs=1 + aligned BUY_YES), force-closing and rebuying the same leg every ~3min (~-$0.27/cycle spread tax). Fix: is_cap_stall_tick/should_remediate_cap_stall skip fully_deployed; aligned max-leg positions stay open until thesis/TP/SL/flip. Apex logs show block=fully_deployed, zero CAP STALL remediate after restart.
+
+### 2026-06-23 — Cap-churn guard + acceptance NAV/churn checks
+Runtime CapChurnGuard pauses trim/refill when same-tick rebalance+fill pattern or NAV drawdown with rebalance activity. acceptance_gate adds nav_session_floor, session_cap_churn, and trading_ready (fail when dashboard trading_blockers).
 ## Lessons Learned
 
 ### 2026-06-22 — Turso champion lag caused wallet STOPPED (high)
@@ -372,3 +384,33 @@ Cap-stall remediation was firing on fully_deployed ticks (max_legs=1 + aligned B
 ### 2026-06-23 15:06 — Fixed cap-stall churn loop: stoppage.py + ip4_apex_edge.py hold aligned max-leg positions instead of remediate→rebuy. 29 stoppage tests pass; trading acceptance_gate PASS; stack HEALTHY fully_deployed; 0 cap-stall events post-restart.
 
 **Next:** Monitor NAV for alpha closes (TP/SL/thesis); fix NO stop-loss exit price bug (+ false win).
+
+### 2026-06-23 — V2 Signal Stack & Adaptive MTF (full plan)
+
+- **Phase 1:** `shared/book_watcher.py`, `shared/signals/*` (microprice, aggressive flow, temporal decay, adaptive MTF, SignalStack bus).
+- **Phase 2:** Overlay-only fair value; `execution_edge.py` composite gate wired in `gateway.py` + OBI execution gate.
+- **Phase 3:** Expanded backtest scorer (MAE, fill prob, slippage stress); `walk_forward_pipeline.py` before Crucible KEEP; mock resolutions stripped from champion path.
+- **Phase 4:** `regime_classifier.py` circuit breaker in Apex tick; dual-horizon Kelly via flow slope.
+- **Tests:** 218 pytest pass (new: `test_mtf_adaptive`, `test_microprice`, `test_aggressive_flow`, `test_composite_edge`; updated `test_fair_value`).
+
+**Next:** Monitor NAV for alpha closes (TP/SL/thesis); fix NO stop-loss exit price bug (+ false win).
+
+### 2026-06-23 — Paper activity tuning (safest order)
+
+- **Step 1 env:** `APEX_MAX_LEGS_PER_MARKET=2`, `CRUCIBLE_EXPLORATION=true`, `V2_MIN_NET_EDGE_COST_MULT=1.0` (kept `APEX_EDGE_MODE=exploration`).
+- **Step 3 strategy:** Moderate relax (spread 0.018, cross 0.004, OBI 0.006, depth imb 0.03); backtest unchanged vs baseline on resolved corpus; synced Turso v96.
+- **Result:** Apex `trading=ACTIVE`; fills on `mkt_fed_cut`, `mkt_ukraine_peace`; expect more cap_rebalance churn with 2 legs/market.
+
+### 2026-06-23 17:12 — Cap-churn guard in engine_1_apex/cap_churn_guard.py wired into Apex tick loop; acceptance gate NAV/churn/trading_ready checks; trade_flow_verify rebalance sells classified as churn. 227 pytest pass; stack restarted.
+
+**Next:** Monitor apex.log for CAP CHURN GUARD under multi-market activity tuning.
+
+### 2026-06-24 — Herding cap, wallet-reset gates, blueprint sync
+
+- **Herding cap:** `engine_1_apex/herding_cap.py` — NAV-scaled cap (`max(floor, NAV×pct)`), Kelly clipped to headroom instead of hard `HERDING_CAP_EXCEEDED`.
+- **Cap-stall:** Remediation paused when Kelly exceeds herding cap or target market in escalated stop-loss cooldown.
+- **Stop-loss loop:** Escalating cooldown (2× repeats), re-entry edge margin; all stop-loss gates ignore pre-`WALLET_RESET` history.
+- **Wallet reset:** Clears `trader_health` streak/counters; `KnowledgeStore` uses `open_replica()` (fixes local sqld toxicity sync error).
+- **Validation:** 235 pytest pass; master blueprints synced via DeepSeek.
+
+**Next:** Monitor post-reset trading; optional `--require-alpha` for soak gate.

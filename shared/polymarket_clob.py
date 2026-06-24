@@ -11,7 +11,7 @@ from typing import Any
 
 import aiohttp
 
-from shared.obi_mtf import filtered_depth_imbalance
+from shared.signals.mtf_filter import filtered_depth_imbalance
 from shared.mock_clob_signals import assign_mock_obi_for_batch, edge_model_mocked, synthetic_book_depth
 from shared.poly_costs import PolyCostModel
 
@@ -282,7 +282,21 @@ class PolymarketClobClient:
         book = _book_from_data(data, token_id=token_id)
         if book:
             book["token_id"] = token_id
+            book["bids"] = _levels(data.get("bids"))
+            book["asks"] = _levels(data.get("asks"))
+            book["fetched_at_ms"] = time.time() * 1000.0
         return book
+
+    async def fetch_trades(
+        self, session: aiohttp.ClientSession, token_id: str, *, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        url = f"{self.clob_base}/trades?token_id={token_id}&limit={limit}"
+        data = await self._fetch_json(session, url)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return data.get("trades") or data.get("data") or []
+        return []
 
     async def fetch_clob_snapshot(
         self,

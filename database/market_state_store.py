@@ -156,7 +156,12 @@ def is_snapshot_stale(snapshot: dict | None) -> bool:
 
 
 def _mtf_max_ephemeral() -> float:
-    return float(os.getenv("ORACLE_MTF_MAX_EPHEMERAL", os.getenv("OBI_EPHEMERAL_RATIO", "0.5")))
+    return float(
+        os.getenv(
+            "ORACLE_MTF_MAX_EPHEMERAL",
+            os.getenv("MTF_HARD_REJECT_RATIO", os.getenv("OBI_EPHEMERAL_RATIO", "0.85")),
+        )
+    )
 
 
 def _mtf_min_stable_markets() -> int:

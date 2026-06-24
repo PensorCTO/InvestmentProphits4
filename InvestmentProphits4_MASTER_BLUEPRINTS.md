@@ -372,6 +372,20 @@ See `.cursor/skills/ip4-stack-lifecycle/SKILL.md` and `agent/wiki/project_wiki.m
 | Supervisor orphans | `tests/test_supervisor_orphans.py` |
 | Trader health store | `tests/test_trader_health_store.py` |
 | Verify stack | `tests/test_verify_stack.py` |
+| Arena transaction | `tests/test_arena_transaction.py` |
+| Backtest judge slope | `tests/test_backtest_judge_slope.py` |
+| Crucible scheduler | `tests/test_crucible_scheduler.py` |
+| Fresh snapshot | `tests/test_get_fresh_snapshot.py` |
+| Kelly sizing | `tests/test_kelly_sizing.py` |
+| Live trading feedback | `tests/test_live_trading_feedback.py` |
+| Poly costs | `tests/test_poly_costs.py` |
+| Runtime state store | `tests/test_runtime_state_store.py` |
+| Stack lifecycle | `tests/test_stack_lifecycle.py` |
+| Strategy atomic | `tests/test_strategy_atomic.py` |
+| Strategy sandbox | `tests/test_strategy_sandbox.py` |
+| Toxicity gate | `tests/test_toxicity_gate.py` |
+| Trade flow verify | `tests/test_trade_flow_verify.py` |
+| Trading activity store | `tests/test_trading_activity_store.py` |
 
 CI (`.github/workflows/test.yml`): runs full test suite on push to `main`.
 
@@ -402,6 +416,8 @@ InvestmentProphits4/
 │   ├── trade_close.py                         ← position close + trim
 │   ├── risk_daemon.py                         ← bracket exits
 │   ├── oracle_sync.py                         ← CLOB + Gamma sync
+│   ├── cap_churn_guard.py                     ← cap-rebalance churn detection
+│   ├── toxicity_gate.py                       ← toxicity rejection gate
 │   └── execution/                             ← gateway, nonce, RPC
 ├── engine_2_crucible/                           ← AutoResearch + backtest judge
 │   ├── ip4_swarm_crucible.py                   ← main loop
@@ -409,7 +425,10 @@ InvestmentProphits4/
 │   ├── val_bpb_backtest.py                     ← Sortino judge (never LLM)
 │   ├── strategy_loader.py                      ← AST sandbox + load
 │   ├── strategy_instructions.md                ← human mandate
+│   ├── strategy_atomic.py                      ← atomic strategy write
 │   ├── backtest_corpus.py                      ← exhaust flatten
+│   ├── backtest_judge.py                       ← Sortino + MAE scorer
+│   ├── live_trading_feedback.py                ← Apex PnL/churn feedback
 │   └── live_replay_gate.py                     ← live signal gate
 ├── engine_3_dashboard/                          ← Streamlit Command Center
 │   ├── app.py                                  ← main UI
@@ -425,7 +444,13 @@ InvestmentProphits4/
 │   ├── trader_health_store.py                  ← stoppage persistence
 │   ├── market_state_store.py                   ← oracle snapshots
 │   ├── replica_store.py                        ← embedded replica sync
-│   └── resolved_corpus_bootstrap.py            ← resolved market bootstrap
+│   ├── resolved_corpus_store.py                ← resolved market corpus
+│   ├── resolved_corpus_bootstrap.py            ← resolved market bootstrap
+│   ├── runtime_state_store.py                  ← runtime observation persistence
+│   ├── trading_activity_store.py               ← trade activity breakdown
+│   ├── arena_lock.py                           ← arena DB lock
+│   ├── transaction.py                          ← arena transaction wrapper
+│   └── sync_config.py                          ← connection mode detection
 ├── scripts/
 │   ├── ip4_supervisor.sh                        ← entrypoint
 │   ├── supervisor_watch.py                      ← process spawner
@@ -434,6 +459,12 @@ InvestmentProphits4/
 │   ├── acceptance_gate.py                       ← full system validation
 │   ├── verify_stack.py                          ← stack health check
 │   ├── restart_stack.py                         ← full restart
+│   ├── stop_stack.py                            ← clean shutdown
+│   ├── stack_lifecycle.py                       ← lifecycle management
+│   ├── stack_status.py                          ← stack snapshot
+│   ├── trade_flow_verify.py                     ← trade flow verification
+│   ├── verify_trade_flow.py                     ← post-restart buy+sell gate
+│   ├── project_python.py                        ← project python helper
 │   ├── preflight.py                             ← startup checks
 │   ├── soak_verify.py                           ← soak test
 │   ├── trader_health_audit.py                   ← periodic health audit
@@ -442,8 +473,10 @@ InvestmentProphits4/
 │   ├── deepseek.py                              ← DeepSeek V4 client
 │   ├── poly_costs.py                            ← transaction cost model
 │   ├── capital_injection.py                     ← injection ledger
-│   └── polymarket_clob.py                       ← CLOB client
-├── tests/                                       ← 211 tests
+│   ├── polymarket_clob.py                       ← CLOB client
+│   ├── db_lock.py                               ← shared DB lock
+│   └── book_watcher.py                          ← sub-second CLOB poller
+├── tests/                                       ← 235 tests
 └── .github/workflows/
     └── test.yml                                 ← CI test suite
 ```
@@ -467,7 +500,7 @@ InvestmentProphits4/
 
 ## 20. Strategy Summary (One Paragraph)
 
-InvestmentProphits4 paper-trades up to ten Polymarket-style binary markets by combining a **Crucible-evolved** `evaluate_market()` strategy with an **Apex execution stack** that computes fair value from live CLOB mids plus order-book imbalance, enforces synthetic transaction costs and configurable net-edge thresholds (default 0.015 for both paper and live, dropping to 0.008 in exploration mode via `APEX_EDGE_MODE=exploration` or `CRUCIBLE_EXPLORATION=true`), and simulates fractional-Kelly ladder entries subject to per-market exposure caps and a maximum open-leg count (default `max(1, floor(APEX_MAX_LADDER_LEGS/2))`). Oracle snapshots land in `trade_exhaust` with full depth fields so the same strategy logic runs in backtest replay and live ticks; the backtest judge scores Sortino on replay rows using synthetic resolutions for still-open markets when `BACKTEST_MOCK_RESOLUTIONS=true` (default), while Apex uses real books when `EDGE_MODEL_MOCKED=false`. A DB-driven supervisor (`scripts/supervisor_watch.py`) spawns Apex and Crucible from `execution_controls`, the Streamlit Command Center exposes kill switch and mode transitions without replacing the supervisor, and inline stoppage detection records wallet health when signals exist but fills stall — distinguishing edge-gate rejection, HOLD-heavy signal starvation, and capital lock-up from process failure. Crucible AutoResearch uses DeepSeek `deepseek-v4-flash` via `shared/deepseek.py` for strategy proposals and blueprint sync, with a validity gate that requires at least `AUTORESEARCH_MIN_LIVE_FILL_ELIGIBLE` signals passing the net-edge threshold on the latest live snapshot before KEEPing a champion. The resolved corpus bootstrap (`database/resolved_corpus_bootstrap.py` and `scripts/seed_resolved_corpus.py`) ensures `markets_ledger.is_resolved` rows exist for champion backtesting, and the oracle fix separating `BACKTEST_MOCK_RESOLUTIONS` from `EDGE_MODEL_MOCKED` prevents live oracle stalls from affecting research replay. The acceptance gate (`scripts/acceptance_gate.py`) validates the full stack — schema, seed data, engine processes, trade flow, and blueprint consistency — before any deployment claim, and the verify stack (`scripts/verify_stack.py`) provides a quick health check with per-check pass/fail reporting for supervisor post-spawn verification.
+InvestmentProphits4 paper-trades up to ten Polymarket-style binary markets by combining a **Crucible-evolved** `evaluate_market()` strategy with an **Apex execution stack** that computes fair value from live CLOB mids plus order-book imbalance, enforces synthetic transaction costs and configurable net-edge thresholds (default 0.015 for both paper and live, dropping to 0.008 in exploration mode via `APEX_EDGE_MODE=exploration` or `CRUCIBLE_EXPLORATION=true`), and simulates fractional-Kelly ladder entries subject to per-market exposure caps and a maximum open-leg count (default `max(1, floor(APEX_MAX_LADDER_LEGS/2))`). Oracle snapshots land in `trade_exhaust` with full depth fields so the same strategy logic runs in backtest replay and live ticks; the backtest judge scores Sortino on replay rows using synthetic resolutions for still-open markets when `BACKTEST_MOCK_RESOLUTIONS=true` (default), while Apex uses real books when `EDGE_MODEL_MOCKED=false`. A DB-driven supervisor (`scripts/supervisor_watch.py`) spawns Apex and Crucible from `execution_controls`, the Streamlit Command Center exposes kill switch and mode transitions without replacing the supervisor, and inline stoppage detection records wallet health when signals exist but fills stall — distinguishing edge-gate rejection, HOLD-heavy signal starvation, and capital lock-up from process failure. Crucible AutoResearch uses DeepSeek `deepseek-v4-flash` via `shared/deepseek.py` for strategy proposals and blueprint sync, with a validity gate that requires at least `AUTORESEARCH_MIN_LIVE_FILL_ELIGIBLE` signals passing the net-edge threshold on the latest live snapshot before KEEPing a champion. The resolved corpus bootstrap (`database/resolved_corpus_bootstrap.py` and `scripts/seed_resolved_corpus.py`) ensures `markets_ledger.is_resolved` rows exist for champion backtesting, and the oracle fix separating `BACKTEST_MOCK_RESOLUTIONS` from `EDGE_MODEL_MOCKED` prevents live oracle stalls from affecting research replay. The acceptance gate (`scripts/acceptance_gate.py`) validates the full stack — schema, seed data, engine processes, trade flow, and blueprint consistency — before any deployment claim, and the verify stack (`scripts/verify_stack.py`) provides a quick health check with per-check pass/fail reporting for supervisor post-spawn verification. The V2 Signal Stack adds sub-second BookWatcher polling (`shared/book_watcher.py`, default 250ms) feeding a composite edge gate (25% microprice, 25% flow, 20% OBI, 15% liquidity, 10% reliability) with adaptive MTF tau, regime circuit breaker for poor liquidity, and walk-forward backtest hardening with MAE penalty and fill-probability filtering — all integrated into the Crucible champion pipeline.
 
 ---
 

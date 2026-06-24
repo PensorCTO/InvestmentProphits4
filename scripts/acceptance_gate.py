@@ -167,7 +167,7 @@ def check_dashboard_http(result: GateResult) -> None:
 
 
 def check_dashboard_semantics(result: GateResult) -> None:
-    """Infra ready must not contradict STALLED trading without System Status split."""
+    """Infra ready must not contradict blocked trading without System Status split."""
     from engine_3_dashboard.db import fetch_trader_status, get_connection
 
     conn = get_connection()
@@ -192,11 +192,78 @@ def check_dashboard_semantics(result: GateResult) -> None:
             "STALLED trading but missing trading_warnings split API",
         )
         return
+    if trading_stalled:
+        blockers = status.get("trading_blockers") or []
+        detail = blockers[0] if blockers else "trading not ready"
+        result.add(
+            "trading_ready",
+            False,
+            detail[:200],
+        )
+        return
     result.add(
         "dashboard_semantics",
         True,
         f"infra_ok={infra_ok} trading_stalled={trading_stalled}",
     )
+    result.add("trading_ready", True, "trading_ready")
+
+
+def check_nav_session_floor(result: GateResult) -> None:
+    """Fail when live NAV has fallen too far below the current session basis."""
+    from database.arena_db import connect_arena_db
+    from database.portfolio_store import (
+        DEFAULT_APEX_AGENT_ID,
+        compute_agent_nav,
+        last_session_basis,
+    )
+    from engine_1_apex.cap_churn_guard import acceptance_min_nav_pct_of_session
+
+    agent_id = os.getenv("APEX_AGENT_ID", DEFAULT_APEX_AGENT_ID)
+    min_pct = acceptance_min_nav_pct_of_session()
+    conn = connect_arena_db()
+    try:
+        nav, cash, _ = compute_agent_nav(conn, agent_id)
+        session_basis, _ = last_session_basis(conn, agent_id=agent_id)
+    finally:
+        conn.close()
+
+    floor = round(session_basis * min_pct, 2)
+    ok = nav >= floor
+    result.add(
+        "nav_session_floor",
+        ok,
+        f"nav=${nav:.2f} cash=${cash:.2f} floor=${floor:.2f} "
+        f"({min_pct:.0%} of session ${session_basis:.2f})",
+    )
+
+
+def check_session_cap_churn(result: GateResult) -> None:
+    """Fail when Apex session logs show sustained cap-rebalance spread churn."""
+    from engine_1_apex.cap_churn_guard import (
+        acceptance_max_churn_ratio,
+        acceptance_max_same_tick_churn,
+        analyze_session_churn,
+        session_looks_like_cap_churn,
+    )
+    from scripts.trade_flow_verify import apex_session_lines
+
+    if not APEX_LOG.is_file():
+        result.add("session_cap_churn", True, "no apex.log")
+        return
+
+    lines = APEX_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+    metrics = analyze_session_churn(apex_session_lines(lines))
+    churn = session_looks_like_cap_churn(metrics)
+    detail = (
+        f"rebalance_sells={metrics.rebalance_sell_count} "
+        f"alpha_sells={metrics.alpha_sell_count} "
+        f"same_tick_churn={metrics.same_tick_churn_ticks} "
+        f"churn_ratio={metrics.churn_ratio:.0%} "
+        f"thresholds ratio<{acceptance_max_churn_ratio():.0%} "
+        f"same_tick<{acceptance_max_same_tick_churn()}"
+    )
+    result.add("session_cap_churn", not churn, detail)
 
 
 def _apex_session_tick_lines(lines: list[str]) -> list[str]:
@@ -295,6 +362,8 @@ def run_gate(*, scope: str, skip_pytest: bool = False) -> GateResult:
         check_verify_trading(result)
         check_trader_health(result)
         check_apex_sustained_no_fills(result)
+        check_nav_session_floor(result)
+        check_session_cap_churn(result)
 
     if scope in ("dashboard", "full"):
         check_dashboard_semantics(result)

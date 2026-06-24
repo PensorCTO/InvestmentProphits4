@@ -15,13 +15,16 @@ from dotenv import load_dotenv
 from engine_1_apex.commit_reveal import assert_market_unresolved
 from engine_1_apex.execution.exceptions import ExecutionHaltedException, GasSpikeVetoException
 from engine_1_apex.execution.execution_wrapper import ExecutionWrapper
-from engine_1_apex.gateway import MAX_SWARM_MARKET_EXPOSURE, MIN_LADDER_USD, PaperGateway
+from engine_1_apex.gateway import MIN_LADDER_USD, PaperGateway
+from engine_1_apex.herding_cap import apply_herding_cap_to_kelly
 from engine_1_apex.sizing import (
     compute_ladder_budget,
     is_stop_loss_cooldown_active,
+    last_stop_loss_net_edge,
     load_agent_sizing_snapshot,
     max_portfolio_pct,
     resolve_min_net_edge,
+    stop_loss_reentry_edge_margin,
 )
 from shared.poly_costs import PolyCostModel
 from database.replica_store import commit_local, open_replica, request_cloud_sync, sync_replica_now
@@ -125,12 +128,18 @@ class LiveGateway:
             current_exposure = PaperGateway._get_swarm_side_exposure(
                 own_conn, market_id, direction
             )
-            if current_exposure + kelly_size > MAX_SWARM_MARKET_EXPOSURE:
+            kelly_size, herding_reason, herding_meta = apply_herding_cap_to_kelly(
+                kelly_size,
+                current_exposure,
+                nav=sizing["nav"],
+                max_position_pct=sizing["max_position_pct"],
+                min_ladder_usd=MIN_LADDER_USD,
+            )
+            if kelly_size is None:
                 return {
                     "status": "REJECTED",
-                    "reason": "HERDING_CAP_EXCEEDED",
-                    "current_exposure": current_exposure,
-                    "cap": MAX_SWARM_MARKET_EXPOSURE,
+                    "reason": herding_reason or "herding_headroom_insufficient",
+                    **herding_meta,
                 }
 
             edge_threshold = resolve_min_net_edge(
@@ -156,6 +165,15 @@ class LiveGateway:
                     "status": "REJECTED",
                     "reason": "ladder_no_edge_improvement",
                 }
+
+            sl_prior_edge = last_stop_loss_net_edge(own_conn, agent_id, market_id)
+            if sl_prior_edge is not None:
+                min_reentry = sl_prior_edge + stop_loss_reentry_edge_margin()
+                if net_edge <= min_reentry:
+                    return {
+                        "status": "REJECTED",
+                        "reason": "stop_loss_reentry_edge",
+                    }
 
             if net_edge < edge_threshold:
                 return {

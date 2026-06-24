@@ -219,6 +219,39 @@ def test_stop_loss_cooldown_and_last_edge(db_conn, monkeypatch):
     assert last_stop_loss_net_edge(db_conn, "APEX_EDGE", "mkt_oscars") == pytest.approx(0.02)
 
 
+def test_stop_loss_gates_ignore_pre_wallet_reset_history(db_conn, monkeypatch):
+    from shared.capital_injection import EVENT_WALLET_RESET, SCOPE_APEX, append_injection
+
+    monkeypatch.setenv("APEX_STOP_LOSS_COOLDOWN_SECONDS", "3600")
+    _seed_market(db_conn)
+    old = (datetime.now(timezone.utc) - timedelta(hours=2)).replace(microsecond=0).isoformat()
+    db_conn.execute(
+        """
+        INSERT INTO trade_execution
+        (trade_id, agent_id, market_id, direction, entry_price, kelly_size,
+         bracket_stop_loss, bracket_take_profit, status, closed_at, entry_context)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "t_pre_reset",
+            "APEX_EDGE",
+            "mkt_oscars",
+            "YES",
+            0.02,
+            10.0,
+            0.01,
+            0.04,
+            "CLOSED_STOP_LOSS",
+            old,
+            "ctx|net_edge=0.500000",
+        ),
+    )
+    append_injection(db_conn, SCOPE_APEX, EVENT_WALLET_RESET, 100.0, agent_id="APEX_EDGE")
+    db_conn.commit()
+    assert last_stop_loss_net_edge(db_conn, "APEX_EDGE", "mkt_oscars") is None
+    assert is_stop_loss_cooldown_active(db_conn, "APEX_EDGE", "mkt_oscars") is False
+
+
 def test_stop_loss_cooldown_expired(db_conn, monkeypatch):
     monkeypatch.setenv("APEX_STOP_LOSS_COOLDOWN_SECONDS", "60")
     _seed_market(db_conn)
@@ -246,6 +279,42 @@ def test_stop_loss_cooldown_expired(db_conn, monkeypatch):
     )
     db_conn.commit()
     assert is_stop_loss_cooldown_active(db_conn, "APEX_EDGE", "mkt_oscars") is False
+
+
+def test_stop_loss_cooldown_escalates_with_repeats(db_conn, monkeypatch):
+    monkeypatch.setenv("APEX_STOP_LOSS_COOLDOWN_SECONDS", "900")
+    monkeypatch.setenv("APEX_STOP_LOSS_ESCALATION_MAX", "3")
+    _seed_market(db_conn)
+    for idx in range(4):
+        ts = (
+            datetime.now(timezone.utc) - timedelta(seconds=30 * (4 - idx))
+        ).replace(microsecond=0).isoformat()
+        db_conn.execute(
+            """
+            INSERT INTO trade_execution
+            (trade_id, agent_id, market_id, direction, entry_price, kelly_size,
+             bracket_stop_loss, bracket_take_profit, status, closed_at, entry_context)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"t_sl_{idx}",
+                "APEX_EDGE",
+                "mkt_oscars",
+                "NO",
+                0.15,
+                10.0,
+                0.20,
+                0.05,
+                "CLOSED_STOP_LOSS",
+                ts,
+                "ctx|net_edge=0.020000",
+            ),
+        )
+    db_conn.commit()
+    from engine_1_apex.sizing import effective_stop_loss_cooldown_seconds
+
+    assert effective_stop_loss_cooldown_seconds(db_conn, "APEX_EDGE", "mkt_oscars") == 7200
+    assert is_stop_loss_cooldown_active(db_conn, "APEX_EDGE", "mkt_oscars") is True
 
 
 def test_default_max_portfolio_pct():

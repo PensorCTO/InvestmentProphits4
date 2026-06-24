@@ -293,9 +293,11 @@ def enrich_cross_venue_adj(state: dict) -> dict:
 
 def build_market_state(market_id: str, market_blob: dict) -> dict:
     """Map oracle/exhaust market blob to evaluate_market input dict."""
+    from shared.polymarket_clob import _parse_token_ids
     from shared.poly_costs import PolyCostModel
 
     clob = market_blob.get("clob") or {}
+    signals = clob.get("signals") or market_blob.get("signals") or {}
     liq_tier = market_blob.get("liquidity_tier", "MED_LIQUIDITY")
     mid = float(clob.get("mid", 0.5))
     spread_raw = clob.get("spread")
@@ -305,22 +307,67 @@ def build_market_state(market_id: str, market_blob: dict) -> dict:
         tier_spread = PolyCostModel.TIER_SPREADS.get(liq_tier, 0.035)
         spread = tier_spread
 
+    obi = float(signals.get("depth_imbalance", clob.get("depth_imbalance", 0.0)))
+
     state = {
         "market_id": market_id,
         "category": market_blob.get("category", ""),
         "liquidity_tier": liq_tier,
-        "order_book_imbalance": float(clob.get("depth_imbalance", 0.0)),
+        "order_book_imbalance": obi,
+        "depth_imbalance": obi,
         "spread": spread,
         "mid_price": mid,
         "best_bid": clob.get("best_bid"),
         "best_ask": clob.get("best_ask"),
-        "bid_depth": float(clob.get("bid_depth", 0.0)),
-        "ask_depth": float(clob.get("ask_depth", 0.0)),
+        "bid_depth": float(signals.get("bid_depth", clob.get("bid_depth", 0.0))),
+        "ask_depth": float(signals.get("ask_depth", clob.get("ask_depth", 0.0))),
         "liquidity_usd": float(clob.get("liquidity_usd", 0.0)),
         "cross_venue_adj": float((market_blob.get("overlays") or {}).get("cross_venue", 0.0)),
+        "microprice": signals.get("microprice"),
+        "microprice_deviation": float(signals.get("microprice_deviation", 0.0)),
+        "flow_imbalance_1s": float(signals.get("flow_imbalance_1s", 0.0)),
+        "flow_imbalance_5s": float(signals.get("flow_imbalance_5s", 0.0)),
+        "flow_imbalance_30s": float(signals.get("flow_imbalance_30s", 0.0)),
+        "flow_imbalance": float(signals.get("flow_imbalance_5s", 0.0)),
+        "ephemeral_ratio": float(
+            signals.get("ephemeral_ratio", clob.get("ephemeral_ratio", 0.0))
+        ),
+        "spoof_penalty": float(
+            signals.get("spoof_penalty", signals.get("ephemeral_ratio", 0.0))
+        ),
+        "liquidity_quality": float(signals.get("liquidity_quality", 0.5)),
+        "historical_reliability": float(signals.get("historical_reliability", 0.5)),
+        "tau_mtf_ms": float(signals.get("tau_mtf_ms", 250.0)),
+        "mtf_applied": bool(signals.get("mtf_applied", clob.get("mtf_applied", False))),
     }
+    token_ids = clob.get("clob_token_ids")
+    if isinstance(token_ids, list):
+        parsed_ids = [str(t) for t in token_ids]
+    elif isinstance(token_ids, str):
+        parsed_ids = _parse_token_ids(token_ids)
+    else:
+        parsed_ids = None
+    if parsed_ids:
+        state["clob_token_id"] = parsed_ids[0]
     state = _apply_mock_book_depth(state)
     return enrich_cross_venue_adj(state)
+
+
+def enrich_state_from_signal_stack(state: dict, stack: dict) -> dict:
+    """Merge live BookWatcher SignalStack into market state."""
+    if not stack:
+        return state
+    merged = dict(state)
+    for key, value in stack.items():
+        if key in ("token_id", "mid", "updated_at_ms"):
+            continue
+        merged[key] = value
+    merged["order_book_imbalance"] = stack.get(
+        "order_book_imbalance", stack.get("depth_imbalance", merged.get("order_book_imbalance", 0.0))
+    )
+    merged["depth_imbalance"] = merged["order_book_imbalance"]
+    merged["flow_imbalance"] = stack.get("flow_imbalance_5s", merged.get("flow_imbalance", 0.0))
+    return merged
 
 
 def _apply_mock_book_depth(state: dict) -> dict:

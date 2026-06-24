@@ -154,3 +154,50 @@ def write_trader_health(
     )
     if commit:
         commit_local(conn)
+
+
+def reset_trader_health_session(
+    conn,
+    *,
+    agent_id: str,
+    cash: float,
+    nav: float,
+    commit: bool = False,
+) -> None:
+    """Clear stall/stoppage counters after a simulated wallet reset."""
+    now = _utc_now_iso()
+    conn.execute(
+        """
+        INSERT INTO trader_health
+        (id, agent_id, status, stoppage_kind, detail, consecutive_stoppage_ticks,
+         last_fill_at, last_activity_at, signals_last_tick, filled_last_tick,
+         skipped_hold_last_tick, skipped_cap_last_tick, rejected_last_tick,
+         cash, nav, cap_reasons_json, updated_at,
+         dominant_block_reason, minutes_since_last_fill, zero_fill_streak, trading_status)
+        VALUES (?, ?, 'HEALTHY', NULL, NULL, 0, NULL, ?, 0, 0, 0, 0, 0, ?, ?, '{}', ?, NULL, NULL, 0, 'IDLE')
+        ON CONFLICT(id) DO UPDATE SET
+            agent_id = excluded.agent_id,
+            status = 'HEALTHY',
+            stoppage_kind = NULL,
+            detail = NULL,
+            consecutive_stoppage_ticks = 0,
+            last_fill_at = NULL,
+            last_activity_at = excluded.last_activity_at,
+            signals_last_tick = 0,
+            filled_last_tick = 0,
+            skipped_hold_last_tick = 0,
+            skipped_cap_last_tick = 0,
+            rejected_last_tick = 0,
+            cash = excluded.cash,
+            nav = excluded.nav,
+            cap_reasons_json = '{}',
+            updated_at = excluded.updated_at,
+            dominant_block_reason = NULL,
+            minutes_since_last_fill = NULL,
+            zero_fill_streak = 0,
+            trading_status = 'IDLE'
+        """,
+        (TRADER_HEALTH_ROW_ID, agent_id, now, cash, nav, now),
+    )
+    if commit:
+        commit_local(conn)
