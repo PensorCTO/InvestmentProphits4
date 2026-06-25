@@ -701,7 +701,7 @@ def persist_trader_health(
     if minutes_since is None:
         from database.trader_health_store import read_trader_health
 
-        existing = read_trader_health(conn, agent_id)
+        existing = read_trader_health(conn, agent_id=agent_id)
         iso = (existing or {}).get("last_fill_at") or tracker.last_fill_at_iso
         minutes_since = _minutes_since_iso(iso)
 

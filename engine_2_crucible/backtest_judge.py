@@ -1,4 +1,8 @@
-"""Backtest judge — Sortino scoring with rolling return/Sharpe slope gates."""
+"""Backtest judge — Sortino scoring with rolling return/Sharpe slope gates.
+
+OOS gate: JUDGE_MIN_OOS_SORTINO=0.0 requires strictly positive out-of-sample Sortino
+(oos_sortino <= floor rejects; zero Sortino always REVERTs at default floor).
+"""
 
 from __future__ import annotations
 
@@ -13,6 +17,7 @@ def judge_min_is_sortino() -> float:
 
 
 def judge_min_oos_sortino() -> float:
+    """Minimum OOS Sortino; default 0.0 means oos_sortino must be strictly > 0."""
     return float(os.getenv("JUDGE_MIN_OOS_SORTINO", "0.0"))
 
 

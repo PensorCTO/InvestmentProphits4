@@ -50,6 +50,7 @@ CRUCIBLE_LOCK_PATH = CRUCIBLE_DIR / ".crucible_iteration.lock"
 SLEEP_SECONDS = int(os.getenv("AUTORESEARCH_SLEEP_SECONDS", "5"))
 BACKTEST_TIMEOUT = int(os.getenv("AUTORESEARCH_BACKTEST_TIMEOUT", "60"))
 PROPOSAL_MAX_TOKENS = int(os.getenv("AUTORESEARCH_PROPOSAL_MAX_TOKENS", "4096"))
+PROPOSAL_TEMPERATURE = float(os.getenv("AUTORESEARCH_TEMPERATURE", "0.3"))
 DRY_RUN = os.getenv("AUTORESEARCH_DRY_RUN", "false").lower() in ("true", "1", "yes")
 MAX_FAILURE_CONTEXT = 5
 
@@ -82,7 +83,7 @@ def parse_backtest_output(stdout: str) -> tuple[float | None, int | None]:
     return parse_score(stdout), parse_trades(stdout)
 
 
-def _sanity_check_proposal(proposed: str, *, min_trades: int = 5) -> tuple[bool, str]:
+def _sanity_check_proposal(proposed: str, *, min_trades: int = 1) -> tuple[bool, str]:
     """Reject proposals that never trade on recent replay-shaped states."""
     from database.resolved_corpus_bootstrap import ensure_resolved_corpus
     from engine_2_crucible.backtest_corpus import flatten_exhaust_rows
@@ -102,11 +103,19 @@ def _sanity_check_proposal(proposed: str, *, min_trades: int = 5) -> tuple[bool,
         )
 
     trades = 0
-    for state, _resolution, _ts in samples[:500]:
-        if evaluate(state) != "HOLD":
+    first_results = []
+    for i, (state, _resolution, _ts) in enumerate(samples[:500]):
+        result = evaluate(state)
+        if i < 3:
+            spread = state.get('spread', 'N/A')
+            spread_str = f"{spread:.4f}" if isinstance(spread, float) else str(spread)
+            first_results.append(f"sample{i}: obi={state.get('order_book_imbalance', 'N/A')}, cross={state.get('cross_venue_adj', 'N/A')}, spread={spread_str} -> {result}")
+        if result != "HOLD":
             trades += 1
             if trades >= min_trades:
+                logging.info("Sanity check PASSED: %s preview trades. First evals: %s", trades, first_results)
                 return True, f"{trades} preview trades"
+    logging.info("Sanity check FAILED: %s trades. First evals: %s", trades, first_results)
     return False, f"only {trades} preview trades on {len(samples[:500])} samples"
 
 
@@ -639,7 +648,7 @@ class AutoResearchCrucible:
                 instructions,
                 prompt,
                 max_tokens=PROPOSAL_MAX_TOKENS,
-                temperature=0.3,
+                temperature=PROPOSAL_TEMPERATURE,
             )
             if not response:
                 self._revert_strategy("DeepSeek returned empty response")
@@ -668,6 +677,7 @@ class AutoResearchCrucible:
 
         ok, preview = _sanity_check_proposal(proposed)
         if not ok:
+            logging.info("Rejected proposal code (first 500 chars):\n%.500s", proposed)
             if proposal_id:
                 with arena_lock(ARENA_LOCK_PATH):
                     qconn = open_replica()

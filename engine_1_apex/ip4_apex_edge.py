@@ -33,7 +33,7 @@ from engine_1_apex.live_performance_monitor import run_live_audit_tick
 from engine_1_apex.oracle_circuit_breaker import evaluate_execution_gate
 from database.migrate_schema import ensure_replica_schema
 from database.portfolio_store import (
-    maybe_restore_bankruptcy_capital,
+    maybe_halt_on_bankruptcy,
     record_portfolio_snapshot,
 )
 from database.replica_store import open_replica, request_cloud_sync, sync_replica_now
@@ -62,6 +62,7 @@ from engine_1_apex.gateway import PaperGateway
 from engine_1_apex.fair_value import resolve_execution_fair_value
 from engine_1_apex.kelly_sizing import compute_fractional_kelly
 from engine_1_apex.sizing import (
+    clamp_fractional_kelly,
     compute_ladder_budget,
     effective_min_net_edge,
     is_stop_loss_cooldown_active,
@@ -69,7 +70,12 @@ from engine_1_apex.sizing import (
     max_portfolio_pct,
     resolve_min_net_edge,
 )
-from engine_1_apex.oracle_sync import _ensure_schema_once, _maybe_auto_map_clob, sync_cycle
+from engine_1_apex.oracle_sync import (
+    _ensure_schema_once,
+    _maybe_auto_map_clob,
+    mark_oracle_schema_initialized,
+    sync_cycle,
+)
 from engine_1_apex.market_regime_hmm import decode_market_regime_full
 from engine_1_apex.runtime_levers import (
     active_max_portfolio_pct,
@@ -131,6 +137,9 @@ from shared.telemetry import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+from shared.state_float import state_float as _state_float
 
 ARENA_LOCK_PATH = PROJECT_ROOT / ".arena_db.lock"
 ORACLE_INTERVAL = int(os.getenv("ORACLE_SYNC_INTERVAL", "30"))
@@ -289,8 +298,26 @@ class ApexEdgeEngine:
             raise RuntimeError(
                 "Live execution requires ALCHEMY_API_KEY or POLYGON_RPC_PRIMARY"
             )
-        if not os.getenv("POLYGON_WALLET_PRIVATE_KEY", "").strip():
+        private_key = os.getenv("POLYGON_WALLET_PRIVATE_KEY", "").strip()
+        if not private_key:
             raise RuntimeError("Live execution requires POLYGON_WALLET_PRIVATE_KEY")
+        key_body = private_key[2:] if private_key.startswith("0x") else private_key
+        if len(key_body) != 64:
+            raise RuntimeError("POLYGON_WALLET_PRIVATE_KEY must be 64 hex characters")
+        try:
+            int(key_body, 16)
+        except ValueError as exc:
+            raise RuntimeError("POLYGON_WALLET_PRIVATE_KEY is not valid hex") from exc
+        address = os.getenv("POLYGON_WALLET_ADDRESS", "").strip()
+        if not address:
+            raise RuntimeError("Live execution requires POLYGON_WALLET_ADDRESS")
+        addr_body = address[2:] if address.startswith("0x") else address
+        if len(addr_body) != 40:
+            raise RuntimeError("POLYGON_WALLET_ADDRESS must be 0x + 40 hex characters")
+        try:
+            int(addr_body, 16)
+        except ValueError as exc:
+            raise RuntimeError("POLYGON_WALLET_ADDRESS is not valid hex") from exc
 
     def _ensure_live_runtime(self) -> None:
         self._validate_live_credentials()
@@ -436,6 +463,8 @@ class ApexEdgeEngine:
 
     def preflight(self) -> None:
         ensure_replica_schema()
+        mark_oracle_schema_initialized()
+        _maybe_auto_map_clob()
         sync_replica_now(reason="apex_startup")
 
         baseline = read_strategy_file_text(STRATEGY_FILE)
@@ -532,8 +561,8 @@ class ApexEdgeEngine:
         return self._shadow_evaluate_fn
 
     def _run_oracle_loop(self) -> None:
+        logger.info("Oracle worker thread entered")
         _ensure_schema_once()
-        _maybe_auto_map_clob()
         logger.info("Oracle worker started (interval=%ds)", ORACLE_INTERVAL)
 
         async def loop() -> None:
@@ -663,7 +692,7 @@ class ApexEdgeEngine:
                     portfolio_states.append(st)
                 hmm_result = decode_market_regime_full(portfolio_states, conn=conn)
                 regime_tracker = get_regime_tracker()
-                p_toxic = float(hmm_result.posterior[2])
+                p_toxic = float(hmm_result.posterior[2] or 0.0)
                 regime_tracker.apply_hmm_toxic_override(
                     hmm_state=hmm_result.state,
                     p_toxic=p_toxic,
@@ -681,20 +710,17 @@ class ApexEdgeEngine:
                 open_notional = sizing["open_notional"]
                 min_net_edge = active_min_net_edge()
                 mode = str(controls.get("active_execution_mode", "PAPER"))
-                if maybe_restore_bankruptcy_capital(
+                if maybe_halt_on_bankruptcy(
                     conn,
                     agent_id=APEX_AGENT_ID,
                     nav=nav,
                     execution_mode=mode,
                 ):
-                    sizing = load_agent_sizing_snapshot(conn, APEX_AGENT_ID)
-                    if sizing:
-                        cash = sizing["cash"]
-                        nav = sizing["nav"]
-                        open_notional = sizing["open_notional"]
-                    logger.warning(
-                        "APEX bankruptcy floor hit — injected capital to restore NAV"
+                    logger.error(
+                        "APEX bankruptcy floor breached — DRAIN_AND_HALT; "
+                        "operator intervention required before new entries"
                     )
+                    self._signals_enabled = False
 
                 filled = 0
                 rejected = 0
@@ -750,7 +776,7 @@ class ApexEdgeEngine:
                                 )
                                 liq_tier = state.get("liquidity_tier", "MED_LIQUIDITY")
                                 category = state.get("category", "")
-                                mid = float(state.get("mid_price", 0.5))
+                                mid = _state_float(state, "mid_price", 0.5)
                                 idle_rotation_rows.append(
                                     (market_id, category, mid, liq_tier)
                                 )
@@ -837,7 +863,7 @@ class ApexEdgeEngine:
                             ).fetchone()
                             if open_row:
                                 category = state.get("category", "")
-                                mid = float(state.get("mid_price", 0.5))
+                                mid = _state_float(state, "mid_price", 0.5)
                                 idle_rotation_rows.append(
                                     (market_id, category, mid, liq_tier)
                                 )
@@ -867,7 +893,7 @@ class ApexEdgeEngine:
                                         min_hold_ok = True
                                 if hold_streak >= APEX_HOLD_CLOSE_TICKS and min_hold_ok:
                                     category = state.get("category", "")
-                                    mid = float(state.get("mid_price", 0.5))
+                                    mid = _state_float(state, "mid_price", 0.5)
                                     n_closed = close_agent_market_positions(
                                         conn,
                                         agent_id=APEX_AGENT_ID,
@@ -957,7 +983,7 @@ class ApexEdgeEngine:
                             (
                                 market_id,
                                 state.get("category", ""),
-                                float(state.get("mid_price", 0.5)),
+                                _state_float(state, "mid_price", 0.5),
                                 liq_tier,
                             )
                         )
@@ -967,7 +993,7 @@ class ApexEdgeEngine:
                                 compute_composite_edge,
                             )
 
-                            preview_mid = float(state.get("mid_price", 0.5))
+                            preview_mid = _state_float(state, "mid_price", 0.5)
                             preview_fv = resolve_execution_fair_value(
                                 conn,
                                 agent_id=APEX_AGENT_ID,
@@ -1010,7 +1036,7 @@ class ApexEdgeEngine:
 
                     rotate_snapshot = self._fully_deployed_rotate_snapshot.get(market_id)
                     if rotate_snapshot is not None:
-                        preview_mid = float(state.get("mid_price", 0.5))
+                        preview_mid = _state_float(state, "mid_price", 0.5)
                         preview_fv = resolve_execution_fair_value(
                             conn,
                             agent_id=APEX_AGENT_ID,
@@ -1045,7 +1071,7 @@ class ApexEdgeEngine:
                     ).fetchone()
                     if open_dir and open_dir[0] != signal_direction:
                         category = state.get("category", "")
-                        mid = float(state.get("mid_price", 0.5))
+                        mid = _state_float(state, "mid_price", 0.5)
                         n_closed = close_agent_market_positions(
                             conn,
                             agent_id=APEX_AGENT_ID,
@@ -1070,7 +1096,7 @@ class ApexEdgeEngine:
                             )
 
                     direction = signal_direction
-                    mid = float(state.get("mid_price", 0.5))
+                    mid = _state_float(state, "mid_price", 0.5)
                     category = state.get("category", "")
                     fair_value = resolve_execution_fair_value(
                         conn,
@@ -1177,10 +1203,10 @@ class ApexEdgeEngine:
                         fair_value=kelly_fair,
                         market_mid=mid,
                         direction=direction,
-                        edge_slope=float(state.get("flow_imbalance_5s", 0.0))
-                        - float(state.get("flow_imbalance_30s", 0.0)),
+                        edge_slope=_state_float(state, "flow_imbalance_5s", 0.0)
+                        - _state_float(state, "flow_imbalance_30s", 0.0),
                     )
-                    signal_kelly = (
+                    signal_kelly = clamp_fractional_kelly(
                         dynamic_kelly if dynamic_kelly > 0 else sizing["fractional_kelly"]
                     )
 
@@ -1686,7 +1712,7 @@ class ApexEdgeEngine:
                             (
                                 mid,
                                 st.get("category", ""),
-                                float(st.get("mid_price", 0.5)),
+                                _state_float(st, "mid_price", 0.5),
                                 st.get("liquidity_tier", "MED_LIQUIDITY"),
                             )
                         )

@@ -129,6 +129,7 @@ The champion is **Python code**, not env vars. Crucible evolves it via DeepSeek 
 | `ORACLE_CB_ENABLED` | true | Circuit breaker on ingest failures | Halts oracle; Apex starves |
 | `ORACLE_CB_FAILURE_THRESHOLD` | 3 | Failures before trip | — |
 | `ORACLE_CB_RECOVERY_SECONDS` | 120 | Cooldown before retry | — |
+| Oracle preflight | `mark_oracle_schema_initialized()` | Schema + CLOB auto-map at Apex startup (not in worker thread) | Prevents ORACLE STARVATION on restart |
 | `CROSS_VENUE_ENABLED` | false | Live cross-venue overlay feed | Strategy `cross_venue_adj` |
 | `CROSS_VENUE_OBI_PROXY` | true | OBI-derived proxy when Kalshi missing | Strategy consensus gate |
 | `MTF_POLL_MS` | 250 | BookWatcher base poll (overridden by DMA) |
@@ -140,7 +141,7 @@ The champion is **Python code**, not env vars. Crucible evolves it via DeepSeek 
 | `DMA_MIN_NOTIONAL_USD` | 50 | Min notional for OBI level weight |
 | `BOOK_WATCHER_MAX_CONCURRENT` | 8 | Parallel book fetches | Latency vs load |
 
-**State enrichment:** `build_market_state()` merges snapshot + `book_buffer` + overlays. Strategy and edge layers both consume the same dict.
+**State enrichment:** `build_market_state()` merges snapshot + `book_buffer` + overlays. Strategy and edge layers consume the same dict. Apex uses `shared/state_float.py` for null-safe `mid_price` / numeric coercion (BookWatcher may emit `None`).
 
 ---
 
@@ -296,7 +297,18 @@ Positions close for **alpha reasons** (signal/risk) or **capital management** (r
 | `CAP_REBALANCE` / trim | Per-market position cap headroom | In-tick trim before fill |
 | `CAP_TRIM` | Partial 50% trim on worst ΔEdge HOLD legs | High-conviction entry waiting |
 | `MAX_LEGS_REBALANCE` | Legacy rebalance | — |
-| `WALLET_RESET` | Operator / bankruptcy injection | — |
+| `WALLET_RESET` | Operator simulated reset | Clears stoppage counters; closes open legs |
+| `DRAIN_AND_HALT` | NAV below `APEX_BANKRUPTCY_FLOOR` | No auto-injection; gateway rejects new entries |
+
+### Bankruptcy floor
+
+| Variable | Default | Role |
+|----------|---------|------|
+| `APEX_BANKRUPTCY_FLOOR` | *(empty = disabled)* | When NAV drops below floor, Apex sets `apex_state=DRAIN_AND_HALT` and logs `bankruptcy_floor_breach` audit event — **no** `BANKRUPTCY_RESET` capital injection |
+
+### Stop-loss re-entry edge
+
+After a stop-loss exit, re-entry requires stored **unboosted** `net_edge` (not composite-boosted edge) to exceed prior stop-loss edge + margin. Lookup is **direction-scoped** per market. Prevents false blocks when legacy fills stored inflated composite edges (~0.94).
 
 ### Thesis-expired levers
 
@@ -589,9 +601,11 @@ EDGE_MODEL_MOCKED=false
 | Shadow soak | `engine_1_apex/shadow_strategy_monitor.py` |
 | Telemetry | `shared/telemetry.py` |
 | Stats (Welch) | `shared/stats_utils.py` |
+| Hrana retry | `shared/hrana_retry.py` |
+| Live audit config | `shared/live_audit_config.py` |
 | WFO judge | `engine_2_crucible/backtest_judge.py`, `walk_forward_pipeline.py` |
 | Algo blueprints | `IP4_ALGO_BLUEPRINTS.md` (this document) |
 
 ---
 
-*Last updated: 2026-06-25 — async guardrails, DMA heartbeat telemetry, churn lockout, tri-state regime CAUTION, shadow Welch promotion, cap-trim PnL floor, live-wallet readiness criteria in master blueprints §18.*
+*Last updated: 2026-06-25 — infrastructure hardening: bankruptcy halt (DRAIN_AND_HALT), Kelly clamp, stop-loss reentry edge fix, oracle preflight, state_float, Hrana retry, live audit preflight.*

@@ -50,17 +50,28 @@ def check_turso() -> None:
 
 
 def check_sqld_or_turso() -> None:
-    from database.sync_config import is_cloud_mode, local_sqld_url
+    from database.sync_config import (
+        InvalidDatabaseUrlError,
+        is_cloud_mode,
+        local_sqld_url,
+        normalize_libsql_url,
+        primary_sync_url,
+    )
 
     if is_cloud_mode():
-        url = os.getenv("TURSO_DATABASE_URL", "")
-        if url:
+        try:
+            url, _ = primary_sync_url()
             ok(f"Turso Cloud primary configured ({url})")
-        else:
-            fail("Turso cloud mode misconfigured — missing TURSO_DATABASE_URL")
+        except InvalidDatabaseUrlError as exc:
+            fail(f"Turso database URL invalid: {exc}")
         return
 
-    sqld_url = local_sqld_url()
+    try:
+        sqld_url = normalize_libsql_url(local_sqld_url())
+    except InvalidDatabaseUrlError as exc:
+        fail(f"LOCAL_SQLD_URL invalid: {exc}")
+        return
+
     started = time.monotonic()
     try:
         import libsql
@@ -101,6 +112,66 @@ def _requires_live_preflight() -> bool:
     except Exception as exc:
         warn(f"Could not read execution_controls for preflight: {exc}")
     return False
+
+
+def _validate_wallet_hex(value: str, *, expected_len: int, allow_0x: bool = True) -> bool:
+    raw = value.strip()
+    if allow_0x and raw.startswith("0x"):
+        raw = raw[2:]
+    if len(raw) != expected_len:
+        return False
+    try:
+        int(raw, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def check_live_wallet() -> None:
+    if not _requires_live_preflight():
+        ok("Paper mode — wallet key checks skipped (required only for LIVE)")
+        return
+
+    private_key = os.getenv("POLYGON_WALLET_PRIVATE_KEY", "").strip()
+    address = os.getenv("POLYGON_WALLET_ADDRESS", "").strip()
+
+    if not private_key:
+        fail("POLYGON_WALLET_PRIVATE_KEY missing — required for live execution")
+    elif not _validate_wallet_hex(private_key, expected_len=64):
+        fail("POLYGON_WALLET_PRIVATE_KEY malformed — expect 64 hex chars (optional 0x prefix)")
+    else:
+        ok("POLYGON_WALLET_PRIVATE_KEY present and well-formed")
+
+    if not address:
+        fail("POLYGON_WALLET_ADDRESS missing — required for live execution")
+    elif not _validate_wallet_hex(address, expected_len=40):
+        fail("POLYGON_WALLET_ADDRESS malformed — expect 0x + 40 hex chars")
+    else:
+        ok(f"POLYGON_WALLET_ADDRESS present ({address[:10]}…)")
+
+
+def check_live_audit_config() -> None:
+    from shared.live_audit_config import live_audit_enabled, live_audit_shadow_mode
+
+    require = os.getenv("IP4_REQUIRE_LIVE_AUDIT", "false").lower() in ("true", "1", "yes")
+    enabled = live_audit_enabled()
+    shadow = live_audit_shadow_mode()
+
+    if not enabled:
+        msg = "LIVE_AUDIT_ENABLED is false — live drift monitoring disabled"
+        if require:
+            fail(msg)
+        else:
+            warn(msg)
+        return
+
+    ok("LIVE_AUDIT_ENABLED=true")
+    if shadow:
+        ok("LIVE_AUDIT_SHADOW=true (log-only breach mode)")
+    elif require:
+        fail("LIVE_AUDIT_SHADOW=false with IP4_REQUIRE_LIVE_AUDIT=true")
+    else:
+        warn("LIVE_AUDIT_SHADOW=false — enforce mode will auto-revert on breach")
 
 
 def check_rpc_latency() -> None:
@@ -232,6 +303,8 @@ def main() -> None:
     check_turso()
     check_sqld_or_turso()
     check_oracle_mode()
+    check_live_audit_config()
+    check_live_wallet()
     check_rpc_latency()
     check_deepseek()
     check_strategy_files()

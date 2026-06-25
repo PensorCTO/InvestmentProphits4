@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from shared.state_float import state_float
+
 STATES = ("Trending", "MeanReverting", "Toxic")
 CONFIDENCE_DELTA_MIN = 0.15
 
@@ -123,16 +125,18 @@ def aggregate_portfolio_features(market_states: list[dict]) -> np.ndarray:
     ephemeral = []
     mids = []
     for state in market_states:
-        flow_5.append(float(state.get("flow_imbalance_5s", 0.0)))
-        flow_30.append(float(state.get("flow_imbalance_30s", 0.0)))
-        spread = float(state.get("spread", 0.03))
+        flow_5.append(state_float(state, "flow_imbalance_5s", 0.0))
+        flow_30.append(state_float(state, "flow_imbalance_30s", 0.0))
+        spread = state_float(state, "spread", 0.03)
         tier = state.get("liquidity_tier", "MED_LIQUIDITY")
         from shared.poly_costs import PolyCostModel
 
         tier_spread = PolyCostModel.TIER_SPREADS.get(tier, 0.035)
         spread_z.append(spread / max(tier_spread, 1e-6))
-        ephemeral.append(float(state.get("ephemeral_ratio", state.get("spoof_penalty", 0.0))))
-        mids.append(float(state.get("mid_price", 0.5)))
+        ephemeral.append(
+            state_float(state, "ephemeral_ratio", state_float(state, "spoof_penalty", 0.0))
+        )
+        mids.append(state_float(state, "mid_price", 0.5))
 
     autocorr = 0.0
     if len(mids) >= 3:
@@ -158,7 +162,7 @@ def _portfolio_spread_z(market_states: list[dict]) -> float:
         return 0.0
     vals = []
     for state in market_states:
-        spread = float(state.get("spread", 0.03))
+        spread = state_float(state, "spread", 0.03)
         tier = state.get("liquidity_tier", "MED_LIQUIDITY")
         from shared.poly_costs import PolyCostModel
 

@@ -214,6 +214,12 @@ Ladder budget now defaults to min(5% cash, 5% NAV per market) with APEX_MAX_PORT
 
 ### 2026-06-24 — FULLY_DEPLOYED rotate anti-churn quartet
 Rotate only at >=67% ladder fill; remediate ticks 18; block same-thesis reentry after FULLY_DEPLOYED_ROTATE until mid/fv moves 2c; cross-market rotate+fill (3 mkts/900s) activates cap_churn_guard.
+
+### 2026-06-25 — 2026-06-25 — IP4 hardening: bankruptcy halt replaces auto-injection
+maybe_halt_on_bankruptcy sets DRAIN_AND_HALT + audit event; no BANKRUPTCY_RESET injections. Gateway rejects entries when halted.
+
+### 2026-06-25 — 2026-06-25 — Null-safe state_float + risk backfill after exits
+BookWatcher None fields no longer crash Apex ticks. Vector backfill runs after bracket exits with Hrana retry; non-fatal on timeout.
 ## Lessons Learned
 
 ### 2026-06-22 — Turso champion lag caused wallet STOPPED (high)
@@ -530,3 +536,19 @@ Rotate only at >=67% ladder fill; remediate ticks 18; block same-thesis reentry 
 **Next:** Restart Apex stack to load new code; soak shadow promotion + HMM lever mapping; flip `LIVE_AUDIT_SHADOW=false` after audit soak.
 
 ### 2026-06-24 17:23 — Implemented rotate-churn fixes (stoppage, cap_churn_guard, ip4_apex_edge); 46 tests pass; post-restart holds 3 legs without rotate. Next: soak cross-market guard.
+
+### 2026-06-25 09:18 — IP4 Infrastructure Hardening & Capital Guardrails (P1–P3): URI normalize, Hrana retry, risk daemon MVCC-friendly cycle, Kelly clamp, bankruptcy halt, OOS Sortino docs, live audit config, wallet preflight. Post-fix: state_float across HMM/regime/execution edge/champion; read_trader_health kwarg fix. 98 targeted + acceptance_gate 318 pytest PASS; stack healthy trading=ACTIVE.
+
+**Next:** 48–72h paper soak: zero BANKRUPTCY_RESET events; monitor risk backfill retries. verify_trade_flow buy+sell on next clean restart if handoff required.
+
+### 2026-06-25 12:32 — Wallet stall resolved (zero trading activity). Deployed baseline consensus strategy v99 to Turso (source=baseline_unstall), reverted APEX_MIN_NET_EDGE to 0.015, reset trader health session, restarted Apex. First tick after restart: 3 fills (mkt_ukraine_peace, mkt_oil_100, mkt_fed_cut YES). Trading status STARVED→ACTIVE→IDLE (fully_deployed). NAV ~$515.68, cash ~$486.93. Crucible remains HALTED.
+
+**Next:** Monitor for alpha closes; risk worker TRANSACTION_TIMEOUT cleared on latest cycle. Do not wallet-reset (would destroy $516 NAV).
+
+### 2026-06-25 12:48 — Trading freeze resolved. Root cause: stop_loss_reentry_edge blocked all signals — legacy entry_context stored boosted composite edge (~0.94) making re-entry impossible; plus FULLY_DEPLOYED_ROTATE closed positions within 60s. Fix: cap/sanitize SL re-entry prior edge, direction-scoped lookup, store unboosted net_edge on fills, disable aggressive rotation (CAP_STALL_REMEDIATE_TICKS=99), strategy v100. Post-restart: 3 fills first tick.
+
+**Next:** Monitor positions hold without rotate churn; verify_trade_flow when sells occur.
+
+### 2026-06-25 13:06 — Fixed ORACLE STARVATION (stale_oracle age=800s+). Root cause: oracle worker thread blocked forever on arena_lock in _ensure_schema_once after Apex restart — never logged Oracle worker started, no snapshots after 12:47. Fix: mark_oracle_schema_initialized() in preflight, move CLOB auto-map to preflight, non-blocking vector backfill locks. Verified: Oracle worker started + snapshots every 30s, ticks resume.
+
+**Next:** Monitor risk daemon TRANSACTION_TIMEOUT under load; consider nb lock in oracle_sync write path if recurs.

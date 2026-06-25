@@ -40,10 +40,25 @@ def effective_fractional_kelly(db_pct: float) -> float:
     """Env override for ladder Kelly fraction; default 5% of cash per ladder step."""
     override = os.getenv("APEX_FRACTIONAL_KELLY", "").strip()
     if override:
-        return float(override)
-    if db_pct > 0:
-        return db_pct
-    return DEFAULT_FRACTIONAL_KELLY
+        raw = float(override)
+    elif db_pct > 0:
+        raw = db_pct
+    else:
+        raw = DEFAULT_FRACTIONAL_KELLY
+    return clamp_fractional_kelly(raw)
+
+
+def clamp_fractional_kelly(fractional_kelly: float) -> float:
+    """Absolute ceiling on fractional Kelly — non-negotiable regardless of conviction."""
+    try:
+        from engine_1_apex.runtime_levers import active_max_fractional_kelly
+
+        cap = active_max_fractional_kelly()
+    except ImportError:
+        from engine_1_apex.kelly_sizing import max_fractional_kelly
+
+        cap = max_fractional_kelly()
+    return min(max(float(fractional_kelly), 0.0), cap)
 
 
 def stop_loss_cooldown_seconds() -> int:
@@ -137,6 +152,16 @@ def _extract_net_edge(entry_context: str | None) -> float | None:
         return float(match.group(1))
     except ValueError:
         return None
+
+
+def _sanitize_stop_loss_reentry_edge(edge: float | None) -> float | None:
+    """Legacy fills tagged boosted composite edge (~0.9+); cap for re-entry gates."""
+    if edge is None:
+        return None
+    cap = float(os.getenv("APEX_STOP_LOSS_REENTRY_EDGE_CAP", "0.25"))
+    if edge > cap:
+        return effective_min_net_edge()
+    return edge
 
 
 def get_agent_open_notional(conn, agent_id: str) -> float:
@@ -259,30 +284,44 @@ def is_stop_loss_cooldown_active(conn, agent_id: str, market_id: str) -> bool:
     return elapsed < cooldown
 
 
-def last_stop_loss_net_edge(conn, agent_id: str, market_id: str) -> float | None:
+def last_stop_loss_net_edge(
+    conn,
+    agent_id: str,
+    market_id: str,
+    *,
+    direction: str | None = None,
+) -> float | None:
     reset_cutoff = _wallet_reset_cutoff_iso(conn, agent_id)
+    direction_sql = " AND direction = ?" if direction else ""
     if reset_cutoff:
+        params: tuple = (agent_id, market_id, reset_cutoff)
+        if direction:
+            params += (direction,)
         row = conn.execute(
-            """
+            f"""
             SELECT entry_context FROM trade_execution
             WHERE agent_id = ? AND market_id = ? AND status = 'CLOSED_STOP_LOSS'
-              AND closed_at >= ?
+              AND closed_at >= ?{direction_sql}
             ORDER BY closed_at DESC LIMIT 1
             """,
-            (agent_id, market_id, reset_cutoff),
+            params,
         ).fetchone()
     else:
+        params = (agent_id, market_id)
+        if direction:
+            params += (direction,)
         row = conn.execute(
-            """
+            f"""
             SELECT entry_context FROM trade_execution
             WHERE agent_id = ? AND market_id = ? AND status = 'CLOSED_STOP_LOSS'
+            {direction_sql}
             ORDER BY closed_at DESC LIMIT 1
             """,
-            (agent_id, market_id),
+            params,
         ).fetchone()
     if not row:
         return None
-    return _extract_net_edge(row[0])
+    return _sanitize_stop_loss_reentry_edge(_extract_net_edge(row[0]))
 
 
 def compute_ladder_budget(
@@ -303,6 +342,8 @@ def compute_ladder_budget(
     """
     if nav <= 0:
         return None, "nav_zero"
+
+    fractional_kelly = clamp_fractional_kelly(fractional_kelly)
 
     active_portfolio_pct = (
         portfolio_pct if portfolio_pct is not None else max_portfolio_pct()

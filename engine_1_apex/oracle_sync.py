@@ -41,6 +41,12 @@ _schema_ready = False
 _archive_counter = 0
 
 
+def mark_oracle_schema_initialized() -> None:
+    """Set after Apex preflight schema migrate — oracle thread skips blocking flock migrate."""
+    global _schema_ready
+    _schema_ready = True
+
+
 def _edge_model_mocked() -> bool:
     return os.getenv("EDGE_MODEL_MOCKED", "true").lower() in ("true", "1", "yes")
 

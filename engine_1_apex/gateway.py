@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from engine_1_apex.commit_reveal import assert_market_unresolved
 from engine_1_apex.herding_cap import apply_herding_cap_to_kelly, kelly_exceeds_herding_cap
 from engine_1_apex.sizing import (
+    clamp_fractional_kelly,
     compute_ladder_budget,
     effective_min_net_edge,
     is_stop_loss_cooldown_active,
@@ -30,6 +31,7 @@ from engine_1_apex.execution_edge import (
 from database.replica_store import commit_local, open_replica, request_cloud_sync, sync_replica_now
 from database.transaction import arena_transaction
 from database.knowledge_store import KnowledgeStore
+from database.execution_controls_store import read_execution_controls
 from engine_1_apex.toxicity_gate import should_reject_toxic_entry
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -151,6 +153,11 @@ class PaperGateway:
         close_conn = conn is None
 
         try:
+            controls = read_execution_controls(own_conn)
+            apex_state = str(controls.get("apex_state", "RUNNING"))
+            if apex_state in ("DRAIN_AND_HALT", "HALTED"):
+                return {"status": "REJECTED", "reason": "bankruptcy_halt"}
+
             limits = self._load_swarm_agent_limits(own_conn, agent_id)
             if limits is None:
                 return {"status": "REJECTED", "reason": "agent_inactive"}
@@ -189,16 +196,21 @@ class PaperGateway:
             agent_exposure = PaperGateway._get_agent_market_exposure(
                 own_conn, agent_id, market_id
             )
-            kelly_size, sizing_reason = compute_ladder_budget(
-                nav=sizing["nav"],
-                cash=sizing["cash"],
-                fractional_kelly=sizing["fractional_kelly"],
-                max_position_pct=sizing["max_position_pct"],
-                market_exposure=agent_exposure,
-                total_open_notional=sizing["open_notional"],
-                min_ladder_usd=MIN_LADDER_USD,
-                portfolio_pct=max_portfolio_pct(),
-            )
+            caller_kelly = float(kelly_size) if kelly_size and kelly_size > 0 else None
+            if caller_kelly is not None:
+                kelly_size = caller_kelly
+                sizing_reason = None
+            else:
+                kelly_size, sizing_reason = compute_ladder_budget(
+                    nav=sizing["nav"],
+                    cash=sizing["cash"],
+                    fractional_kelly=clamp_fractional_kelly(sizing["fractional_kelly"]),
+                    max_position_pct=sizing["max_position_pct"],
+                    market_exposure=agent_exposure,
+                    total_open_notional=sizing["open_notional"],
+                    min_ladder_usd=MIN_LADDER_USD,
+                    portfolio_pct=max_portfolio_pct(),
+                )
             if kelly_size is None:
                 return {"status": "REJECTED", "reason": sizing_reason or "position_cap"}
 
@@ -229,6 +241,7 @@ class PaperGateway:
                 state=state,
             )
             net_edge = boosted_net_edge(edge_result)
+            stored_edge = edge_result.net_edge
             edge_threshold = resolve_min_net_edge(
                 market_mid,
                 min_net_edge if min_net_edge is not None else self.MIN_NET_EDGE,
@@ -246,10 +259,12 @@ class PaperGateway:
                     "reason": "ladder_no_edge_improvement",
                 }
 
-            sl_prior_edge = last_stop_loss_net_edge(own_conn, agent_id, market_id)
+            sl_prior_edge = last_stop_loss_net_edge(
+                own_conn, agent_id, market_id, direction=direction
+            )
             if sl_prior_edge is not None:
                 min_reentry = sl_prior_edge + stop_loss_reentry_edge_margin()
-                if net_edge <= min_reentry:
+                if stored_edge <= min_reentry:
                     return {
                         "status": "REJECTED",
                         "reason": "stop_loss_reentry_edge",
@@ -298,7 +313,7 @@ class PaperGateway:
                         kelly_size,
                         stop_loss,
                         take_profit,
-                        PaperGateway._tag_entry_context(entry_context, net_edge),
+                        PaperGateway._tag_entry_context(entry_context, stored_edge),
                     ),
                 )
                 own_conn.execute(

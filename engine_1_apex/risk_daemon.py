@@ -17,8 +17,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from engine_1_apex.commit_reveal import audit_commitments_for_market
 from database.knowledge_store import KnowledgeStore
+from database.audit_store import append_audit_event
 from database.arena_lock import arena_lock
 from database.migrate_schema import ensure_replica_schema
+from database.transaction import arena_transaction, arena_transaction_with_retry
+from shared.db_lock import arena_lock_nb
 from shared.poly_costs import PolyCostModel
 from database.replica_store import open_replica, request_cloud_sync
 
@@ -57,9 +60,6 @@ class PlannedTradeExit:
 
 class RiskDaemon:
     def __init__(self):
-        self.replica_path = os.getenv("LOCAL_REPLICA_PATH", "./ip4_local_replica.db")
-        self.sync_url = os.getenv("TURSO_DATABASE_URL")
-        self.auth_token = os.getenv("TURSO_AUTH_TOKEN")
         self.knowledge = KnowledgeStore()
 
     def get_client(self):
@@ -105,12 +105,12 @@ class RiskDaemon:
         return gross_return - size
 
     def _load_open_positions(self) -> list[tuple]:
-        with arena_lock(ARENA_LOCK_PATH):
-            conn = self.get_client()
-            try:
-                return conn.execute(_OPEN_POSITIONS_QUERY).fetchall()
-            finally:
-                conn.close()
+        """Read open positions outside arena_lock — sqld MVCC allows concurrent reads."""
+        conn = self.get_client()
+        try:
+            return conn.execute(_OPEN_POSITIONS_QUERY).fetchall()
+        finally:
+            conn.close()
 
     def _plan_exits(self, open_positions: list[tuple]) -> list[PlannedTradeExit]:
         """Evaluate bracket/resolution exits outside the arena lock."""
@@ -285,33 +285,93 @@ class RiskDaemon:
         if not prepared_swarm:
             return
 
-        with arena_lock(ARENA_LOCK_PATH):
-            conn = self.get_client()
+        def _persist(conn) -> None:
+            for payload in prepared_swarm:
+                self.knowledge.persist_swarm_post_mortem(conn, payload)
+
+        try:
+            # Use non-blocking lock with timeout to avoid competing with main Apex tick
+            with arena_lock_nb(ARENA_LOCK_PATH, timeout_s=8.0) as acquired:
+                if not acquired:
+                    logging.warning("Risk daemon post-mortem: could not acquire arena_lock within 8s, skipping persistence")
+                    return
+                arena_transaction_with_retry(self.get_client, _persist, max_attempts=7)
+            request_cloud_sync("risk_daemon_post_mortem")
+        except Exception as exc:
+            logging.error("Post-mortem persistence failed after retries: %s", exc)
             try:
-                for payload in prepared_swarm:
-                    self.knowledge.persist_swarm_post_mortem(conn, payload)
-                conn.commit()
-                request_cloud_sync("risk_daemon_post_mortem")
-            finally:
-                conn.close()
+                audit_conn = self.get_client()
+                try:
+                    append_audit_event(
+                        audit_conn,
+                        event_type="risk_daemon_post_mortem_failed",
+                        source="risk_daemon",
+                        payload=str(exc),
+                        violations=["post_mortem_persist_failed"],
+                        action_taken="log_only",
+                    )
+                finally:
+                    audit_conn.close()
+            except Exception as audit_exc:
+                logging.error("Failed to record post-mortem audit event: %s", audit_exc)
+            raise
+
+    def _run_vector_backfill(self) -> None:
+        """Ingest closed-trade vectors after bracket exits — retried, non-fatal."""
+        from shared.hrana_retry import is_transient_hrana_error, run_with_hrana_retry
+
+        def _backfill() -> int:
+            return self.knowledge.backfill_closed_trades(batch_limit=3)
+
+        def _on_retry(attempt: int, exc: BaseException) -> None:
+            logging.warning(
+                "Vector backfill retry %d/%d: %s",
+                attempt,
+                5,
+                exc,
+            )
+
+        try:
+            backfilled = run_with_hrana_retry(
+                _backfill,
+                max_attempts=5,
+                on_retry=_on_retry,
+            )
+            if backfilled:
+                logging.info(
+                    "Vector memory backfill: %d post-mortem(s) ingested this cycle.",
+                    backfilled,
+                )
+        except Exception as exc:
+            logging.error("Vector backfill failed after retries: %s", exc)
+            if not is_transient_hrana_error(exc):
+                try:
+                    audit_conn = self.get_client()
+                    try:
+                        append_audit_event(
+                            audit_conn,
+                            event_type="vector_backfill_failed",
+                            source="risk_daemon",
+                            payload=str(exc),
+                            violations=["vector_backfill_failed"],
+                            action_taken="log_only",
+                        )
+                    finally:
+                        audit_conn.close()
+                except Exception as audit_exc:
+                    logging.error(
+                        "Failed to record vector backfill audit event: %s", audit_exc
+                    )
+            return
 
     def evaluate_exits(self):
         logging.info("Initiating Risk Assessment Loop...")
         ensure_replica_schema()
         loop_start = time.perf_counter()
 
-        try:
-            backfilled = self.knowledge.backfill_closed_trades(batch_limit=3)
-            if backfilled:
-                logging.info(
-                    "Vector memory backfill: %d post-mortem(s) ingested this cycle.",
-                    backfilled,
-                )
-        except Exception as e:
-            logging.error("Vector backfill failed: %s", e)
-
         pending_post_mortems: list[tuple[str, str, float, float, str]] = []
         closed_count = 0
+        read_ms = plan_ms = write_ms = 0
 
         read_start = time.perf_counter()
         open_positions = self._load_open_positions()
@@ -319,39 +379,68 @@ class RiskDaemon:
 
         if not open_positions:
             logging.info("No open positions. Capital is safe.")
-            return
+        else:
+            plan_start = time.perf_counter()
+            planned = self._plan_exits(open_positions)
+            plan_ms = int((time.perf_counter() - plan_start) * 1000)
 
-        plan_start = time.perf_counter()
-        planned = self._plan_exits(open_positions)
-        plan_ms = int((time.perf_counter() - plan_start) * 1000)
+            if not planned:
+                logging.info(
+                    "Risk Loop Complete. 0 positions closed. timing read=%d plan=%d ms",
+                    read_ms,
+                    plan_ms,
+                )
+            else:
+                write_start = time.perf_counter()
+                try:
+                    # Use non-blocking lock with timeout to avoid competing with main Apex tick
+                    with arena_lock_nb(ARENA_LOCK_PATH, timeout_s=8.0) as acquired:
+                        if not acquired:
+                            logging.warning("Risk daemon: could not acquire arena_lock within 8s, skipping exit cycle")
+                            pending_post_mortems = []
+                            closed_count = 0
+                        else:
+                            def _apply(conn) -> tuple[int, list]:
+                                return self._apply_planned_exits(conn, planned)
 
-        if not planned:
-            logging.info(
-                "Risk Loop Complete. 0 positions closed. timing read=%d plan=%d ms",
-                read_ms,
-                plan_ms,
-            )
-            return
+                            closed_count, pending_post_mortems = arena_transaction_with_retry(
+                                self.get_client,
+                                _apply,
+                                max_attempts=7,
+                            )
+                    if closed_count > 0:
+                        request_cloud_sync("risk_daemon_exits")
+                except Exception as e:
+                    logging.error("Risk Daemon Failure after retries: %s", e)
+                    try:
+                        conn = self.get_client()
+                        try:
+                            append_audit_event(
+                                conn,
+                                event_type="risk_daemon_exit_failed",
+                                source="risk_daemon",
+                                payload=str(e),
+                                violations=["bracket_exit_write_failed"],
+                                action_taken="log_only",
+                                commit=True,
+                            )
+                        finally:
+                            conn.close()
+                    except Exception as audit_exc:
+                        logging.error(
+                            "Failed to record risk daemon audit event: %s", audit_exc
+                        )
+                    pending_post_mortems = []
+                    closed_count = 0
+                write_ms = int((time.perf_counter() - write_start) * 1000)
 
-        write_start = time.perf_counter()
-        with arena_lock(ARENA_LOCK_PATH):
-            conn = self.get_client()
-            try:
-                closed_count, pending_post_mortems = self._apply_planned_exits(conn, planned)
-                if closed_count > 0:
-                    conn.commit()
-                    request_cloud_sync("risk_daemon_exits")
-            except Exception as e:
-                logging.error("Risk Daemon Failure: %s", e)
-            finally:
-                conn.close()
-        write_ms = int((time.perf_counter() - write_start) * 1000)
+                if pending_post_mortems:
+                    try:
+                        self._persist_post_mortems(pending_post_mortems)
+                    except Exception as e:
+                        logging.error("Post-mortem persistence failed: %s", e)
 
-        if pending_post_mortems:
-            try:
-                self._persist_post_mortems(pending_post_mortems)
-            except Exception as e:
-                logging.error("Post-mortem persistence failed: %s", e)
+        self._run_vector_backfill()
 
         total_ms = int((time.perf_counter() - loop_start) * 1000)
         logging.info(

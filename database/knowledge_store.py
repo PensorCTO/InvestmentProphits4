@@ -12,6 +12,7 @@ import requests
 from dotenv import load_dotenv
 
 from database.arena_lock import arena_lock
+from shared.db_lock import arena_lock_nb
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -31,9 +32,6 @@ RAG_COLD_START_MIN_VECTORS = 100
 
 class KnowledgeStore:
     def __init__(self):
-        self.replica_path = os.getenv("LOCAL_REPLICA_PATH", "./ip4_local_replica.db")
-        self.sync_url = os.getenv("TURSO_DATABASE_URL")
-        self.auth_token = os.getenv("TURSO_AUTH_TOKEN")
         self.embedding_dims = int(
             os.getenv("EMBEDDING_DIMS", str(DEFAULT_EMBEDDING_DIMS))
         )
@@ -851,7 +849,10 @@ class KnowledgeStore:
 
     def backfill_closed_trades(self, *, batch_limit: int = 25) -> int:
         """Ingest CLOSED_* trades missing from knowledge_core_vectors."""
-        with arena_lock(_ARENA_LOCK_PATH):
+        with arena_lock_nb(_ARENA_LOCK_PATH, timeout_s=5.0) as acquired:
+            if not acquired:
+                logger.debug("Vector backfill: arena_lock busy, skipping read batch")
+                return 0
             self._backfill_missing_entry_context_locked()
             conn = self.get_client()
             try:
@@ -902,7 +903,10 @@ class KnowledgeStore:
             return 0
 
         ingested = 0
-        with arena_lock(_ARENA_LOCK_PATH):
+        with arena_lock_nb(_ARENA_LOCK_PATH, timeout_s=8.0) as acquired:
+            if not acquired:
+                logger.debug("Vector backfill: arena_lock busy, skipping persist batch")
+                return 0
             conn = self.get_client()
             try:
                 for payload in prepared:
@@ -910,10 +914,9 @@ class KnowledgeStore:
                         ingested += 1
                 if ingested:
                     conn.commit()
-                    try:
-                        conn.sync()
-                    except Exception as sync_e:
-                        logger.warning("Cloud sync delayed: %s", sync_e)
+                    from database.replica_store import request_cloud_sync
+
+                    request_cloud_sync("vector_backfill")
             finally:
                 conn.close()
 

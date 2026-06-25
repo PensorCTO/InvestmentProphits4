@@ -36,11 +36,12 @@ def db_conn():
         conn.close()
 
 
-def test_compute_ladder_budget_uses_nav_not_cash():
+def test_compute_ladder_budget_uses_nav_not_cash(monkeypatch):
+    monkeypatch.setenv("APEX_MAX_FRACTIONAL_KELLY", "0.20")
     size, reason = compute_ladder_budget(
         nav=100.0,
         cash=100.0,
-        fractional_kelly=0.35,
+        fractional_kelly=0.15,
         max_position_pct=0.15,
         market_exposure=0.0,
         total_open_notional=0.0,
@@ -49,6 +50,26 @@ def test_compute_ladder_budget_uses_nav_not_cash():
     )
     assert reason is None
     assert size == pytest.approx(15.0)
+
+
+def test_clamp_fractional_kelly_caps_high_static(monkeypatch):
+    from engine_1_apex.sizing import clamp_fractional_kelly
+
+    monkeypatch.setenv("APEX_MAX_FRACTIONAL_KELLY", "0.05")
+    assert clamp_fractional_kelly(0.35) == pytest.approx(0.05)
+
+    size, reason = compute_ladder_budget(
+        nav=100.0,
+        cash=100.0,
+        fractional_kelly=0.35,
+        max_position_pct=0.50,
+        market_exposure=0.0,
+        total_open_notional=0.0,
+        min_ladder_usd=5.0,
+        portfolio_pct=0.50,
+    )
+    assert reason is None
+    assert size == pytest.approx(5.0)
 
 
 def test_compute_ladder_budget_blocks_portfolio_cap():
@@ -66,7 +87,8 @@ def test_compute_ladder_budget_blocks_portfolio_cap():
     assert reason == "portfolio_cap"
 
 
-def test_compute_ladder_budget_shrinks_with_deployed_notional():
+def test_compute_ladder_budget_shrinks_with_deployed_notional(monkeypatch):
+    monkeypatch.setenv("APEX_MAX_FRACTIONAL_KELLY", "0.50")
     first, _ = compute_ladder_budget(
         nav=100.0,
         cash=100.0,
@@ -219,6 +241,40 @@ def test_stop_loss_cooldown_and_last_edge(db_conn, monkeypatch):
     assert last_stop_loss_net_edge(db_conn, "APEX_EDGE", "mkt_oscars") == pytest.approx(0.02)
 
 
+def test_stop_loss_reentry_edge_sanitizes_inflated_legacy_boost(db_conn, monkeypatch):
+    monkeypatch.setenv("APEX_MIN_NET_EDGE", "0.015")
+    _seed_market(db_conn)
+    recent = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    db_conn.execute(
+        """
+        INSERT INTO trade_execution
+        (trade_id, agent_id, market_id, direction, entry_price, kelly_size,
+         bracket_stop_loss, bracket_take_profit, status, closed_at, entry_context)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "t_inflated",
+            "APEX_EDGE",
+            "mkt_oscars",
+            "NO",
+            0.02,
+            10.0,
+            0.01,
+            0.04,
+            "CLOSED_STOP_LOSS",
+            recent,
+            "ctx|net_edge=0.943325",
+        ),
+    )
+    db_conn.commit()
+    assert last_stop_loss_net_edge(
+        db_conn, "APEX_EDGE", "mkt_oscars", direction="NO"
+    ) == pytest.approx(0.015)
+    assert last_stop_loss_net_edge(
+        db_conn, "APEX_EDGE", "mkt_oscars", direction="YES"
+    ) is None
+
+
 def test_stop_loss_gates_ignore_pre_wallet_reset_history(db_conn, monkeypatch):
     from shared.capital_injection import EVENT_WALLET_RESET, SCOPE_APEX, append_injection
 
@@ -363,7 +419,8 @@ def test_portfolio_cap_blocks_when_half_nav_deployed():
     assert reason == "portfolio_cap"
 
 
-def test_compute_ladder_budget_no_portfolio_cap():
+def test_compute_ladder_budget_no_portfolio_cap(monkeypatch):
+    monkeypatch.setenv("APEX_MAX_FRACTIONAL_KELLY", "0.50")
     size, reason = compute_ladder_budget(
         nav=100.0,
         cash=60.0,

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from shared.rolling_stats import RollingWindow
+from shared.state_float import state_float
 
 
 def _env_float(name: str, default: str) -> float:
@@ -160,12 +161,14 @@ class RegimeStateTracker:
         ts_ms: float,
     ) -> RegimeResult:
         ms = self._state(market_id)
-        spread = float(state.get("spread", 0.0))
-        bid_depth = float(state.get("bid_depth", 0.0))
-        ask_depth = float(state.get("ask_depth", 0.0))
+        spread = state_float(state, "spread", 0.0)
+        bid_depth = state_float(state, "bid_depth", 0.0)
+        ask_depth = state_float(state, "ask_depth", 0.0)
         depth = bid_depth + ask_depth
-        ephemeral = float(state.get("ephemeral_ratio", state.get("spoof_penalty", 0.0)))
-        liq_q = float(state.get("liquidity_quality", 0.5))
+        ephemeral = state_float(
+            state, "ephemeral_ratio", state_float(state, "spoof_penalty", 0.0)
+        )
+        liq_q = state_float(state, "liquidity_quality", 0.5)
 
         ms.spread_window.add(ts_ms, spread)
         ms.depth_window.add(ts_ms, depth)

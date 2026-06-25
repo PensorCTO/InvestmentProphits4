@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 
 from database.audit_store import append_audit_event
 from database.execution_controls_store import update_execution_controls
@@ -13,28 +12,20 @@ from database.trading_activity_store import fetch_activity_breakdown
 from engine_1_apex.trade_close import calculate_pnl
 from engine_2_crucible.backtest_judge import (
     judge_horizons,
-    judge_min_return_slope,
     judge_slope_window,
     rolling_return_slopes,
     rolling_sharpe_slopes,
     sharpe_slope_reject_reason,
     slope_reject_reason,
 )
+from shared.live_audit_config import (
+    live_audit_enabled,
+    live_audit_min_closes,
+    live_audit_shadow_mode,
+)
 from shared.poly_costs import PolyCostModel
 
 logger = logging.getLogger(__name__)
-
-
-def live_audit_enabled() -> bool:
-    return os.getenv("LIVE_AUDIT_ENABLED", "false").lower() in ("true", "1", "yes")
-
-
-def live_audit_shadow_mode() -> bool:
-    return os.getenv("LIVE_AUDIT_SHADOW", "true").lower() in ("true", "1", "yes")
-
-
-def live_audit_min_closes() -> int:
-    return int(os.getenv("LIVE_AUDIT_MIN_CLOSES", "5"))
 
 
 def execution_friction() -> float:
@@ -54,6 +45,7 @@ def _closed_returns_since_keep(conn, *, agent_id: str, since_iso: str) -> list[f
     ).fetchall()
     returns: list[float] = []
     for entry_price, exit_price, kelly_size, status in rows:
+        del status
         if exit_price is None:
             continue
         pnl = calculate_pnl(float(entry_price), float(exit_price), float(kelly_size))
@@ -63,28 +55,14 @@ def _closed_returns_since_keep(conn, *, agent_id: str, since_iso: str) -> list[f
     return returns
 
 
-def _load_baseline_slopes(conn, version: int) -> dict | None:
-    row = conn.execute(
-        """
-        SELECT baseline_slopes_json FROM strategy_history
-        WHERE version = ?
-        """,
-        (version,),
-    ).fetchone()
-    if not row or not row[0]:
-        return None
-    try:
-        return json.loads(row[0])
-    except json.JSONDecodeError:
-        return None
-
-
 def evaluate_live_performance(conn, *, agent_id: str | None = None) -> tuple[str | None, dict]:
     """
     Return (breach_reason, metrics) for current champion since last KEEP.
 
     Shadow mode logs only; enforce mode triggers revert + DRAIN_AND_HALT.
     """
+    import os
+
     agent_id = agent_id or os.getenv("APEX_AGENT_ID", "APEX_EDGE")
     record = read_active_strategy_record(conn)
     if not record or not record.get("updated_at"):
@@ -124,6 +102,13 @@ def evaluate_live_performance(conn, *, agent_id: str | None = None) -> tuple[str
 
     returns = _closed_returns_since_keep(conn, agent_id=agent_id, since_iso=since_iso)
     metrics["return_count"] = len(returns)
+
+    window = judge_slope_window()
+    horizons = judge_horizons()
+    return_slopes = rolling_return_slopes(returns, window=window, horizons=horizons)
+    metrics["return_slope_h5"] = return_slopes.get(5, 0.0)
+    sharpe_slopes = rolling_sharpe_slopes(returns, window=window, horizons=horizons)
+    metrics["sharpe_slope_h5"] = sharpe_slopes.get(5, 0.0)
 
     return_reason = slope_reject_reason(returns)
     if return_reason:

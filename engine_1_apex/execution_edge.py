@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from shared.poly_costs import PolyCostModel
+from shared.state_float import state_float
 
 
 def _weight(name: str, default: str) -> float:
@@ -48,14 +49,20 @@ class CompositeEdgeResult:
 
 
 def _feature_score(state: dict, direction: str) -> dict[str, float]:
-    mid = float(state.get("mid_price", 0.5))
-    mp_dev = float(state.get("microprice_deviation", 0.0))
-    flow = float(state.get("flow_imbalance_5s", state.get("flow_imbalance", 0.0)))
-    obi = float(state.get("order_book_imbalance", state.get("depth_imbalance", 0.0)))
-    liq_q = float(state.get("liquidity_quality", 0.5))
-    reliability = float(state.get("historical_reliability", 0.5))
-    spoof = float(state.get("spoof_penalty", state.get("ephemeral_ratio", 0.0)))
-    phantom = float(state.get("phantom_liquidity_penalty", 0.0))
+    mid = state_float(state, "mid_price", 0.5)
+    mp_dev = state_float(state, "microprice_deviation", 0.0)
+    flow = state_float(
+        state, "flow_imbalance_5s", state_float(state, "flow_imbalance", 0.0)
+    )
+    obi = state_float(
+        state, "order_book_imbalance", state_float(state, "depth_imbalance", 0.0)
+    )
+    liq_q = state_float(state, "liquidity_quality", 0.5)
+    reliability = state_float(state, "historical_reliability", 0.5)
+    spoof = state_float(
+        state, "spoof_penalty", state_float(state, "ephemeral_ratio", 0.0)
+    )
+    phantom = state_float(state, "phantom_liquidity_penalty", 0.0)
 
     sign = 1.0 if direction == "YES" else -1.0
     return {

@@ -27,3 +27,12 @@ def test_event_loop_closed():
 
 def test_real_error_not_transient():
     assert not is_transient_hrana_error(ValueError("no such table: foo"))
+
+
+def test_transaction_timeout():
+    assert is_transient_hrana_error(
+        ValueError(
+            "Hrana: `cursor error: `error at step 0: "
+            "(error code: TRANSACTION_TIMEOUT) `Transaction timed out``"
+        )
+    )

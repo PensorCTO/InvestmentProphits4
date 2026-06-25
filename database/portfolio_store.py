@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 from typing import Any
 
 from shared.capital_injection import (
-    EVENT_BANKRUPTCY_RESET,
     EVENT_INITIAL_SEED,
     EVENT_WALLET_RESET,
     SCOPE_APEX,
@@ -62,6 +61,53 @@ def ensure_apex_initial_injection(
     )
 
 
+def maybe_halt_on_bankruptcy(
+    conn,
+    *,
+    agent_id: str = DEFAULT_APEX_AGENT_ID,
+    nav: float,
+    execution_mode: str = "PAPER",
+) -> bool:
+    """
+    Halt entries when NAV falls below APEX_BANKRUPTCY_FLOOR — no capital injection.
+
+    Sets apex_state=DRAIN_AND_HALT and logs audit event for operator intervention.
+    """
+    floor = apex_bankruptcy_floor()
+    if floor is None or nav >= floor:
+        return False
+
+    from database.audit_store import append_audit_event
+    from database.execution_controls_store import set_apex_state
+
+    total_inj = total_injected(conn, SCOPE_APEX, agent_id=agent_id)
+    set_apex_state(conn, "DRAIN_AND_HALT", commit=False)
+    append_audit_event(
+        conn,
+        event_type="bankruptcy_floor_breach",
+        source="portfolio_store",
+        payload={
+            "nav": round(nav, 2),
+            "floor": floor,
+            "total_injected": round(total_inj, 2),
+            "execution_mode": execution_mode,
+        },
+        violations=["bankruptcy_floor_breach"],
+        action_taken="DRAIN_AND_HALT",
+        commit=False,
+    )
+    commit_local(conn)
+    request_cloud_sync("bankruptcy_halt")
+    logger.error(
+        "APEX bankruptcy floor breach: nav=%.2f floor=%.2f total_injected=$%.2f — "
+        "DRAIN_AND_HALT (no capital injection)",
+        nav,
+        floor,
+        total_inj,
+    )
+    return True
+
+
 def maybe_restore_bankruptcy_capital(
     conn,
     *,
@@ -69,49 +115,13 @@ def maybe_restore_bankruptcy_capital(
     nav: float,
     execution_mode: str = "PAPER",
 ) -> bool:
-    """Inject capital when NAV falls below APEX_BANKRUPTCY_FLOOR."""
-    floor = apex_bankruptcy_floor()
-    if floor is None or nav >= floor:
-        return False
-
-    inject_amount = round(DEFAULT_INITIAL_CAPITAL - nav, 2)
-    if inject_amount <= 0:
-        return False
-
-    row = conn.execute(
-        "SELECT capital FROM agent_archetypes WHERE agent_id = ? AND is_active = 1",
-        (agent_id,),
-    ).fetchone()
-    if not row:
-        return False
-
-    new_cash = round(float(row[0]) + inject_amount, 2)
-    conn.execute(
-        "UPDATE agent_archetypes SET capital = ? WHERE agent_id = ?",
-        (new_cash, agent_id),
-    )
-    append_injection(
-        conn,
-        SCOPE_APEX,
-        EVENT_BANKRUPTCY_RESET,
-        inject_amount,
-        agent_id=agent_id,
-    )
-    logger.warning(
-        "APEX bankruptcy floor injection: nav=%.2f floor=%.2f injected=$%.2f new_cash=$%.2f",
-        nav,
-        floor,
-        inject_amount,
-        new_cash,
-    )
-    record_portfolio_snapshot(
+    """Deprecated alias — halts instead of injecting capital."""
+    return maybe_halt_on_bankruptcy(
         conn,
         agent_id=agent_id,
+        nav=nav,
         execution_mode=execution_mode,
-        commit=False,
-        sync=False,
     )
-    return True
 
 
 def _mark_open_position_value(

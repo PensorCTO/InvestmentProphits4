@@ -115,8 +115,9 @@ def test_fetch_history_returns_most_recent_rows(db_conn):
     assert navs == [120.0, 130.0, 140.0]
 
 
-def test_bankruptcy_injection_logs_and_records(db_conn, monkeypatch):
-    from database.portfolio_store import maybe_restore_bankruptcy_capital
+def test_bankruptcy_floor_triggers_halt_not_injection(db_conn, monkeypatch):
+    from database.execution_controls_store import read_execution_controls
+    from database.portfolio_store import get_apex_total_injected, maybe_halt_on_bankruptcy
 
     monkeypatch.setenv("APEX_BANKRUPTCY_FLOOR", "20")
     db_conn.execute(
@@ -124,16 +125,20 @@ def test_bankruptcy_injection_logs_and_records(db_conn, monkeypatch):
     )
     db_conn.commit()
 
-    injected = maybe_restore_bankruptcy_capital(
+    injected_before = get_apex_total_injected(db_conn, "APEX_EDGE")
+
+    halted = maybe_halt_on_bankruptcy(
         db_conn,
         agent_id="APEX_EDGE",
         nav=15.0,
         execution_mode="PAPER",
     )
     db_conn.commit()
-    assert injected is True
+    assert halted is True
     total, cash, positions = compute_agent_nav(db_conn, "APEX_EDGE")
     assert positions == pytest.approx(0.0)
-    assert cash == pytest.approx(100.0)
-    assert total == pytest.approx(100.0)
-    assert get_apex_total_injected(db_conn, "APEX_EDGE") == pytest.approx(185.0)
+    assert cash == pytest.approx(15.0)
+    assert total == pytest.approx(15.0)
+    assert get_apex_total_injected(db_conn, "APEX_EDGE") == pytest.approx(injected_before)
+    controls = read_execution_controls(db_conn)
+    assert controls["apex_state"] == "DRAIN_AND_HALT"

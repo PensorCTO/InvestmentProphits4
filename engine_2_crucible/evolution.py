@@ -163,20 +163,15 @@ def archive_retired_agent(
 
 class GeneticEvolution:
     def __init__(self):
-        self.replica_path = os.getenv("LOCAL_REPLICA_PATH", "./ip4_local_replica.db")
-        self.sync_url = os.getenv("TURSO_DATABASE_URL")
-        self.auth_token = os.getenv("TURSO_AUTH_TOKEN")
         self.BANKRUPTCY_THRESHOLD = 150.0
         self.STARTING_CAPITAL = 400.0
         self.MUTATION_RATE = 0.15
         self.POPULATION_CAP = 6
 
     def get_client(self):
-        return libsql.connect(
-            self.replica_path,
-            sync_url=self.sync_url,
-            auth_token=self.auth_token,
-        )
+        from database.replica_store import open_replica
+
+        return open_replica()
 
     def execute_epoch(self):
         if not validation_gate_passed():

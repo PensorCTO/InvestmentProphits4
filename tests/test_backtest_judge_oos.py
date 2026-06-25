@@ -29,7 +29,23 @@ def test_oos_mdd_hard_reject():
     assert verdict.oos_mdd > 0.10
 
 
-def test_dual_positive_sortino_required():
+def test_oos_sortino_zero_rejects(monkeypatch):
+    """Zero OOS Sortino must REVERT at default JUDGE_MIN_OOS_SORTINO=0.0 floor."""
+    monkeypatch.setenv("JUDGE_MIN_IS_SORTINO", "0.0")
+    monkeypatch.setenv("JUDGE_MIN_OOS_SORTINO", "0.0")
+    monkeypatch.setenv("JUDGE_MAX_OOS_MDD", "0.10")
+    is_returns = [0.05, 0.04, 0.03]
+    oos_returns = [0.0, 0.0, 0.0]
+    verdict = evaluate_oos_gates(is_returns, oos_returns)
+    assert not verdict.passed
+    assert "OOS_SORTINO_REJECT" in verdict.reason
+    assert verdict.oos_sortino == 0.0
+
+
+def test_dual_positive_sortino_required(monkeypatch):
+    monkeypatch.setenv("JUDGE_MIN_IS_SORTINO", "0.0")
+    monkeypatch.setenv("JUDGE_MIN_OOS_SORTINO", "0.0")
+    monkeypatch.setenv("JUDGE_MAX_OOS_MDD", "0.10")
     is_returns = [0.05, 0.04]
     oos_returns = [-0.01, -0.02]
     verdict = evaluate_oos_gates(is_returns, oos_returns)

@@ -13,7 +13,13 @@ import libsql
 from dotenv import load_dotenv
 
 from database.arena_db import connect_arena_db
-from database.sync_config import connection_mode, has_sync_primary, is_cloud_mode, primary_sync_url
+from database.sync_config import (
+    InvalidDatabaseUrlError,
+    connection_mode,
+    has_sync_primary,
+    is_cloud_mode,
+    primary_sync_url,
+)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(_PROJECT_ROOT / ".env")
@@ -70,11 +76,13 @@ def open_replica(*, for_sync: bool = False, read_only: bool = False):
     if _daemon_owner is not None and not for_sync:
         return _daemon_owner.borrow_connection()
     path = replica_path()
-    if connection_mode() == "cloud_replica":
+    try:
         sync_url, auth_token = primary_sync_url()
+    except InvalidDatabaseUrlError as exc:
+        raise RuntimeError(f"Invalid database connection URI: {exc}") from exc
+    if connection_mode() == "cloud_replica":
         return libsql.connect(path, sync_url=sync_url, auth_token=auth_token)
-    url, auth_token = primary_sync_url()
-    return libsql.connect(database=url, auth_token=auth_token)
+    return libsql.connect(database=sync_url, auth_token=auth_token)
 
 
 def ensure_replica_pragmas(conn) -> None:

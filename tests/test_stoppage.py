@@ -304,8 +304,11 @@ def test_tracker_zero_fill_streak_stop_loss_precheck():
     assert derive_trading_status(stats, zero_fill_streak=tracker.zero_fill_streak) == "IDLE"
 
 
-def test_should_remediate_idle_deployment_edge_gated_only():
+def test_should_remediate_idle_deployment_edge_gated_only(monkeypatch):
     from engine_1_apex.stoppage import should_remediate_idle_deployment
+
+    monkeypatch.delenv("APEX_FULLY_DEPLOYED_ROTATE_MIN_OPEN_LEGS", raising=False)
+    monkeypatch.setenv("APEX_FULLY_DEPLOYED_ROTATE_MIN_FRACTION", "0.67")
 
     stats = TickStats(
         signals=1,
@@ -357,8 +360,11 @@ def test_should_remediate_idle_deployment_cap_blocked_no_actionable():
     assert should_remediate_idle_deployment(stats) is True
 
 
-def test_should_remediate_fully_deployed_requires_min_open_legs():
+def test_should_remediate_fully_deployed_requires_min_open_legs(monkeypatch):
     from engine_1_apex.stoppage import should_remediate_fully_deployed
+
+    monkeypatch.delenv("APEX_FULLY_DEPLOYED_ROTATE_MIN_OPEN_LEGS", raising=False)
+    monkeypatch.setenv("APEX_FULLY_DEPLOYED_ROTATE_MIN_FRACTION", "0.67")
 
     sparse = TickStats(
         signals=0,

@@ -361,7 +361,8 @@ def enrich_state_from_signal_stack(state: dict, stack: dict) -> dict:
     for key, value in stack.items():
         if key in ("token_id", "mid", "updated_at_ms"):
             continue
-        merged[key] = value
+        if value is not None:
+            merged[key] = value
     merged["order_book_imbalance"] = stack.get(
         "order_book_imbalance", stack.get("depth_imbalance", merged.get("order_book_imbalance", 0.0))
     )

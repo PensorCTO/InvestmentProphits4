@@ -73,6 +73,8 @@ def test_replay_fill_eligibility_mock(monkeypatch):
         )
     ]
     monkeypatch.setattr(gate, "open_replica", lambda: conn)
+    monkeypatch.setenv("AUTORESEARCH_MIN_REPLAY_FILL_ELIGIBLE", "5")
+    monkeypatch.setenv("AUTORESEARCH_MAX_REPLAY_EDGE_REJECT_RATE", "0.5")
 
     result = gate.replay_fill_eligibility("def evaluate_market(s): return 'HOLD'")
     assert result.signals >= 1

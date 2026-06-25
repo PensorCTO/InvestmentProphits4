@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import random
 from collections.abc import Callable
@@ -15,6 +16,8 @@ from engine_2_crucible.backtest_judge import (
 )
 from engine_2_crucible.validate import validation_gate_passed
 from engine_2_crucible.val_bpb_backtest import BACKTEST_MAX_ROWS, _score_samples
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -95,6 +98,8 @@ def run_walk_forward_pipeline(
 
     oos_verdict = evaluate_oos_gates(is_returns, oos_returns)
     if not oos_verdict.passed:
+        if "OOS_SORTINO_REJECT" in oos_verdict.reason:
+            logger.warning("REVERT — OOS_SORTINO_REJECT: %s", oos_verdict.reason)
         return WalkForwardResult(
             passed=False,
             stage="oos_gates",
