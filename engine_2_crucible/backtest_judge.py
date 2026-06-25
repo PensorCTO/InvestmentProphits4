@@ -301,6 +301,77 @@ def combined_slope_reject_reason(returns: list[float]) -> str | None:
     return slope_reject_reason(returns) or sharpe_slope_reject_reason(returns)
 
 
+def crucible_staleness_days() -> int:
+    return int(os.getenv("CRUCIBLE_STALENESS_DAYS", "14"))
+
+
+def crucible_time_decay_lambda() -> float:
+    return float(os.getenv("CRUCIBLE_TIME_DECAY_LAMBDA", "0.01"))
+
+
+def apply_time_decay_weights(
+    values: list[float],
+    timestamps: list[int],
+    *,
+    lambda_: float | None = None,
+    now_epoch: int | None = None,
+) -> list[float]:
+    """Weight samples via W_i = exp(-λ * Δt_i) where Δt is seconds from now."""
+    if not values or not timestamps:
+        return []
+    lam = lambda_ if lambda_ is not None else crucible_time_decay_lambda()
+    now = now_epoch if now_epoch is not None else int(__import__("time").time())
+    weights: list[float] = []
+    for ts in timestamps:
+        delta_s = max(0.0, float(now - int(ts)))
+        weights.append(math.exp(-lam * delta_s))
+    total_w = sum(weights) or 1.0
+    return [v * w / total_w * len(values) for v, w in zip(values, weights)]
+
+
+def staleness_reject_reason(
+    samples: list[tuple[dict, int, int]],
+    *,
+    max_stale_fraction: float = 0.40,
+    max_age_days: int | None = None,
+    now_epoch: int | None = None,
+) -> str | None:
+    """Reject when too much performance attribution comes from stale rows."""
+    if not samples:
+        return None
+    age_limit_days = max_age_days if max_age_days is not None else crucible_staleness_days()
+    now = now_epoch if now_epoch is not None else int(__import__("time").time())
+    max_age_s = age_limit_days * 86400
+    stale_weight = 0.0
+    total_weight = 0.0
+    for _state, _resolution, ts in samples:
+        age_s = max(0.0, float(now - int(ts)))
+        w = 1.0
+        total_weight += w
+        if age_s > max_age_s:
+            stale_weight += w
+    if total_weight <= 0:
+        return None
+    stale_frac = stale_weight / total_weight
+    if stale_frac > max_stale_fraction:
+        return (
+            f"STALENESS_REJECT stale_fraction={stale_frac:.3f} > {max_stale_fraction} "
+            f"(>{age_limit_days}d)"
+        )
+    return None
+
+
+def weighted_mean(values: list[float], weights: list[float]) -> float:
+    if not values:
+        return 0.0
+    if not weights or len(weights) != len(values):
+        return sum(values) / len(values)
+    total = sum(weights)
+    if total <= 1e-15:
+        return sum(values) / len(values)
+    return sum(v * w for v, w in zip(values, weights)) / total
+
+
 def score_samples_with_slopes(
     samples: list[tuple[dict, int]],
     evaluate_market: Callable[[dict], str],

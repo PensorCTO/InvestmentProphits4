@@ -91,8 +91,8 @@ def main() -> int:
     finally:
         conn.close()
 
-    obi_values = [float(state.get("order_book_imbalance", 0.0)) for state, _ in samples]
-    outcomes = [int(resolution) for _, resolution in samples]
+    obi_values = [float(state.get("order_book_imbalance", 0.0)) for state, _, _ts in samples]
+    outcomes = [int(resolution) for _, resolution, _ts in samples]
 
     summary = {
         "resolved_markets_in_ledger": int(resolved_count),

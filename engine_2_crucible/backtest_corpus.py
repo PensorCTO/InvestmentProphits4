@@ -54,7 +54,7 @@ def load_resolutions(conn) -> dict[str, int | None]:
 
 def flatten_exhaust_rows(
     conn, max_rows: int, *, use_mock: bool = False
-) -> list[tuple[dict, int]]:
+) -> list[tuple[dict, int, int]]:
     rows = conn.execute(
         """
         SELECT payload, as_of_ms FROM trade_exhaust
@@ -64,7 +64,7 @@ def flatten_exhaust_rows(
         (max_rows,),
     ).fetchall()
     resolutions = load_resolutions(conn)
-    samples: list[tuple[dict, int]] = []
+    samples: list[tuple[dict, int, int]] = []
 
     for payload_raw, as_of_ms in rows:
         try:
@@ -73,6 +73,7 @@ def flatten_exhaust_rows(
             continue
         if not isinstance(markets, dict):
             continue
+        ts = int(as_of_ms or 0)
         for market_id, blob in markets.items():
             if not isinstance(blob, dict):
                 continue
@@ -80,9 +81,18 @@ def flatten_exhaust_rows(
             state = build_market_state(market_id, blob)
             if resolution is None and use_mock:
                 mid = float(state.get("mid_price", 0.5))
-                resolution = synthetic_resolution(market_id, int(as_of_ms or 0), mid)
+                resolution = synthetic_resolution(market_id, ts, mid)
             if resolution is None:
                 continue
-            samples.append((state, resolution))
+            samples.append((state, resolution, ts))
 
     return samples
+
+
+def flatten_exhaust_pairs(
+    conn, max_rows: int, *, use_mock: bool = False
+) -> list[tuple[dict, int]]:
+    """Backward-compatible (state, resolution) pairs without timestamps."""
+    return [(state, resolution) for state, resolution, _ts in flatten_exhaust_rows(
+        conn, max_rows, use_mock=use_mock
+    )]

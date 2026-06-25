@@ -368,7 +368,23 @@ def check_offline_safety(result: GateResult) -> None:
     )
 
 
-def run_gate(*, scope: str, skip_pytest: bool = False) -> GateResult:
+def check_guardrails_pytest(result: GateResult) -> None:
+    code, out = _run(
+        [sys.executable, "-m", "pytest", "tests/test_asynchronous_guardrails.py", "-q"]
+    )
+    tail = "\n".join(out.strip().splitlines()[-3:])
+    result.add("guardrails_pytest", code == 0, tail or f"exit {code}")
+
+
+def check_telemetry_schema(result: GateResult) -> None:
+    from shared.telemetry import build_tick_telemetry, verify_telemetry_schema
+
+    payload = build_tick_telemetry(regime_score=10.0, regime_state="GOOD")
+    ok = verify_telemetry_schema(payload)
+    result.add("telemetry_schema", ok, "required keys present" if ok else "schema missing keys")
+
+
+def run_gate(*, scope: str, skip_pytest: bool = False, verify_telemetry: bool = False) -> GateResult:
     result = GateResult(
         passed=True,
         timestamp=datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
@@ -378,6 +394,14 @@ def run_gate(*, scope: str, skip_pytest: bool = False) -> GateResult:
         if not skip_pytest:
             check_pytest(result)
         check_offline_safety(result)
+        return result
+
+    if scope == "components":
+        if not skip_pytest:
+            check_guardrails_pytest(result)
+        check_offline_safety(result)
+        if verify_telemetry:
+            check_telemetry_schema(result)
         return result
 
     if scope == "infra":
@@ -424,16 +448,25 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="IP4 definition-of-done acceptance gate")
     parser.add_argument(
         "--scope",
-        choices=("infra", "offline", "trading", "dashboard", "full"),
+        choices=("infra", "offline", "components", "trading", "dashboard", "full"),
         default="full",
-        help="offline=pytest+safety gates; infra=processes only; trading=includes verify --trading; full=all checks",
+        help="offline=pytest+safety; components=guardrails pytest; infra=processes; trading=verify --trading; full=all",
+    )
+    parser.add_argument(
+        "--verify-telemetry",
+        action="store_true",
+        help="Assert unified telemetry payload schema (use with --scope components)",
     )
     parser.add_argument("--baseline", action="store_true", help="Write baseline JSON and exit")
     parser.add_argument("--skip-pytest", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
-    result = run_gate(scope=args.scope, skip_pytest=args.skip_pytest)
+    result = run_gate(
+        scope=args.scope,
+        skip_pytest=args.skip_pytest,
+        verify_telemetry=args.verify_telemetry,
+    )
     if args.baseline:
         write_baseline(result)
         print(f"Baseline written to {BASELINE_PATH}")

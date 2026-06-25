@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -75,6 +76,22 @@ def test_shadow_promotion_after_window(monkeypatch):
         conn.commit()
         monkeypatch.setenv("SHADOW_PROMOTE_WINDOW_S", "3600")
         monkeypatch.setenv("SHADOW_PROMOTE_MIN_EDGE_DELTA", "0.002")
+        monkeypatch.setenv("SHADOW_PROMOTE_MIN_SIGNALS", "30")
+        metrics = {
+            "shadow_score": 2.0,
+            "champion_edge_sum": 0.01,
+            "shadow_edge_sum": 0.36,
+            "tick_count": 35,
+            "edge_deltas": [0.01] * 35,
+        }
+        conn.execute(
+            """
+            UPDATE active_strategy SET shadow_metrics_json = ?
+            WHERE id = 1
+            """,
+            (json.dumps(metrics),),
+        )
+        conn.commit()
         action = evaluate_shadow_promotion(conn)
         assert action == "promoted"
         assert read_shadow_strategy(conn) is None

@@ -8,7 +8,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from engine_2_crucible.backtest_corpus import flatten_exhaust_rows
-from engine_2_crucible.backtest_judge import evaluate_oos_gates, split_is_oos
+from engine_2_crucible.backtest_judge import (
+    evaluate_oos_gates,
+    split_is_oos,
+    staleness_reject_reason,
+)
 from engine_2_crucible.validate import validation_gate_passed
 from engine_2_crucible.val_bpb_backtest import BACKTEST_MAX_ROWS, _score_samples
 
@@ -77,6 +81,10 @@ def run_walk_forward_pipeline(
             stage="corpus",
             detail=f"insufficient resolved samples={len(samples)}",
         )
+
+    stale_reason = staleness_reject_reason(samples)
+    if stale_reason:
+        return WalkForwardResult(passed=False, stage="staleness", detail=stale_reason)
 
     train, oos, hidden = _chronological_split(samples, train_frac)
     if not oos:

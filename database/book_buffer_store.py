@@ -66,6 +66,11 @@ def read_book_buffer(conn, market_id: str) -> dict[str, Any] | None:
     }
 
 
+def count_book_buffer_rows(conn) -> int:
+    row = conn.execute("SELECT COUNT(*) FROM book_buffer").fetchone()
+    return int(row[0]) if row else 0
+
+
 def read_all_book_buffers(conn) -> dict[str, dict[str, Any]]:
     rows = conn.execute(
         "SELECT market_id, token_id, payload, as_of, updated_at FROM book_buffer"

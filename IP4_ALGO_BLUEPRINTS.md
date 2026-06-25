@@ -47,7 +47,8 @@ Parallel loops (not on every tick):
 - **Risk daemon** — `ARENA_RISK_INTERVAL` (default 45s): bracket exits, optional toxicity committee
 - **BookWatcher** — DMA adaptive poll (`DMA_POLL_SLOW_MS` 250ms → `DMA_POLL_FAST_MS` 50ms on vol spike): debounced writes to `book_buffer`
 - **HMM regime** — per-tick decode → `runtime_levers.py` overrides edge/Kelly/portfolio caps
-- **Shadow soak** — Crucible stages `backtest_pass`; Apex promotes after 1h edge comparison
+- **Shadow soak** — Crucible stages `backtest_pass`; Apex promotes after Welch t-test edge comparison (`SHADOW_PROMOTE_MAX_P_VALUE`)
+- **Telemetry** — per-tick jsonl export (`logs/telemetry.jsonl`); DMA heartbeat at `/tmp/.dma_heartbeat`
 
 ---
 
@@ -68,9 +69,11 @@ Levers are grouped by **layer**. Within a layer, order matters: upstream levers 
 | I. Churn guards | `cap_churn_guard.py` | Pause spread-tax loops |
 | J. Health telemetry | `stoppage.py` | `trader_health` status (not fill logic) |
 | K. Crucible research | `ip4_swarm_crucible.py` | Champion code selection |
-| L. DMA microstructure | `book_watcher.py`, `mtf_filter.py`, `mid_vol_tracker.py` | Poll cadence, OBI debounce, phantom liquidity |
+| L. DMA microstructure | `book_watcher.py`, `mtf_filter.py`, `mid_vol_tracker.py` | Poll cadence, OBI debounce, phantom liquidity, backpressure |
 | M. HMM runtime levers | `market_regime_hmm.py`, `runtime_levers.py` | Regime-aware edge/Kelly/portfolio overrides |
-| N. Shadow promotion | `shadow_strategy_monitor.py`, `strategy_store.py` | Soak-before-champion |
+| N. Shadow promotion | `shadow_strategy_monitor.py`, `strategy_store.py`, `stats_utils.py` | Welch t-test soak-before-champion |
+| O. Churn lockout | `churn_lockout.py` | Post alpha-decay exit re-entry block |
+| P. Telemetry | `shared/telemetry.py` | DMA heartbeat pusher + tick jsonl observability |
 
 ---
 
@@ -108,6 +111,11 @@ The champion is **Python code**, not env vars. Crucible evolves it via DeepSeek 
 | `WALK_FORWARD_HIDDEN_FRACTION` | 0 | Optional hidden holdout (default off; 80/20 IS/OOS) |
 | `SHADOW_PROMOTE_WINDOW_S` | 3600 | Shadow soak before champion promotion |
 | `SHADOW_PROMOTE_MIN_EDGE_DELTA` | 0.002 | Min edge advantage for shadow promotion |
+| `SHADOW_PROMOTE_MIN_SIGNALS` | 30 | Min edge observations before Welch test |
+| `SHADOW_PROMOTE_MAX_P_VALUE` | 0.05 | One-tailed Welch t-test significance ceiling |
+| `SHADOW_MAX_LIFESPAN_CYCLES` | 360 | Max shadow cycles before expiry |
+| `CRUCIBLE_STALENESS_DAYS` | 14 | KEEP rejected if champion older than N days |
+| `CRUCIBLE_TIME_DECAY_LAMBDA` | 0.01 | Time-decay weight on backtest samples |
 
 ---
 
@@ -138,7 +146,7 @@ The champion is **Python code**, not env vars. Crucible evolves it via DeepSeek 
 
 ## 5. Layer C — Regime & Liquidity
 
-Hard **skip** before strategy evaluation completes entry path. Uses **z-score Schmitt hysteresis** (June 2026).
+Hard **skip** before strategy evaluation completes entry path. Uses **z-score Schmitt hysteresis** with tri-state output (June 2026).
 
 | Variable | Default | Role |
 |----------|---------|------|
@@ -148,12 +156,14 @@ Hard **skip** before strategy evaluation completes entry path. Uses **z-score Sc
 | `REGIME_SCORE_TRIP` | 80 | Regime score 0–100 to enter POOR |
 | `REGIME_SCORE_RECOVER` | 40 | Score must stay below for recovery |
 | `REGIME_RECOVER_TICKS` | 3 | Consecutive ticks below recover score |
+| `REGIME_WEIGHT_SPREAD` | 60.0 | Composite score weight for spread z |
+| `REGIME_WEIGHT_DEPTH` | 40.0 | Composite score weight for depth z |
 | `REGIME_Z_WINDOW_S` | 300 | Rolling window for z-scores (5 min) |
 | `REGIME_EPHEMERAL_THRESHOLD` | 0.7 | Flickering book reason (auxiliary) |
 | `REGIME_SPREAD_MULT` | 2.0 | **Deprecated** — superseded by z-scores |
 | `APEX_LIQUIDITY_FLOOR` | 50000 | Min tier volume; markets below skipped |
 
-**Schmitt trigger:** Enter POOR when score > 80; exit only after score < 40 for 3 consecutive Apex ticks (~30s).
+**Schmitt trigger:** Enter POOR when score > 80; exit only after score < 40 for 3 consecutive Apex ticks (~30s). **CAUTION** (40–80) downscales ladder sizing via `compute_ladder_budget()` without hard HOLD.
 
 **Effect:** Increments `skipped_hold` (regime) — distinct from strategy HOLD.
 
@@ -306,12 +316,13 @@ When cash is idle but caps block new entries, Apex **recycles capital** by closi
 
 | Variable | Default | Role |
 |----------|---------|------|
-| `APEX_CAP_STALL_REMEDIATE_TICKS` | **18** | Consecutive cap-block ticks before remediate (~3 min @ 10s) |
+| `APEX_CAP_STALL_REMEDIATE_TICKS` | **6** | Consecutive cap-block ticks before remediate (~1 min @ 10s) |
 | `APEX_CAP_STALL_ENTRY_COOLDOWN_SECONDS` | 60 (paper) / 600 (live) | Cooldown after cap-stall close |
 | `APEX_CAP_TRIM_ENABLED` | true | Partial trim before full-leg rotate |
 | `APEX_CAP_TRIM_FRACTION` | 0.50 | Fraction trimmed per leg |
 | `APEX_CAP_TRIM_MIN_LEGS` | 2 | Worst HOLD legs to trim |
 | `APEX_CAP_TRIM_MIN_EDGE_MULT` | 2.0 | Pending signal edge must be ≥ mult × min_edge |
+| `APEX_CAP_TRIM_MIN_PNL_PCT` | -0.04 | Skip trim targets with unrealized loss above this |
 
 **Rotation sort:** Remediation closes legs by **lowest alpha decay** (ΔEdge = current net edge − entry net edge), not smallest notional.
 
@@ -375,6 +386,16 @@ cap_blocked_streak >= APEX_CAP_STALL_REMEDIATE_TICKS ?
 
 **When active:** `blocks_rebalance()` and `blocks_new_entries()` return true → logs `APEX CAP CHURN GUARD`.
 
+### Alpha-decay churn lockout (Layer O)
+
+After `PORTFOLIO_CAP_ROTATE`, `FULLY_DEPLOYED_ROTATE`, `IDLE_ROTATE`, or `CAP_REBALANCE` exits, Apex records a per-market lockout in `churn_lockout.py`:
+
+| Variable | Default | Role |
+|----------|---------|------|
+| `APEX_CHURN_LOCKOUT_SECONDS` | 1800 | Block new long entries on that market |
+
+Telemetry exports active lockouts in `logs/telemetry.jsonl` → `portfolio_metrics.active_churn_lockouts`.
+
 **Acceptance gate mirrors:**
 
 | Variable | Default |
@@ -385,7 +406,25 @@ cap_blocked_streak >= APEX_CAP_STALL_REMEDIATE_TICKS ?
 
 ---
 
-## 12. Layer J — Stoppage & Health Telemetry
+## 12. Layer P — Telemetry & DMA Heartbeat
+
+| Variable | Default | Role |
+|----------|---------|------|
+| `DMA_HEARTBEAT_TIMEOUT_S` | 5 | Max age before BookWatcher considered stale |
+| `DMA_HEARTBEAT_GRACE_S` | 15 | Startup grace before stale check fires |
+| `DMA_HEARTBEAT_TICK_S` | 1.0 | Background pusher write interval |
+| `BOOKWATCHER_BACKPRESSURE_MS` | 45 | Queue depth threshold for poll throttle |
+| `BOOKWATCHER_BACKPRESSURE_CYCLES` | 20 | Consecutive backpressure cycles before throttle |
+| `BOOKWATCHER_BACKPRESSURE_THROTTLE_MS` | 100 | Throttled poll interval when backlogged |
+| `BOOK_BUFFER_PERSIST_INTERVAL_S` | 1.0 | Debounced book_buffer write cadence |
+
+**Tick jsonl schema** (`shared/telemetry.py`): `tick_timestamp`, `processes.book_watcher_heartbeat_delta_s`, `regime_metrics`, `hmm_metrics`, `portfolio_metrics` (ladder legs, utilization, churn lockouts).
+
+**Acceptance:** `acceptance_gate.py --scope components --verify-telemetry` validates schema against last emitted payload.
+
+---
+
+## 13. Layer J — Stoppage & Health Telemetry
 
 Does **not** block fills directly — classifies wallet state for dashboard and ops.
 
@@ -506,7 +545,9 @@ Typical calibrated checkpoint (June 2026):
 ```bash
 APEX_MAX_LADDER_LEGS=6
 APEX_MAX_LEGS_PER_MARKET=1
-APEX_CAP_STALL_REMEDIATE_TICKS=18
+APEX_CAP_STALL_REMEDIATE_TICKS=6
+APEX_CHURN_LOCKOUT_SECONDS=1800
+APEX_CAP_TRIM_MIN_PNL_PCT=-0.04
 APEX_FULLY_DEPLOYED_ROTATE_MIN_FRACTION=0.67
 APEX_ROTATE_REENTRY_MID_DELTA=0.02
 APEX_ROTATE_REENTRY_FV_DELTA=0.02
@@ -516,6 +557,9 @@ APEX_CAP_CHURN_MIN_CROSS_MARKET_ROTATES=3
 APEX_MIN_NET_EDGE=0.015
 APEX_THESIS_REENTRY_COOLDOWN_SECONDS=900
 APEX_IDLE_ROTATE_REENTRY_COOLDOWN_SECONDS=900
+DMA_HEARTBEAT_TIMEOUT_S=5
+SHADOW_PROMOTE_MIN_SIGNALS=30
+SHADOW_PROMOTE_MAX_P_VALUE=0.05
 CRUCIBLE_EXPLORATION=false
 EDGE_MODEL_MOCKED=false
 ```
@@ -529,6 +573,7 @@ EDGE_MODEL_MOCKED=false
 | Tick orchestration | `engine_1_apex/ip4_apex_edge.py` |
 | Stoppage / remediate | `engine_1_apex/stoppage.py` |
 | Churn guard | `engine_1_apex/cap_churn_guard.py` |
+| Churn lockout | `engine_1_apex/churn_lockout.py` |
 | Sizing / cooldowns | `engine_1_apex/sizing.py` |
 | Dynamic Kelly | `engine_1_apex/kelly_sizing.py` |
 | Herding cap | `engine_1_apex/herding_cap.py` |
@@ -542,9 +587,11 @@ EDGE_MODEL_MOCKED=false
 | DMA / vol tracker | `shared/mid_vol_tracker.py`, `shared/rolling_stats.py` |
 | HMM + runtime levers | `engine_1_apex/market_regime_hmm.py`, `engine_1_apex/runtime_levers.py` |
 | Shadow soak | `engine_1_apex/shadow_strategy_monitor.py` |
+| Telemetry | `shared/telemetry.py` |
+| Stats (Welch) | `shared/stats_utils.py` |
 | WFO judge | `engine_2_crucible/backtest_judge.py`, `walk_forward_pipeline.py` |
 | Algo blueprints | `IP4_ALGO_BLUEPRINTS.md` (this document) |
 
 ---
 
-*Last updated: 2026-06-25 — DMA adaptive polling, z-score regime hysteresis, alpha-decay rotation + CAP_TRIM, Crucible shadow soak, HMM runtime levers, live audit shadow-first.*
+*Last updated: 2026-06-25 — async guardrails, DMA heartbeat telemetry, churn lockout, tri-state regime CAUTION, shadow Welch promotion, cap-trim PnL floor, live-wallet readiness criteria in master blueprints §18.*

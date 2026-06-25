@@ -295,6 +295,7 @@ def compute_ladder_budget(
     total_open_notional: float,
     min_ladder_usd: float,
     portfolio_pct: float | None = None,
+    regime_downscale: float = 1.0,
 ) -> tuple[float | None, str | None]:
     """
     Return (kelly_size, skip_reason). skip_reason is set when kelly_size is None.
@@ -334,6 +335,10 @@ def compute_ladder_budget(
             kelly = min(market_remaining, portfolio_remaining)
         else:
             return None, "position_cap"
+    scale = max(0.0, min(1.0, regime_downscale))
+    kelly *= scale
+    if kelly < ladder_floor and scale < 1.0:
+        return None, "regime_caution"
     return kelly, None
 
 

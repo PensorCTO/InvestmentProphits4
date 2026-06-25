@@ -5,6 +5,7 @@ import time
 from shared.regime_classifier import (
     RegimeStateTracker,
     get_regime_tracker,
+    regime_score_trip,
 )
 
 
@@ -25,23 +26,30 @@ def test_regime_score_trip_and_recover():
     mid = "test_market"
     now = time.time() * 1000.0
 
-    for i in range(20):
-        tracker.update(mid, _base_state(spread=0.01 + i * 0.001), ts_ms=now + i * 1000)
+    for i in range(30):
+        tracker.update(mid, _base_state(spread=0.01 + i * 0.0005), ts_ms=now + i * 1000)
 
     result = tracker.update(
         mid,
-        _base_state(spread=0.15, ephemeral_ratio=0.9, liquidity_quality=0.1),
-        ts_ms=now + 25_000,
+        _base_state(spread=0.50),
+        ts_ms=now + 35_000,
     )
-    assert result.poor_liquidity or result.regime_score > 40
+    assert result.regime_score > regime_score_trip() or result.poor_liquidity
 
     for i in range(3):
         result = tracker.update(
             mid,
-            _base_state(spread=0.01, ephemeral_ratio=0.1, liquidity_quality=0.8),
-            ts_ms=now + 30_000 + i * 10_000,
+            _base_state(spread=0.01),
+            ts_ms=now + 40_000 + i * 10_000,
         )
-    assert not result.poor_liquidity or result.regime_score < 80
+    assert not result.poor_liquidity
+
+
+def test_caution_downscale_band():
+    tracker = RegimeStateTracker()
+    assert tracker.classify_band(20.0) == "GOOD"
+    assert tracker.classify_band(50.0) == "CAUTION"
+    assert tracker.classify_band(90.0) == "POOR_LIQUIDITY"
 
 
 def test_no_whipsaw_on_borderline():

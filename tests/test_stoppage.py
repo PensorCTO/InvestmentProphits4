@@ -125,7 +125,10 @@ def test_cap_stall_remediate_ticks_default(monkeypatch):
     from engine_1_apex import stoppage as stoppage_mod
 
     monkeypatch.delenv("APEX_CAP_STALL_REMEDIATE_TICKS", raising=False)
+    monkeypatch.setenv("EXECUTION_MODE", "live")
     assert stoppage_mod.cap_stall_remediate_ticks() == 18
+    monkeypatch.setenv("EXECUTION_MODE", "paper")
+    assert stoppage_mod.cap_stall_remediate_ticks() == 6
 
 
 def test_remediate_cap_stall_below_threshold(monkeypatch):
@@ -312,6 +315,43 @@ def test_should_remediate_idle_deployment_edge_gated_only():
         cash=52.0,
         min_ladder_usd=5.0,
         open_legs=4,
+        max_ladder_legs=6,
+    )
+    assert should_remediate_idle_deployment(stats) is True
+
+
+def test_should_remediate_idle_deployment_all_hold_sparse_legs():
+    from engine_1_apex.stoppage import should_remediate_idle_deployment
+
+    stats = TickStats(
+        evaluated=7,
+        skipped_hold=7,
+        cap_reasons={"max_legs_per_market": 3},
+        cash=85.0,
+        min_ladder_usd=5.0,
+        open_legs=3,
+        max_ladder_legs=6,
+    )
+    assert should_remediate_idle_deployment(stats) is True
+
+
+def test_actionable_unfilled_signals_excludes_rejected():
+    from engine_1_apex.stoppage import actionable_unfilled_signals
+
+    stats = TickStats(signals=2, skipped_edge=1, rejected=1, filled=0)
+    assert actionable_unfilled_signals(stats) == 0
+
+
+def test_should_remediate_idle_deployment_cap_blocked_no_actionable():
+    from engine_1_apex.stoppage import should_remediate_idle_deployment
+
+    stats = TickStats(
+        signals=1,
+        skipped_edge=1,
+        cap_reasons={"max_legs_per_market": 3},
+        cash=85.0,
+        min_ladder_usd=5.0,
+        open_legs=3,
         max_ladder_legs=6,
     )
     assert should_remediate_idle_deployment(stats) is True

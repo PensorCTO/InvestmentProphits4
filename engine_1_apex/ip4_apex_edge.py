@@ -70,7 +70,7 @@ from engine_1_apex.sizing import (
     resolve_min_net_edge,
 )
 from engine_1_apex.oracle_sync import _ensure_schema_once, _maybe_auto_map_clob, sync_cycle
-from engine_1_apex.market_regime_hmm import decode_market_regime
+from engine_1_apex.market_regime_hmm import decode_market_regime_full
 from engine_1_apex.runtime_levers import (
     active_max_portfolio_pct,
     active_min_net_edge,
@@ -79,6 +79,7 @@ from engine_1_apex.runtime_levers import (
 )
 from engine_1_apex.risk_daemon import RiskDaemon
 from engine_1_apex.cap_churn_guard import CapChurnGuard, cap_churn_cooldown_seconds
+from engine_1_apex.churn_lockout import active_lockout_market_ids, blocks_entry
 from engine_1_apex.stoppage import (
     RotateReentrySnapshot,
     StoppageTracker,
@@ -122,7 +123,12 @@ from engine_2_crucible.strategy_loader import (
 from shared.book_watcher import get_book_watcher_runtime
 from shared.mock_clob_signals import edge_model_mocked
 from shared.poly_costs import PolyCostModel
-from shared.regime_classifier import circuit_breaker_holds
+from shared.regime_classifier import classify_liquidity_regime, get_regime_tracker
+from shared.telemetry import (
+    build_tick_telemetry,
+    emit_tick_telemetry,
+    heartbeat_is_stale,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -239,6 +245,7 @@ class ApexEdgeEngine:
         self._fully_deployed_rotate_snapshot: dict[str, RotateReentrySnapshot] = {}
         self._churn_guard = CapChurnGuard()
         self._book_watcher_runtime = None
+        self._book_watcher_started_at: float | None = None
 
     def _ensure_book_watcher(self) -> None:
         if edge_model_mocked():
@@ -266,6 +273,13 @@ class ApexEdgeEngine:
             runtime.set_token_provider(_token_provider)
             runtime.start()
             self._book_watcher_runtime = runtime
+            self._book_watcher_started_at = time.monotonic()
+            from shared.telemetry import start_dma_heartbeat_pusher, write_heartbeat
+
+            start_dma_heartbeat_pusher()
+            write_heartbeat()
+            if halt_reason() == "bookwatcher_silence":
+                clear_execution_halt()
             logger.info("BookWatcher started (poll_ms=%s)", os.getenv("MTF_POLL_MS", "250"))
 
     def _validate_live_credentials(self) -> None:
@@ -393,6 +407,33 @@ class ApexEdgeEngine:
                 clear_execution_halt()
         return self._signals_enabled and not is_execution_halted()
 
+    def _trigger_bookwatcher_emergency_halt(self, conn, controls: dict) -> None:
+        logger.critical(
+            "CRITICAL: BookWatcher silence detected. Initiating Emergency Halt."
+        )
+        set_execution_halt("bookwatcher_silence")
+        self._signals_enabled = False
+        set_apex_state(conn, "DRAIN_AND_HALT", commit=True)
+        mode = str(controls.get("active_execution_mode", "PAPER"))
+        if mode == "LIVE":
+            from engine_1_apex.live_gateway import request_emergency_cancel_all
+
+            request_emergency_cancel_all(self.gateway)
+        tick_stats = TickStats(nav=0.0, cash=0.0)
+        persist_trader_health(
+            conn,
+            agent_id=APEX_AGENT_ID,
+            tracker=self._stoppage,
+            stats=tick_stats,
+            status="STOPPED",
+            kind="BOOKWATCHER_SILENCE",
+            detail="BookWatcher heartbeat stale",
+            consecutive=1,
+            commit=True,
+            trading_status_override="SYSTEM_HALTED",
+        )
+        conn.commit()
+
     def preflight(self) -> None:
         ensure_replica_schema()
         sync_replica_now(reason="apex_startup")
@@ -407,6 +448,16 @@ class ApexEdgeEngine:
                 elif controls.get("global_kill_switch"):
                     raise RuntimeError(
                         "global_kill_switch active — clear in execution_controls before boot"
+                    )
+                elif str(controls.get("apex_state", "")).upper() in (
+                    "HALTED",
+                    "DRAIN_AND_HALT",
+                ):
+                    set_apex_state(conn, "RUNNING", commit=True)
+                    clear_execution_halt()
+                    logger.warning(
+                        "Recovered apex_state=%s -> RUNNING on startup",
+                        controls.get("apex_state"),
                     )
                 elif controls.get("active_execution_mode") == "LIVE":
                     self._ensure_live_runtime()
@@ -541,6 +592,27 @@ class ApexEdgeEngine:
                 if not self._apply_execution_controls(conn, controls):
                     return
 
+                if self._book_watcher_runtime is not None:
+                    bw_thread = self._book_watcher_runtime._thread
+                    thread_dead = bw_thread is not None and not bw_thread.is_alive()
+                    stale = heartbeat_is_stale(
+                        started_at_monotonic=self._book_watcher_started_at,
+                    )
+                    from shared.telemetry import heartbeat_pusher_alive, read_heartbeat_age_s
+
+                    if thread_dead or (stale and not heartbeat_pusher_alive()):
+                        age = read_heartbeat_age_s()
+                        logger.critical(
+                            "BookWatcher liveness failed (thread_dead=%s stale=%s "
+                            "pusher_alive=%s heartbeat_age_s=%s)",
+                            thread_dead,
+                            stale,
+                            heartbeat_pusher_alive(),
+                            age,
+                        )
+                        self._trigger_bookwatcher_emergency_halt(conn, controls)
+                        return
+
                 try:
                     evaluate_market = self._load_evaluate_fn(conn)
                 except StrategyLoadError as exc:
@@ -589,9 +661,16 @@ class ApexEdgeEngine:
                         if stack is not None:
                             st = enrich_state_from_signal_stack(st, stack.to_dict())
                     portfolio_states.append(st)
-                hmm_state = decode_market_regime(portfolio_states)
-                set_active_levers(levers_for_hmm_state(hmm_state))
-                logger.debug("HMM regime=%s levers active", hmm_state)
+                hmm_result = decode_market_regime_full(portfolio_states, conn=conn)
+                regime_tracker = get_regime_tracker()
+                p_toxic = float(hmm_result.posterior[2])
+                regime_tracker.apply_hmm_toxic_override(
+                    hmm_state=hmm_result.state,
+                    p_toxic=p_toxic,
+                    low_confidence=hmm_result.low_confidence,
+                )
+                set_active_levers(levers_for_hmm_state(hmm_result.state))
+                logger.debug("HMM regime=%s levers active", hmm_result.state)
 
                 sizing = load_agent_sizing_snapshot(conn, APEX_AGENT_ID)
                 if not sizing:
@@ -634,6 +713,10 @@ class ApexEdgeEngine:
                 idle_rotation_rows: list[tuple[str, str, float, str]] = []
                 cap_trim_pending_kelly = 0.0
                 cap_trim_pending_edge = 0.0
+                tick_regime_score = 0.0
+                tick_regime_state = "GOOD"
+                tick_regime_downscale = 1.0
+                tick_regime_downscale = 1.0
                 for market_id, data in market_data.items():
                     if not isinstance(data, dict):
                         continue
@@ -644,10 +727,88 @@ class ApexEdgeEngine:
                         if stack is not None:
                             state = enrich_state_from_signal_stack(state, stack.to_dict())
 
-                    hold_regime, regime_reason = circuit_breaker_holds(state, market_id=market_id)
-                    if hold_regime:
+                    regime_result = classify_liquidity_regime(state, market_id=market_id)
+                    tick_regime_score = max(tick_regime_score, regime_result.regime_score)
+                    tick_regime_state = regime_result.regime
+                    tick_regime_downscale = min(
+                        tick_regime_downscale, regime_result.sizing_downscale
+                    )
+                    if regime_result.poor_liquidity:
                         skipped_hold += 1
+                        if APEX_CLOSE_ON_HOLD:
+                            open_row = conn.execute(
+                                """
+                                SELECT committed_at FROM trade_execution
+                                WHERE agent_id = ? AND market_id = ? AND status = 'OPEN'
+                                LIMIT 1
+                                """,
+                                (APEX_AGENT_ID, market_id),
+                            ).fetchone()
+                            if open_row:
+                                self._hold_streak[market_id] = (
+                                    self._hold_streak.get(market_id, 0) + 1
+                                )
+                                liq_tier = state.get("liquidity_tier", "MED_LIQUIDITY")
+                                category = state.get("category", "")
+                                mid = float(state.get("mid_price", 0.5))
+                                idle_rotation_rows.append(
+                                    (market_id, category, mid, liq_tier)
+                                )
+                                if (
+                                    count_open_legs(conn, APEX_AGENT_ID, market_id)
+                                    >= APEX_MAX_LEGS_PER_MARKET
+                                ):
+                                    cap_reasons["max_legs_per_market"] = (
+                                        cap_reasons.get("max_legs_per_market", 0) + 1
+                                    )
+                                hold_streak = self._hold_streak[market_id]
+                                min_hold_ok = True
+                                if open_row[0] and APEX_MIN_HOLD_SECONDS > 0:
+                                    from datetime import datetime, timezone
+
+                                    try:
+                                        opened = datetime.fromisoformat(
+                                            str(open_row[0]).replace("Z", "+00:00")
+                                        )
+                                        if opened.tzinfo is None:
+                                            opened = opened.replace(tzinfo=timezone.utc)
+                                        age_s = (
+                                            datetime.now(timezone.utc) - opened
+                                        ).total_seconds()
+                                        min_hold_ok = age_s >= APEX_MIN_HOLD_SECONDS
+                                    except ValueError:
+                                        min_hold_ok = True
+                                if hold_streak >= APEX_HOLD_CLOSE_TICKS and min_hold_ok:
+                                    n_closed = close_agent_market_positions(
+                                        conn,
+                                        agent_id=APEX_AGENT_ID,
+                                        market_id=market_id,
+                                        category=category,
+                                        market_mid=mid,
+                                        liquidity_tier=liq_tier,
+                                        exit_reason="THESIS_EXPIRED",
+                                    )
+                                    if n_closed:
+                                        closed_flip += n_closed
+                                        self._hold_streak.pop(market_id, None)
+                                        self._remediate_cooldown_until[market_id] = (
+                                            time.monotonic()
+                                            + thesis_reentry_cooldown_seconds()
+                                        )
+                                        sizing = load_agent_sizing_snapshot(
+                                            conn, APEX_AGENT_ID
+                                        )
+                                        if sizing:
+                                            cash = sizing["cash"]
+                                            nav = sizing["nav"]
+                                            open_notional = sizing["open_notional"]
+                                        logger.info(
+                                            "APEX CLOSE thesis_expired: %s closed %d leg(s)",
+                                            market_id,
+                                            n_closed,
+                                        )
                         continue
+                    regime_downscale = regime_result.sizing_downscale
 
                     liq_tier = state.get("liquidity_tier", "MED_LIQUIDITY")
                     if not PolyCostModel.tier_meets_liquidity_floor(
@@ -680,6 +841,13 @@ class ApexEdgeEngine:
                                 idle_rotation_rows.append(
                                     (market_id, category, mid, liq_tier)
                                 )
+                                if (
+                                    count_open_legs(conn, APEX_AGENT_ID, market_id)
+                                    >= APEX_MAX_LEGS_PER_MARKET
+                                ):
+                                    cap_reasons["max_legs_per_market"] = (
+                                        cap_reasons.get("max_legs_per_market", 0) + 1
+                                    )
                                 hold_streak = self._hold_streak[market_id]
                                 min_hold_ok = True
                                 if open_row[0] and APEX_MIN_HOLD_SECONDS > 0:
@@ -830,6 +998,14 @@ class ApexEdgeEngine:
                             "APEX stop-loss cooldown: %s",
                             market_id,
                         )
+                        continue
+
+                    if blocks_entry(market_id):
+                        skipped_cap += 1
+                        cap_reasons["churn_lockout"] = (
+                            cap_reasons.get("churn_lockout", 0) + 1
+                        )
+                        logger.debug("APEX churn lockout: %s", market_id)
                         continue
 
                     rotate_snapshot = self._fully_deployed_rotate_snapshot.get(market_id)
@@ -1017,6 +1193,7 @@ class ApexEdgeEngine:
                         total_open_notional=open_notional,
                         min_ladder_usd=APEX_MIN_LADDER_USD,
                         portfolio_pct=active_max_portfolio_pct(),
+                        regime_downscale=regime_downscale,
                     )
                     if (
                         kelly_size is None
@@ -1230,6 +1407,7 @@ class ApexEdgeEngine:
                     max_ladder_legs=APEX_MAX_LADDER_LEGS,
                     cap_reasons=cap_reasons,
                 )
+                status, kind, detail, consecutive = self._stoppage.observe(tick_stats)
                 if self._churn_guard.observe(
                     filled=filled,
                     closed_rebalance=closed_rebalance,
@@ -1489,7 +1667,6 @@ class ApexEdgeEngine:
                             "APEX FULLY DEPLOYED remediate: closed %d leg(s) for deployment rotation",
                             n_fd,
                         )
-                status, kind, detail, consecutive = self._stoppage.observe(tick_stats)
                 if kind == "CAPITAL_STARVATION":
                     rebalance_rows: list[tuple[str, str, float, str]] = []
                     position_cap = nav * sizing["max_position_pct"]
@@ -1577,6 +1754,26 @@ class ApexEdgeEngine:
                 )
                 conn.commit()
                 request_cloud_sync("portfolio_snapshot")
+                open_legs = count_agent_open_legs(conn, APEX_AGENT_ID)
+                utilization = (open_notional / nav) if nav > 0 else 0.0
+                emit_tick_telemetry(
+                    conn,
+                    build_tick_telemetry(
+                        regime_score=tick_regime_score,
+                        regime_state=tick_regime_state,
+                        sizing_downscale=tick_regime_downscale,
+                        hmm_state=hmm_result.state if hmm_result else "Trending",
+                        hmm_confidence_delta=(
+                            hmm_result.confidence_delta if hmm_result else 0.0
+                        ),
+                        hmm_override_active=get_regime_tracker().hmm_override_active,
+                        active_ladder_legs=open_legs,
+                        total_utilization_pct=utilization,
+                        churn_lockouts=active_lockout_market_ids(
+                            list(market_data.keys())
+                        ),
+                    ),
+                )
                 if filled == 0 and evaluated > 0 and skipped_hold >= evaluated:
                     logger.warning(
                         "APEX signal starvation: %d/%d markets returned HOLD — "

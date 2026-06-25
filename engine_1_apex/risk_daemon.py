@@ -251,6 +251,11 @@ class RiskDaemon:
 
             closed_count += 1
             logging.info(
+                "APEX CLOSE %s: %s closed 1 leg(s)",
+                exit_plan.exit_reason.lower(),
+                exit_plan.market_id,
+            )
+            logging.info(
                 "EXIT [%s]: %s | %s | PnL: $%.2f",
                 exit_plan.exit_reason,
                 agent_id,

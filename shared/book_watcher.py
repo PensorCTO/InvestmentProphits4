@@ -13,12 +13,30 @@ from typing import Any
 
 import aiohttp
 
+from shared.mid_vol_tracker import (
+    MidVolTracker,
+    VolTrackerWorker,
+    dma_poll_fast_ms,
+    dma_poll_slow_ms,
+)
 from shared.polymarket_clob import CLOB_BASE, HTTP_TIMEOUT, PolymarketClobClient, _levels
-from shared.mid_vol_tracker import MidVolTracker
 from shared.signals.mtf_filter import mtf_poll_ms
 from shared.signals.stack import SignalStack, compute_signal_stack
+from shared.telemetry import start_dma_heartbeat_pusher, stop_dma_heartbeat_pusher, write_heartbeat
 
 logger = logging.getLogger(__name__)
+
+
+def backpressure_ms() -> float:
+    return float(os.getenv("BOOKWATCHER_BACKPRESSURE_MS", "45"))
+
+
+def backpressure_cycles() -> int:
+    return int(os.getenv("BOOKWATCHER_BACKPRESSURE_CYCLES", "20"))
+
+
+def backpressure_throttle_ms() -> int:
+    return int(os.getenv("BOOKWATCHER_BACKPRESSURE_THROTTLE_MS", "100"))
 
 
 @dataclass
@@ -43,7 +61,11 @@ class BookWatcher:
         self._last_persist: dict[str, float] = {}
         self._persist_interval_s = float(os.getenv("BOOK_BUFFER_PERSIST_INTERVAL_S", "1.0"))
         self._vol_tracker = MidVolTracker()
+        self._vol_worker = VolTrackerWorker(self._vol_tracker)
         self._effective_poll_ms = self.config.poll_ms
+        self._backpressure_streak = 0
+        self._recovery_streak = 0
+        self._throttled = False
 
     def set_market_tokens(self, mapping: dict[str, tuple[str, str]]) -> None:
         """Map market_id -> (yes_token_id, liquidity_tier)."""
@@ -117,7 +139,7 @@ class BookWatcher:
         )
         stack.effective_poll_ms = self._effective_poll_ms
         ts_ms = time.time() * 1000.0
-        self._vol_tracker.record_mid(token_id, mid, ts_ms)
+        self._vol_worker.enqueue(token_id, mid, ts_ms)
         with self._lock:
             self._snapshots[token_id] = stack
 
@@ -161,6 +183,35 @@ class BookWatcher:
         except Exception as exc:
             logger.debug("book_buffer persist skipped: %s", exc)
 
+    def _apply_backpressure(self, loop_elapsed_ms: float) -> None:
+        fast_ms = dma_poll_fast_ms()
+        if self._effective_poll_ms > fast_ms and not self._throttled:
+            return
+        limit = backpressure_ms()
+        if loop_elapsed_ms > limit:
+            self._backpressure_streak += 1
+            self._recovery_streak = 0
+        else:
+            self._backpressure_streak = 0
+            if self._throttled:
+                self._recovery_streak += 1
+
+        if self._backpressure_streak >= backpressure_cycles():
+            logger.warning(
+                "BookWatcher back-pressure: loop %.1fms > %.1fms for %d cycles — throttling",
+                loop_elapsed_ms,
+                limit,
+                self._backpressure_streak,
+            )
+            self._vol_tracker.prune_stale(older_than_ms=1000.0)
+            self._effective_poll_ms = backpressure_throttle_ms()
+            self._throttled = True
+            self._backpressure_streak = 0
+
+        if self._throttled and self._recovery_streak >= 5:
+            self._throttled = False
+            self._recovery_streak = 0
+
     async def run_once(self, token_map: dict[str, tuple[str, str]]) -> None:
         if not token_map:
             return
@@ -178,20 +229,30 @@ class BookWatcher:
 
     async def run_loop(self, token_provider) -> None:
         """token_provider: callable returning dict[market_id, (token_id, tier)]."""
-        while not self._shutdown.is_set():
-            try:
-                mapping = token_provider()
-                self.set_market_tokens(mapping)
-                token_ids = [tok for _, (tok, _) in mapping.items()]
-                self._effective_poll_ms = self._vol_tracker.effective_poll_ms(token_ids)
-                await self.run_once(mapping)
-            except Exception as exc:
-                logger.warning("BookWatcher poll cycle failed: %s", exc)
-            interval = self._effective_poll_ms / 1000.0
-            try:
-                await asyncio.wait_for(self._shutdown.wait(), timeout=interval)
-            except asyncio.TimeoutError:
-                pass
+        await self._vol_worker.start()
+        try:
+            while not self._shutdown.is_set():
+                loop_start = time.monotonic()
+                try:
+                    mapping = token_provider()
+                    self.set_market_tokens(mapping)
+                    token_ids = [tok for _, (tok, _) in mapping.items()]
+                    if not self._throttled:
+                        self._effective_poll_ms = self._vol_tracker.effective_poll_ms(
+                            token_ids
+                        )
+                    await self.run_once(mapping)
+                except Exception as exc:
+                    logger.warning("BookWatcher poll cycle failed: %s", exc)
+                loop_elapsed_ms = (time.monotonic() - loop_start) * 1000.0
+                self._apply_backpressure(loop_elapsed_ms)
+                interval = self._effective_poll_ms / 1000.0
+                try:
+                    await asyncio.wait_for(self._shutdown.wait(), timeout=interval)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            await self._vol_worker.stop()
 
     def stop(self) -> None:
         self._shutdown.set()
@@ -218,13 +279,13 @@ class BookWatcherRuntime:
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
-        self._shutdown_evt = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
             name="apex-book-watcher",
             daemon=True,
         )
         self._thread.start()
+        start_dma_heartbeat_pusher()
         if not self._ready.wait(timeout=30):
             raise RuntimeError("BookWatcher runtime failed to start")
 
@@ -243,6 +304,7 @@ class BookWatcherRuntime:
         )
 
     def stop(self) -> None:
+        stop_dma_heartbeat_pusher()
         if self._loop is None:
             return
         future = asyncio.run_coroutine_threadsafe(self._async_stop(), self._loop)

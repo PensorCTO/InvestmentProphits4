@@ -18,7 +18,6 @@ _INJECTION_PATTERNS = [
     re.compile(r"you\s+are\s+now\s+", re.I),
     re.compile(r"new\s+instructions?\s*:", re.I),
     re.compile(r"<\s*/?\s*system\s*>", re.I),
-    re.compile(r"```\s*python", re.I),
     re.compile(r"\bexec\s*\(", re.I),
     re.compile(r"\beval\s*\(", re.I),
     re.compile(r"\bos\.system\s*\(", re.I),

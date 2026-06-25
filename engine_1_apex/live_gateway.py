@@ -309,3 +309,11 @@ class LiveGateway:
             "status": "REJECTED",
             "reason": "prime_live_lane_not_implemented",
         }
+
+
+def request_emergency_cancel_all(gateway) -> None:
+    """Best-effort live halt hook when BookWatcher silence triggers emergency stop."""
+    logger.critical(
+        "LIVE emergency cancel requested — execution halted (no CLOB cancel-all API wired)"
+    )
+    del gateway

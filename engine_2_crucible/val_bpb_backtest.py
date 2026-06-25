@@ -123,7 +123,7 @@ def _score_samples(
     mae_values: list[float] = []
     slippage_stress_mult = float(os.getenv("BACKTEST_SLIPPAGE_STRESS_MULT", "2.0"))
 
-    for state, resolution in samples:
+    for state, resolution, _ts in samples:
         decision = evaluate_market(state)
         if decision == "HOLD":
             continue

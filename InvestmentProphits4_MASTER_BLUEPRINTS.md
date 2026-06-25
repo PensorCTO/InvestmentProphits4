@@ -1,6 +1,6 @@
 # InvestmentProphits4 — Master Blueprints
 
-**Version:** June 2026 checkpoint (QA audit remediation, oracle circuit breaker, deployment headroom tuning, dual-engine Turso/libSQL arena, Karpathy AutoResearch Crucible, Apex Edge execution, Streamlit Command Center, trader health stoppage detection, live Polymarket CLOB when `EDGE_MODEL_MOCKED=false`)  
+**Version:** June 2026 checkpoint (async guardrails, DMA heartbeat telemetry, churn lockout, shadow Welch promotion, tri-state regime + HMM runtime levers, QA audit remediation, dual-engine Turso/libSQL arena, Karpathy AutoResearch Crucible, Apex Edge execution, Streamlit Command Center, live Polymarket CLOB when `EDGE_MODEL_MOCKED=false`)  
 **Scope:** Paper-first Polymarket-inspired binary prediction market trading with optional LIVE execution scaffold. No real capital unless explicitly switched to LIVE mode with wallet keys.
 
 This document describes **what IP4 is**, **how it works end-to-end**, and **exactly what the trading strategy is** — from oracle snapshots through Crucible research, Apex paper fills, dashboard control plane, and observability. It reflects the codebase as implemented at this checkpoint, not aspirational backlog.
@@ -94,7 +94,7 @@ Lineage: conceptual descendant of IP2/IP3 agent arenas, but **standalone codebas
 
 1. Oracle worker writes `trade_exhaust` payload (per-market CLOB mid, spread, depth, overlays). BookWatcher debounces writes to `book_buffer`; oracle circuit breaker can halt ingest on sustained failures.
 2. Load `active_strategy.python_source` from Turso → `evaluate_market(state)` per market.
-3. Entry gates **before** signal count: entry cooldown, stop-loss cooldown, per-market max legs, portfolio-wide `APEX_MAX_LADDER_LEGS` via `count_agent_open_legs()`.
+3. Entry gates **before** signal count: entry cooldown, stop-loss cooldown, alpha-decay **churn lockout** (`churn_lockout.py`), per-market max legs, portfolio-wide `APEX_MAX_LADDER_LEGS` via `count_agent_open_legs()`.
 4. Fair value + net edge vs `APEX_MIN_NET_EDGE` (default 0.015; exploration 0.008 only when `APEX_EDGE_MODE=exploration`).
 5. `PaperGateway` simulates fills; updates cash/NAV; ladder + cap checks.
 6. Stoppage detector → `trader_health` row (`dominant_block_reason` includes `fully_deployed`, `edge_gated`, `cap_blocked`, `all_hold`).
@@ -253,6 +253,8 @@ Supervisor opens a **new DB connection each poll tick** to avoid stale Hrana ses
 | Crucible log | `logs/crucible.log` |
 | Supervisor | `logs/supervisor.log` |
 | Dashboard | `logs/dashboard.log`, watchdog `logs/dashboard_watchdog.log` |
+| Tick telemetry | `logs/telemetry.jsonl` — regime, HMM, portfolio utilization, churn lockouts (`shared/telemetry.py`) |
+| DMA heartbeat | `/tmp/.dma_heartbeat` — BookWatcher liveness (1s pusher thread; stale → `SYSTEM_HALTED`) |
 | Streamlit UI | http://127.0.0.1:8501 — Trader Status, Wallet Health, engine PIDs |
 | Trader health audit | `scripts/trader_health_audit.py` (supervisor periodic) |
 
@@ -266,7 +268,7 @@ Dominant block reasons (dashboard / `trader_health`): `fully_deployed`, `cap_blo
 | `scripts/restart_stack.py` | Stop/start stack + optional trade-flow verify |
 | `scripts/stop_stack.py` | Clean shutdown |
 | `scripts/verify_trade_flow.py` | Post-restart buy+sell gate |
-| `scripts/acceptance_gate.py` | Definition-of-done QA |
+| `scripts/acceptance_gate.py` | Definition-of-done QA (`--scope components --verify-telemetry` for jsonl schema) |
 
 ---
 
@@ -313,7 +315,20 @@ Crucible env:
 | Shadow promotion | `strategy_store.shadow_*`, `shadow_strategy_monitor.py` | Crucible soak → Apex 1h edge promote |
 | Alpha-decay rotate | `trade_close.py`, `stoppage.py` | ΔEdge leg ranking + CAP_TRIM partial close |
 | HMM levers | `market_regime_hmm.py`, `runtime_levers.py` | Trending / MeanReverting / Toxic overrides |
+| Async guardrails | `shared/telemetry.py`, `churn_lockout.py`, `shared/stats_utils.py` | DMA heartbeat pusher, alpha-decay re-entry lock, Welch t-test shadow promotion |
 | Algo reference | `IP4_ALGO_BLUEPRINTS.md` | Tunable lever taxonomy for operators |
+
+### Async guardrails (June 2026)
+
+| Component | Module | Role |
+|-----------|--------|------|
+| DMA heartbeat | `shared/telemetry.py` | Background 1s pusher; Apex halts on stale BookWatcher (`DMA_HEARTBEAT_TIMEOUT_S`, grace `DMA_HEARTBEAT_GRACE_S`) |
+| Tick telemetry | `shared/telemetry.py` | Per-tick jsonl: regime score, HMM state/confidence, ladder utilization, active churn lockouts |
+| Churn lockout | `engine_1_apex/churn_lockout.py` | Blocks re-entry for `APEX_CHURN_LOCKOUT_SECONDS` after alpha-decay rotate/trim exits |
+| Cap-trim floor | `trade_close.py` | Skips trim targets below `APEX_CAP_TRIM_MIN_PNL_PCT` unrealized P&L |
+| BookWatcher backpressure | `shared/book_watcher.py` | Throttles poll when persist queue backs up (`BOOKWATCHER_BACKPRESSURE_*`) |
+| Shadow Welch promotion | `shadow_strategy_monitor.py`, `shared/stats_utils.py` | Promote shadow champion when edge delta passes one-tailed Welch t-test (`SHADOW_PROMOTE_MAX_P_VALUE`) |
+| Crucible staleness | `backtest_judge.py` | Reject KEEP when champion age exceeds `CRUCIBLE_STALENESS_DAYS` with time-decay (`CRUCIBLE_TIME_DECAY_LAMBDA`) |
 
 ---
 
@@ -327,6 +342,8 @@ EXECUTION_MODE=paper
 APEX_MAX_LADDER_LEGS=6           # portfolio-wide open-leg budget (default code: 3)
 APEX_MAX_LEGS_PER_MARKET=1       # six markets × one leg
 APEX_CAP_STALL_REMEDIATE_TICKS=6 # idle / cap-stall rotate (~1 min)
+APEX_CHURN_LOCKOUT_SECONDS=1800  # post alpha-decay exit re-entry block
+APEX_CAP_TRIM_MIN_PNL_PCT=-0.04  # skip trim on legs above this unrealized loss
 APEX_THESIS_REENTRY_COOLDOWN_SECONDS=900
 APEX_IDLE_ROTATE_REENTRY_COOLDOWN_SECONDS=900
 APEX_CAP_STALL_ENTRY_COOLDOWN_SECONDS=120
@@ -336,10 +353,15 @@ LIVE_AUDIT_ENABLED=true          # shadow-first live-performance auto-revert
 LIVE_AUDIT_SHADOW=true
 HMM_ENABLED=true
 DMA_ENABLED=true
+DMA_HEARTBEAT_TIMEOUT_S=5
+DMA_HEARTBEAT_GRACE_S=15
 JUDGE_MAX_OOS_MDD=0.10           # hard REVERT on OOS drawdown breach
 SHADOW_PROMOTE_WINDOW_S=3600
+SHADOW_PROMOTE_MIN_SIGNALS=30
+SHADOW_PROMOTE_MAX_P_VALUE=0.05
+CRUCIBLE_STALENESS_DAYS=14
 ORACLE_CB_ENABLED=true
-BACKTEST_MOCK_RESOLUTIONS=true   # backtest judge (independent of live mock)
+BACKTEST_MOCK_RESOLUTIONS=false  # champion SCORE resolved-only; mock for RESEARCH_SCORE only
 IP4_DASHBOARD_PORT=8501
 SUPERVISOR_POLL_SECONDS=3
 ```
@@ -443,6 +465,10 @@ See `.cursor/skills/ip4-stack-lifecycle/SKILL.md` and `agent/wiki/project_wiki.m
 | Thesis re-entry cooldown | `tests/test_thesis_reentry_cooldown.py` |
 | Strategy history revert | `tests/test_strategy_history_revert.py` |
 | Trading activity store | `tests/test_trading_activity_store.py` |
+| Async guardrails | `tests/test_asynchronous_guardrails.py` |
+| Shadow strategy monitor | `tests/test_shadow_strategy_monitor.py` |
+| Market regime HMM | `tests/test_market_regime_hmm.py` |
+| Regime classifier | `tests/test_regime_classifier.py` |
 
 CI (`.github/workflows/test.yml`): pytest on push to `main`; `safety-gates` job runs offline acceptance gate; `security` job runs bandit; preflight blocking (no `|| true`).
 
@@ -452,8 +478,8 @@ CI (`.github/workflows/test.yml`): pytest on push to `main`; `safety-gates` job 
 
 - IP3-style 24-agent quadrant competition in the hot path
 - Prime Apex meta-lanes
-- Fully validated LIVE wallet crucible pass
-- Automatic blueprint LLM sync on every push (manual/workflow_dispatch only)
+- **Production LIVE wallet cutover** — requires `POLYGON_WALLET_*`, RPC latency preflight, `LIVE_AUDIT` shadow soak with zero slope breach, positive true PnL over multi-day soak with **zero** bankruptcy-floor injections, and stable risk-daemon (no sustained Hrana transaction timeouts)
+- Automatic blueprint LLM sync on every push (manual/workflow_dispatch only; sync prompt may be blocked by adversarial filter when repo context is large — use targeted manual edits)
 - Resolved markets in `markets_ledger` during paper (backtest uses synthetic resolutions)
 
 ---
@@ -471,6 +497,7 @@ InvestmentProphits4/
 │   ├── kelly_sizing.py                        ← fractional Kelly
 │   ├── sizing.py                              ← edge gates, ladder caps
 │   ├── trade_close.py                         ← position close + trim
+│   ├── churn_lockout.py                       ← alpha-decay re-entry lock
 │   ├── risk_daemon.py                         ← bracket exits
 │   ├── oracle_sync.py                         ← CLOB + Gamma sync
 │   ├── oracle_circuit_breaker.py              ← ingest failure circuit breaker
@@ -539,8 +566,12 @@ InvestmentProphits4/
 │   ├── polymarket_clob.py                       ← CLOB client
 │   ├── db_lock.py                               ← shared DB lock
 │   ├── book_watcher.py                          ← sub-second CLOB poller
+│   ├── mid_vol_tracker.py                       ← vol spike + async worker
+│   ├── regime_classifier.py                     ← tri-state z-score regime
+│   ├── telemetry.py                             ← DMA heartbeat + tick jsonl
+│   ├── stats_utils.py                           ← Welch t-test for shadow promotion
 │   └── adversarial_filter.py                    ← LLM/news toxicity scan
-├── tests/                                       ← 270+ tests
+├── tests/                                       ← 306+ tests
 └── .github/workflows/
     └── test.yml                                 ← CI: pytest + safety-gates + bandit
 ```
@@ -564,11 +595,11 @@ InvestmentProphits4/
 
 ## 20. Strategy Summary (One Paragraph)
 
-InvestmentProphits4 paper-trades up to ten Polymarket-style binary markets by combining a **Crucible-evolved** `evaluate_market()` strategy (OBI + cross-venue consensus + depth gates at checkpoint) with an **Apex execution stack** that computes fair value from live CLOB mids, enforces synthetic transaction costs and a **0.015 net-edge bar** (exploration 0.008 only when explicitly enabled), and simulates fractional-Kelly ladder entries subject to **portfolio-wide** `APEX_MAX_LADDER_LEGS`, per-market `APEX_MAX_LEGS_PER_MARKET`, and `APEX_MAX_PORTFOLIO_PCT` deployment caps. Oracle snapshots land in `trade_exhaust` with BookWatcher-fed `book_buffer` merge; an **oracle circuit breaker** protects ingest. Stoppage telemetry distinguishes infra health from trading activity (`IDLE`, `STALLED`, `STARVED`) using `actionable_unfilled_signals` — edge-gated and cooldown-blocked signals must not inflate false STALLED states. Idle and fully-deployed rotation redeploys idle cash when strategy is HOLD-heavy. Crucible quarantines LLM proposals in `strategy_proposals`, scores KEEP candidates with Sharpe-slope and friction-aware judges, and optionally shadows live champion drift via `live_performance_monitor`. Adversarial filtering guards DeepSeek and news inputs. The acceptance gate and CI safety-gates validate schema, engines, trade flow, and blueprint consistency before handoff.
+InvestmentProphits4 paper-trades up to ten Polymarket-style binary markets by combining a **Crucible-evolved** `evaluate_market()` strategy (OBI + cross-venue consensus + depth gates at checkpoint) with an **Apex execution stack** that computes fair value from live CLOB mids, enforces synthetic transaction costs and a **0.015 net-edge bar** (exploration 0.008 only when explicitly enabled), and simulates fractional-Kelly ladder entries subject to **portfolio-wide** `APEX_MAX_LADDER_LEGS`, per-market `APEX_MAX_LEGS_PER_MARKET`, and `APEX_MAX_PORTFOLIO_PCT` deployment caps. Oracle snapshots land in `trade_exhaust` with BookWatcher-fed `book_buffer` merge and **DMA heartbeat** liveness; an **oracle circuit breaker** protects ingest. **Tri-state regime** classification (GOOD/CAUTION/POOR_LIQUIDITY) and **HMM runtime levers** adjust edge and sizing. Stoppage telemetry distinguishes infra health from trading activity (`IDLE`, `STALLED`, `STARVED`) using `actionable_unfilled_signals` — edge-gated and cooldown-blocked signals must not inflate false STALLED states. Idle and fully-deployed rotation redeploys idle cash when strategy is HOLD-heavy; **alpha-decay churn lockout** blocks destructive re-entry loops after rotate exits. Crucible quarantines LLM proposals in `strategy_proposals`, scores KEEP candidates with walk-forward Sortino + OOS MDD gates, promotes shadow champions via Welch t-test edge comparison, and optionally shadows live champion drift via `live_performance_monitor`. Per-tick **telemetry jsonl** exports regime/HMM/portfolio state for soak audits. Adversarial filtering guards DeepSeek and news inputs. The acceptance gate and CI safety-gates validate schema, engines, trade flow, telemetry schema, and blueprint consistency before handoff.
 
 ---
 
-*Manual engineering sync 2026-06-24 (QA audit remediation, deployment tuning, stoppage fixes).*
+*Manual engineering sync 2026-06-25 (async guardrails, telemetry, churn lockout, shadow Welch promotion, live-wallet readiness criteria).*
 
 *This document reflects the IP4 codebase at checkpoint June 2026. For session-level engineering notes see `agent/wiki/project_wiki.md`. Prior art: `../InvestmentProphits3/InvestmentProphits3_MASTER_BLUEPRINTS.md`.*
 

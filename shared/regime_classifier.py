@@ -33,8 +33,24 @@ def regime_score_recover() -> float:
     return _env_float("REGIME_SCORE_RECOVER", "40")
 
 
+def regime_weight_spread() -> float:
+    return _env_float("REGIME_WEIGHT_SPREAD", "60.0")
+
+
+def regime_weight_depth() -> float:
+    return _env_float("REGIME_WEIGHT_DEPTH", "40.0")
+
+
 def regime_recover_ticks() -> int:
     return int(os.getenv("REGIME_RECOVER_TICKS", "3"))
+
+
+def regime_caution_low() -> float:
+    return _env_float("REGIME_SCORE_RECOVER", "40")
+
+
+def regime_caution_high() -> float:
+    return _env_float("REGIME_SCORE_TRIP", "80")
 
 
 @dataclass
@@ -45,6 +61,7 @@ class RegimeResult:
     regime_score: float = 0.0
     spread_z: float = 0.0
     depth_z: float = 0.0
+    sizing_downscale: float = 1.0
 
 
 @dataclass
@@ -65,6 +82,39 @@ class RegimeStateTracker:
 
     def __init__(self) -> None:
         self._markets: dict[str, _MarketRegimeState] = {}
+        self._hmm_override_active = False
+        self._hmm_non_toxic_streak = 0
+
+    def apply_hmm_toxic_override(
+        self,
+        *,
+        hmm_state: str,
+        p_toxic: float,
+        low_confidence: bool,
+    ) -> None:
+        """Compress recovery boundary when HMM decodes Toxic with high confidence."""
+        if low_confidence:
+            return
+        if hmm_state == "Toxic" and p_toxic >= 0.85:
+            self._hmm_override_active = True
+            self._hmm_non_toxic_streak = 0
+            return
+        if hmm_state != "Toxic":
+            self._hmm_non_toxic_streak += 1
+            if self._hmm_non_toxic_streak >= 3:
+                self._hmm_override_active = False
+        else:
+            self._hmm_non_toxic_streak = 0
+
+    @property
+    def hmm_override_active(self) -> bool:
+        return self._hmm_override_active
+
+    def effective_recover_threshold(self) -> float:
+        base = regime_score_recover()
+        if self._hmm_override_active:
+            return base * 0.50
+        return base
 
     def _state(self, market_id: str) -> _MarketRegimeState:
         return self._markets.setdefault(market_id, _MarketRegimeState())
@@ -74,11 +124,33 @@ class RegimeStateTracker:
         *,
         spread_z: float,
         depth_z: float,
-        ephemeral: float,
-        liq_q: float,
+        ephemeral: float = 0.0,
+        liq_q: float = 0.5,
     ) -> float:
-        raw = 50.0 + 15.0 * spread_z - 10.0 * depth_z + 20.0 * ephemeral + 10.0 * (1.0 - liq_q)
+        del ephemeral, liq_q
+        w_s = regime_weight_spread()
+        w_d = regime_weight_depth()
+        raw = w_s * spread_z - w_d * depth_z
         return max(0.0, min(100.0, raw))
+
+    @staticmethod
+    def classify_band(score: float) -> str:
+        if score > regime_caution_high():
+            return "POOR_LIQUIDITY"
+        if score >= regime_caution_low():
+            return "CAUTION"
+        return "GOOD"
+
+    @staticmethod
+    def caution_downscale(score: float) -> float:
+        low = regime_caution_low()
+        high = regime_caution_high()
+        if score <= low:
+            return 1.0
+        if score >= high:
+            return 0.25
+        progress = (score - low) / max(high - low, 1e-6)
+        return 1.0 - progress * 0.75
 
     def update(
         self,
@@ -123,12 +195,13 @@ class RegimeStateTracker:
         if depth < depth_floor:
             reasons.append("thin_book")
 
+        recover_threshold = self.effective_recover_threshold()
         if not ms.poor_liquidity:
             if score > regime_score_trip():
                 ms.poor_liquidity = True
                 ms.recover_streak = 0
         else:
-            if score < regime_score_recover():
+            if score < recover_threshold:
                 ms.recover_streak += 1
                 if ms.recover_streak >= regime_recover_ticks():
                     ms.poor_liquidity = False
@@ -136,17 +209,23 @@ class RegimeStateTracker:
             else:
                 ms.recover_streak = 0
 
-        regime = "POOR_LIQUIDITY" if ms.poor_liquidity else "NORMAL"
+        band = self.classify_band(score)
         if ms.poor_liquidity:
+            band = "POOR_LIQUIDITY"
             reasons.append(f"regime_score={score:.1f}")
 
+        downscale = 1.0
+        if band == "CAUTION" and not ms.poor_liquidity:
+            downscale = self.caution_downscale(score)
+
         return RegimeResult(
-            regime=regime,
-            poor_liquidity=ms.poor_liquidity,
+            regime=band,
+            poor_liquidity=ms.poor_liquidity or band == "POOR_LIQUIDITY",
             reasons=reasons,
             regime_score=score,
             spread_z=spread_z,
             depth_z=depth_z,
+            sizing_downscale=downscale,
         )
 
 

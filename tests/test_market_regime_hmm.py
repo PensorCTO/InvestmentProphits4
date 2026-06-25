@@ -40,11 +40,14 @@ def test_hmm_decode_returns_known_state():
     import numpy as np
 
     state = decoder.decode(np.array([0.2, 0.1, 0.5, 0.2, 0.4]))
-    assert state in ("Trending", "MeanReverting", "Toxic")
+    assert state.state in ("Trending", "MeanReverting", "Toxic")
 
 
 def test_decode_market_regime_empty():
-    assert decode_market_regime([]) in ("Trending", "MeanReverting", "Toxic")
+    from engine_1_apex.market_regime_hmm import decode_market_regime_full
+
+    result = decode_market_regime_full([])
+    assert result.state in ("Trending", "MeanReverting", "Toxic")
 
 
 def test_levers_for_toxic_state():

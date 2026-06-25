@@ -40,6 +40,37 @@ def cap_trim_min_edge_mult() -> float:
     return float(os.getenv("APEX_CAP_TRIM_MIN_EDGE_MULT", "2.0"))
 
 
+def cap_trim_min_pnl_pct() -> float:
+    return float(os.getenv("APEX_CAP_TRIM_MIN_PNL_PCT", "-0.04"))
+
+
+_ALPHA_DECAY_EXIT_REASONS = frozenset(
+    {
+        "PORTFOLIO_CAP_ROTATE",
+        "FULLY_DEPLOYED_ROTATE",
+        "IDLE_ROTATE",
+        "CAP_REBALANCE",
+    }
+)
+
+
+def _maybe_record_churn_lockout(market_id: str, exit_reason: str) -> None:
+    if exit_reason in _ALPHA_DECAY_EXIT_REASONS:
+        from engine_1_apex.churn_lockout import record_alpha_decay_exit
+
+        record_alpha_decay_exit(market_id)
+
+
+def _leg_unrealized_pnl_pct(leg: LegRank) -> float:
+    exit_price = mark_to_market_exit_price(
+        leg.direction, leg.market_mid, leg.liquidity_tier, leg.kelly_size
+    )
+    pnl = calculate_pnl(leg.entry_price, exit_price, leg.kelly_size)
+    if leg.kelly_size <= 0:
+        return 0.0
+    return pnl / leg.kelly_size
+
+
 def calculate_pnl(entry_price: float, exit_price: float, size: float) -> float:
     shares = size / entry_price
     gross_return = shares * exit_price
@@ -381,6 +412,7 @@ def close_worst_alpha_decay_leg(
         entry_context=leg.entry_context,
         exit_reason=exit_reason,
     )
+    _maybe_record_churn_lockout(leg.market_id, exit_reason)
     return True, leg.market_id, leg.direction, leg.market_mid
 
 
@@ -413,6 +445,7 @@ def close_worst_alpha_decay_market_leg(
                 entry_context=leg.entry_context,
                 exit_reason=exit_reason,
             )
+            _maybe_record_churn_lockout(market_id, exit_reason)
             return True
     return False
 
@@ -434,7 +467,10 @@ def cap_trim_worst_hold_legs(
     hold_legs = [leg for leg in ranked if leg.market_id in hold_set]
     target = n_legs if n_legs is not None else cap_trim_min_legs()
     trimmed = 0
+    min_pnl = cap_trim_min_pnl_pct()
     for leg in hold_legs[:target]:
+        if _leg_unrealized_pnl_pct(leg) < min_pnl:
+            continue
         trim_leg_fraction(conn, agent_id=agent_id, leg=leg, fraction=fraction)
         trimmed += 1
     return trimmed

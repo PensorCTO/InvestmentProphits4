@@ -99,6 +99,29 @@ def _deployment_rotate_min_legs_met(stats: TickStats) -> bool:
     return stats.open_legs >= fully_deployed_rotate_min_open_legs(max_legs)
 
 
+def _is_idle_deployed_cap_stall(stats: TickStats) -> bool:
+    """
+    True when max-legs cap blocks new entries, cash is idle, and nothing actionable
+    can fill. all_hold (strategy-wide HOLD) uses a lower open-leg bar than
+    fully_deployed so post-reset wallets with sparse legs can still rotate.
+    """
+    if stats.cash < stats.min_ladder_usd:
+        return False
+    if actionable_unfilled_signals(stats) > 0:
+        return False
+    if not (stats.cap_reasons or {}).get("max_legs_per_market"):
+        return False
+    if stats.open_legs <= 0:
+        return False
+    reason = derive_dominant_block_reason(stats)
+    if reason == "fully_deployed":
+        return _deployment_rotate_min_legs_met(stats)
+    # Strategy HOLD / edge-gated / cap-blocked with idle cash — rotate a leg.
+    if reason in ("all_hold", "cap_blocked", "edge_gated"):
+        return True
+    return False
+
+
 def stoppage_threshold_ticks() -> int:
     return int(os.getenv("APEX_STOPPAGE_TICKS", "6"))
 
@@ -108,7 +131,8 @@ def trading_stall_ticks() -> int:
 
 
 def cap_stall_remediate_ticks() -> int:
-    return int(os.getenv("APEX_CAP_STALL_REMEDIATE_TICKS", "18"))
+    default = "6" if _paper_execution() else "18"
+    return int(os.getenv("APEX_CAP_STALL_REMEDIATE_TICKS", default))
 
 
 def cap_stall_entry_cooldown_seconds() -> int:
@@ -126,10 +150,16 @@ def _paper_execution() -> bool:
 
 
 def actionable_unfilled_signals(stats: TickStats) -> int:
-    """Signals that could still fill this tick (exclude edge-gated)."""
+    """Signals that could still fill this tick (exclude edge/cooldown/toxicity rejects)."""
     if stats.filled > 0:
         return 0
-    return max(0, stats.signals - stats.skipped_edge)
+    blocked = (
+        stats.skipped_edge
+        + stats.rejected
+        + stats.skipped_cooldown
+        + stats.skipped_toxicity
+    )
+    return max(0, stats.signals - blocked)
 
 
 def is_cap_stall_tick(stats: TickStats) -> bool:
@@ -144,15 +174,11 @@ def is_cap_stall_tick(stats: TickStats) -> bool:
         )
     if not cap_keys.get("max_legs_per_market"):
         return False
+    if _is_idle_deployed_cap_stall(stats):
+        return True
     reason = derive_dominant_block_reason(stats)
     if reason == "fully_deployed":
-        # Deployed with idle cash and no actionable entries — rotate a HOLD leg.
-        if not _deployment_rotate_min_legs_met(stats):
-            return False
-        return (
-            stats.cash >= stats.min_ladder_usd
-            and actionable_unfilled_signals(stats) == 0
-        )
+        return False
     return True
 
 
@@ -469,15 +495,7 @@ def thesis_reentry_cooldown_seconds() -> int:
 
 def should_remediate_idle_deployment(stats: TickStats) -> bool:
     """True when max legs are deployed, cash is idle, and no signal can fill."""
-    if not (stats.cap_reasons or {}).get("max_legs_per_market"):
-        return False
-    if stats.cash < stats.min_ladder_usd:
-        return False
-    if actionable_unfilled_signals(stats) > 0:
-        return False
-    if not _deployment_rotate_min_legs_met(stats):
-        return False
-    return derive_dominant_block_reason(stats) == "fully_deployed"
+    return _is_idle_deployed_cap_stall(stats)
 
 
 def remediate_idle_deployment(
@@ -575,15 +593,7 @@ def remediate_portfolio_cap(
 
 def should_remediate_fully_deployed(stats: TickStats) -> bool:
     """Rotate smallest leg when max legs are deployed, cash is idle, and nothing can fill."""
-    if stats.cash < stats.min_ladder_usd:
-        return False
-    if actionable_unfilled_signals(stats) > 0:
-        return False
-    if not (stats.cap_reasons or {}).get("max_legs_per_market"):
-        return False
-    if not _deployment_rotate_min_legs_met(stats):
-        return False
-    return derive_dominant_block_reason(stats) == "fully_deployed"
+    return _is_idle_deployed_cap_stall(stats)
 
 
 def remediate_fully_deployed(
@@ -681,9 +691,10 @@ def persist_trader_health(
     detail: str,
     consecutive: int,
     commit: bool = False,
+    trading_status_override: str | None = None,
 ) -> None:
     dominant_block_reason = derive_dominant_block_reason(stats)
-    trading_status = derive_trading_status(
+    trading_status = trading_status_override or derive_trading_status(
         stats, zero_fill_streak=tracker.zero_fill_streak
     )
     minutes_since = tracker.minutes_since_last_fill()

@@ -1290,6 +1290,20 @@ def migrate_qa_audit_tables(conn) -> bool:
         )
         changed = True
 
+    if not _table_exists(conn, "regime_transitions"):
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS regime_transitions (
+                timestamp INTEGER NOT NULL,
+                previous_state TEXT NOT NULL,
+                new_state TEXT NOT NULL,
+                confidence_delta REAL NOT NULL,
+                spread_z_score REAL NOT NULL
+            )
+            """
+        )
+        changed = True
+
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_audit_events_created

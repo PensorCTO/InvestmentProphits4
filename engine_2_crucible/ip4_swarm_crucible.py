@@ -102,7 +102,7 @@ def _sanity_check_proposal(proposed: str, *, min_trades: int = 5) -> tuple[bool,
         )
 
     trades = 0
-    for state, _resolution in samples[:500]:
+    for state, _resolution, _ts in samples[:500]:
         if evaluate(state) != "HOLD":
             trades += 1
             if trades >= min_trades:

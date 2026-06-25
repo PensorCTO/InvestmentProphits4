@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
 
 STATES = ("Trending", "MeanReverting", "Toxic")
+CONFIDENCE_DELTA_MIN = 0.15
 
 
 def hmm_enabled() -> bool:
@@ -20,6 +22,16 @@ def hmm_persist_ticks() -> int:
 
 
 @dataclass
+class HMMDecodeResult:
+    state: str
+    posterior: np.ndarray
+    confidence_delta: float
+    low_confidence: bool
+    previous_state: str
+    transitioned: bool
+
+
+@dataclass
 class HMMState:
     """Online HMM decoder with state persistence."""
 
@@ -28,7 +40,8 @@ class HMMState:
     pending_state: str | None = None
     pending_count: int = 0
 
-    def decode(self, features: np.ndarray) -> str:
+    def decode(self, features: np.ndarray) -> HMMDecodeResult:
+        previous = self.decoded_state
         transition = np.array(
             [
                 [0.85, 0.10, 0.05],
@@ -58,25 +71,38 @@ class HMMState:
         else:
             self.alpha = np.array([1 / 3, 1 / 3, 1 / 3])
 
-        idx = int(np.argmax(self.alpha))
+        sorted_idx = np.argsort(self.alpha)[::-1]
+        confidence_delta = float(self.alpha[sorted_idx[0]] - self.alpha[sorted_idx[1]])
+        low_confidence = confidence_delta < CONFIDENCE_DELTA_MIN
+
+        idx = int(sorted_idx[0])
         candidate = STATES[idx]
 
         if candidate == self.decoded_state:
             self.pending_state = None
             self.pending_count = 0
-            return self.decoded_state
-
-        if candidate == self.pending_state:
+            state = self.decoded_state
+        elif candidate == self.pending_state:
             self.pending_count += 1
+            if self.pending_count >= hmm_persist_ticks():
+                self.decoded_state = candidate
+                self.pending_state = None
+                self.pending_count = 0
+            state = self.decoded_state
         else:
             self.pending_state = candidate
             self.pending_count = 1
+            state = self.decoded_state
 
-        if self.pending_count >= hmm_persist_ticks():
-            self.decoded_state = candidate
-            self.pending_state = None
-            self.pending_count = 0
-        return self.decoded_state
+        transitioned = state != previous
+        return HMMDecodeResult(
+            state=state,
+            posterior=self.alpha.copy(),
+            confidence_delta=confidence_delta,
+            low_confidence=low_confidence,
+            previous_state=previous,
+            transitioned=transitioned,
+        )
 
 
 _DECODER = HMMState()
@@ -127,8 +153,94 @@ def aggregate_portfolio_features(market_states: list[dict]) -> np.ndarray:
     )
 
 
-def decode_market_regime(market_states: list[dict]) -> str:
+def _portfolio_spread_z(market_states: list[dict]) -> float:
+    if not market_states:
+        return 0.0
+    vals = []
+    for state in market_states:
+        spread = float(state.get("spread", 0.03))
+        tier = state.get("liquidity_tier", "MED_LIQUIDITY")
+        from shared.poly_costs import PolyCostModel
+
+        tier_spread = PolyCostModel.TIER_SPREADS.get(tier, 0.035)
+        vals.append(spread / max(tier_spread, 1e-6))
+    return sum(vals) / len(vals)
+
+
+def log_regime_transition(
+    conn,
+    *,
+    previous_state: str,
+    new_state: str,
+    confidence_delta: float,
+    spread_z_score: float,
+    commit: bool = False,
+) -> None:
+    try:
+        conn.execute(
+            """
+            INSERT INTO regime_transitions
+                (timestamp, previous_state, new_state, confidence_delta, spread_z_score)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                int(time.time()),
+                previous_state,
+                new_state,
+                confidence_delta,
+                spread_z_score,
+            ),
+        )
+        if commit:
+            from database.replica_store import commit_local
+
+            commit_local(conn)
+    except Exception:
+        pass
+
+
+def decode_market_regime(
+    market_states: list[dict],
+    *,
+    conn=None,
+) -> str:
     if not hmm_enabled():
         return "Trending"
     features = aggregate_portfolio_features(market_states)
-    return _DECODER.decode(features)
+    result = _DECODER.decode(features)
+    if conn is not None and result.transitioned and not result.low_confidence:
+        log_regime_transition(
+            conn,
+            previous_state=result.previous_state,
+            new_state=result.state,
+            confidence_delta=result.confidence_delta,
+            spread_z_score=_portfolio_spread_z(market_states),
+        )
+    return result.state
+
+
+def decode_market_regime_full(
+    market_states: list[dict],
+    *,
+    conn=None,
+) -> HMMDecodeResult:
+    if not hmm_enabled():
+        return HMMDecodeResult(
+            state="Trending",
+            posterior=np.array([1 / 3, 1 / 3, 1 / 3]),
+            confidence_delta=1.0,
+            low_confidence=False,
+            previous_state="Trending",
+            transitioned=False,
+        )
+    features = aggregate_portfolio_features(market_states)
+    result = _DECODER.decode(features)
+    if conn is not None and result.transitioned and not result.low_confidence:
+        log_regime_transition(
+            conn,
+            previous_state=result.previous_state,
+            new_state=result.state,
+            confidence_delta=result.confidence_delta,
+            spread_z_score=_portfolio_spread_z(market_states),
+        )
+    return result
