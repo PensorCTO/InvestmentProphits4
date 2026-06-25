@@ -72,6 +72,23 @@ def test_analyze_session_churn_counts_same_tick_events():
     assert metrics.same_tick_churn_ticks == 1
 
 
+def test_guard_activates_on_cross_market_rotate_cadence(monkeypatch):
+    monkeypatch.setenv("APEX_CAP_CHURN_GUARD", "true")
+    monkeypatch.setenv("APEX_CAP_CHURN_CROSS_MARKET_WINDOW_SECONDS", "900")
+    monkeypatch.setenv("APEX_CAP_CHURN_MIN_CROSS_MARKET_ROTATES", "3")
+    monkeypatch.setenv("APEX_CAP_CHURN_MIN_ROTATE_FILL_PAIRS", "99")
+    guard = CapChurnGuard()
+
+    guard.note_market_rebalance("mkt_recession")
+    guard.note_market_fill("mkt_recession")
+    guard.note_market_rebalance("mkt_ukraine_peace")
+    guard.note_market_fill("mkt_ukraine_peace")
+    guard.note_market_rebalance("mkt_oil_100")
+    assert guard.note_market_fill("mkt_oil_100") is True
+    assert guard.blocks_new_entries() is True
+    assert "cross-market rotate churn" in guard.last_activation_detail
+
+
 def test_session_looks_like_cap_churn():
     churny = SessionChurnMetrics(
         buy_count=20,

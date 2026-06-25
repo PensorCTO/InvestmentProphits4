@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from engine_2_crucible.backtest_corpus import flatten_exhaust_rows
+from engine_2_crucible.backtest_judge import evaluate_oos_gates, split_is_oos
 from engine_2_crucible.validate import validation_gate_passed
 from engine_2_crucible.val_bpb_backtest import BACKTEST_MAX_ROWS, _score_samples
 
@@ -23,14 +24,16 @@ def _chronological_split(
     samples: list[tuple[dict, int]],
     train_fraction: float,
 ) -> tuple[list, list, list]:
+    """80/20 IS/OOS split; optional hidden holdout when WALK_FORWARD_HIDDEN_FRACTION > 0."""
+    hidden_frac = float(os.getenv("WALK_FORWARD_HIDDEN_FRACTION", "0"))
+    train, oos = split_is_oos(samples, train_fraction)
+    if not oos or hidden_frac <= 0:
+        return train, oos, []
     n = len(samples)
-    if n < 10:
-        return samples, [], []
+    holdout_end = int(n * (1.0 - hidden_frac))
     train_end = int(n * train_fraction)
-    holdout_end = int(n * 0.9)
-    train = samples[:train_end]
-    oos = samples[train_end:holdout_end]
-    hidden = samples[holdout_end:]
+    hidden = samples[holdout_end:] if holdout_end > train_end else []
+    oos = samples[train_end:holdout_end] if holdout_end > train_end else oos
     return train, oos, hidden
 
 
@@ -79,8 +82,22 @@ def run_walk_forward_pipeline(
     if not oos:
         return WalkForwardResult(passed=False, stage="split", detail="empty OOS split")
 
-    train_score, train_trades, _, _ = _score_samples(train, evaluate_market)
-    oos_score, oos_trades, _, _ = _score_samples(oos, evaluate_market)
+    train_score, train_trades, _, is_returns = _score_samples(train, evaluate_market)
+    oos_score, oos_trades, oos_mdd, oos_returns = _score_samples(oos, evaluate_market)
+
+    oos_verdict = evaluate_oos_gates(is_returns, oos_returns)
+    if not oos_verdict.passed:
+        return WalkForwardResult(
+            passed=False,
+            stage="oos_gates",
+            detail=(
+                f"{oos_verdict.reason} "
+                f"(is_sortino={oos_verdict.is_sortino:.4f} "
+                f"oos_sortino={oos_verdict.oos_sortino:.4f} "
+                f"oos_mdd={oos_verdict.oos_mdd:.4f})"
+            ),
+        )
+
     if oos_trades == 0:
         return WalkForwardResult(
             passed=False,

@@ -63,4 +63,10 @@ def compute_fractional_kelly(
     if raw <= 0.0:
         return 0.0
     scaled = raw * _edge_slope_scale(edge_slope)
-    return _clamp(scaled, 0.0, max_fractional_kelly())
+    try:
+        from engine_1_apex.runtime_levers import active_max_fractional_kelly
+
+        cap = active_max_fractional_kelly()
+    except ImportError:
+        cap = max_fractional_kelly()
+    return _clamp(scaled, 0.0, cap)

@@ -40,7 +40,12 @@ from database.replica_store import open_replica, request_cloud_sync, sync_replic
 from database.strategy_store import (
     read_active_strategy_source,
     read_active_strategy_version,
+    read_shadow_strategy,
     seed_active_strategy_if_empty,
+)
+from engine_1_apex.shadow_strategy_monitor import (
+    evaluate_shadow_promotion,
+    record_shadow_tick,
 )
 from engine_1_apex.execution.controls import (
     clear_execution_halt,
@@ -65,11 +70,20 @@ from engine_1_apex.sizing import (
     resolve_min_net_edge,
 )
 from engine_1_apex.oracle_sync import _ensure_schema_once, _maybe_auto_map_clob, sync_cycle
+from engine_1_apex.market_regime_hmm import decode_market_regime
+from engine_1_apex.runtime_levers import (
+    active_max_portfolio_pct,
+    active_min_net_edge,
+    levers_for_hmm_state,
+    set_active_levers,
+)
 from engine_1_apex.risk_daemon import RiskDaemon
 from engine_1_apex.cap_churn_guard import CapChurnGuard, cap_churn_cooldown_seconds
 from engine_1_apex.stoppage import (
+    RotateReentrySnapshot,
     StoppageTracker,
     TickStats,
+    blocks_fully_deployed_rotate_reentry,
     cap_stall_remediation_paused,
     cap_stall_entry_cooldown_seconds,
     cap_stall_remediate_ticks,
@@ -78,11 +92,13 @@ from engine_1_apex.stoppage import (
     thesis_reentry_cooldown_seconds,
     persist_trader_health,
     remediate_cap_stall,
+    remediate_cap_trim,
     remediate_fully_deployed,
     remediate_idle_deployment,
     remediate_portfolio_cap,
     remediate_stoppage,
     should_remediate_cap_stall,
+    should_cap_trim,
     should_remediate_fully_deployed,
     should_remediate_idle_deployment,
     should_remediate_portfolio_cap,
@@ -212,12 +228,15 @@ class ApexEdgeEngine:
         self.risk = RiskDaemon()
         self._cached_version = -1
         self._evaluate_fn = None
+        self._shadow_evaluate_fn = None
+        self._shadow_source: str | None = None
         self._signals_enabled = True
         self._mode_swap_in_progress = False
         self._stoppage = StoppageTracker()
         self._hold_streak: dict[str, int] = {}
         self._remediate_cooldown_until: dict[str, float] = {}
         self._idle_rotate_reentry_until: dict[str, float] = {}
+        self._fully_deployed_rotate_snapshot: dict[str, RotateReentrySnapshot] = {}
         self._churn_guard = CapChurnGuard()
         self._book_watcher_runtime = None
 
@@ -443,6 +462,24 @@ class ApexEdgeEngine:
         self._cached_version = version
         return self._evaluate_fn
 
+    def _load_shadow_evaluate_fn(self, conn):
+        shadow = read_shadow_strategy(conn)
+        if not shadow or not shadow.get("python_source"):
+            self._shadow_evaluate_fn = None
+            self._shadow_source = None
+            return None
+        source = str(shadow["python_source"])
+        if self._shadow_evaluate_fn is not None and source == self._shadow_source:
+            return self._shadow_evaluate_fn
+        try:
+            self._shadow_evaluate_fn = load_evaluate_market_from_source(source)
+            self._shadow_source = source
+        except StrategyLoadError as exc:
+            logger.warning("Shadow strategy load failed: %s", exc)
+            self._shadow_evaluate_fn = None
+            self._shadow_source = None
+        return self._shadow_evaluate_fn
+
     def _run_oracle_loop(self) -> None:
         _ensure_schema_once()
         _maybe_auto_map_clob()
@@ -519,6 +556,8 @@ class ApexEdgeEngine:
                     return
 
                 run_live_audit_tick(conn)
+                evaluate_shadow_promotion(conn)
+                shadow_fn = self._load_shadow_evaluate_fn(conn)
 
                 snapshot, _ = get_fresh_snapshot(conn)
                 if snapshot is None:
@@ -540,6 +579,20 @@ class ApexEdgeEngine:
                         enriched_market_data[mid] = blob
                 market_data = enriched_market_data
 
+                portfolio_states: list[dict] = []
+                for mid, data in market_data.items():
+                    if not isinstance(data, dict):
+                        continue
+                    st = build_market_state(mid, data)
+                    if self._book_watcher_runtime is not None:
+                        stack = self._book_watcher_runtime.watcher.get_by_market(mid)
+                        if stack is not None:
+                            st = enrich_state_from_signal_stack(st, stack.to_dict())
+                    portfolio_states.append(st)
+                hmm_state = decode_market_regime(portfolio_states)
+                set_active_levers(levers_for_hmm_state(hmm_state))
+                logger.debug("HMM regime=%s levers active", hmm_state)
+
                 sizing = load_agent_sizing_snapshot(conn, APEX_AGENT_ID)
                 if not sizing:
                     logger.warning("Apex agent %s not active — skip tick", APEX_AGENT_ID)
@@ -547,7 +600,7 @@ class ApexEdgeEngine:
                 cash = sizing["cash"]
                 nav = sizing["nav"]
                 open_notional = sizing["open_notional"]
-                min_net_edge = effective_min_net_edge()
+                min_net_edge = active_min_net_edge()
                 mode = str(controls.get("active_execution_mode", "PAPER"))
                 if maybe_restore_bankruptcy_capital(
                     conn,
@@ -579,6 +632,8 @@ class ApexEdgeEngine:
                 cap_reasons: dict[str, int] = {}
                 cap_stall_rows: list[tuple[str, str, float, str]] = []
                 idle_rotation_rows: list[tuple[str, str, float, str]] = []
+                cap_trim_pending_kelly = 0.0
+                cap_trim_pending_edge = 0.0
                 for market_id, data in market_data.items():
                     if not isinstance(data, dict):
                         continue
@@ -589,7 +644,7 @@ class ApexEdgeEngine:
                         if stack is not None:
                             state = enrich_state_from_signal_stack(state, stack.to_dict())
 
-                    hold_regime, regime_reason = circuit_breaker_holds(state)
+                    hold_regime, regime_reason = circuit_breaker_holds(state, market_id=market_id)
                     if hold_regime:
                         skipped_hold += 1
                         continue
@@ -738,6 +793,35 @@ class ApexEdgeEngine:
                                 liq_tier,
                             )
                         )
+                        try:
+                            from engine_1_apex.execution_edge import (
+                                boosted_net_edge,
+                                compute_composite_edge,
+                            )
+
+                            preview_mid = float(state.get("mid_price", 0.5))
+                            preview_fv = resolve_execution_fair_value(
+                                conn,
+                                agent_id=APEX_AGENT_ID,
+                                market_blob=data,
+                                state=state,
+                                direction=signal_direction,
+                            )
+                            preview_edge = compute_composite_edge(
+                                fair_value=preview_fv,
+                                market_mid=preview_mid,
+                                direction=signal_direction,
+                                liquidity_tier=liq_tier,
+                                kelly_size=APEX_MIN_LADDER_USD,
+                                capital=nav,
+                                state=state,
+                            )
+                            preview_net = boosted_net_edge(preview_edge)
+                            if preview_net > cap_trim_pending_edge:
+                                cap_trim_pending_edge = preview_net
+                                cap_trim_pending_kelly = APEX_MIN_LADDER_USD
+                        except Exception:
+                            pass
                         continue
 
                     if is_stop_loss_cooldown_active(conn, APEX_AGENT_ID, market_id):
@@ -747,6 +831,31 @@ class ApexEdgeEngine:
                             market_id,
                         )
                         continue
+
+                    rotate_snapshot = self._fully_deployed_rotate_snapshot.get(market_id)
+                    if rotate_snapshot is not None:
+                        preview_mid = float(state.get("mid_price", 0.5))
+                        preview_fv = resolve_execution_fair_value(
+                            conn,
+                            agent_id=APEX_AGENT_ID,
+                            market_blob=data,
+                            state=state,
+                            direction=signal_direction,
+                        )
+                        if blocks_fully_deployed_rotate_reentry(
+                            rotate_snapshot,
+                            signal_direction=signal_direction,
+                            mid=preview_mid,
+                            fair_value=preview_fv,
+                        ):
+                            skipped_cooldown += 1
+                            logger.debug(
+                                "APEX rotate reentry blocked: %s %s unchanged thesis",
+                                market_id,
+                                signal_direction,
+                            )
+                            continue
+                        self._fully_deployed_rotate_snapshot.pop(market_id, None)
 
                     signals += 1
 
@@ -847,6 +956,39 @@ class ApexEdgeEngine:
                         capital=nav,
                         state=state,
                     )
+                    if self._shadow_evaluate_fn is not None:
+                        try:
+                            from engine_1_apex.execution_edge import boosted_net_edge
+
+                            champion_edge = boosted_net_edge(edge_preview)
+                            shadow_decision = self._shadow_evaluate_fn(state)
+                            shadow_edge_val = 0.0
+                            if shadow_decision in ("BUY_YES", "BUY_NO"):
+                                shadow_dir = "YES" if shadow_decision == "BUY_YES" else "NO"
+                                shadow_fv = resolve_execution_fair_value(
+                                    conn,
+                                    agent_id=APEX_AGENT_ID,
+                                    market_blob=data,
+                                    state=state,
+                                    direction=shadow_dir,
+                                )
+                                shadow_preview = compute_composite_edge(
+                                    fair_value=shadow_fv,
+                                    market_mid=mid,
+                                    direction=shadow_dir,
+                                    liquidity_tier=liq_tier,
+                                    kelly_size=APEX_MIN_LADDER_USD,
+                                    capital=nav,
+                                    state=state,
+                                )
+                                shadow_edge_val = boosted_net_edge(shadow_preview)
+                            record_shadow_tick(
+                                conn,
+                                champion_edge=champion_edge,
+                                shadow_edge=shadow_edge_val,
+                            )
+                        except Exception as exc:
+                            logger.debug("Shadow edge compare skipped: %s", exc)
                     kelly_fair = signal_execution_fair(
                         mid, direction, edge_preview.composite_score
                     )
@@ -874,7 +1016,7 @@ class ApexEdgeEngine:
                         market_exposure=exposure,
                         total_open_notional=open_notional,
                         min_ladder_usd=APEX_MIN_LADDER_USD,
-                        portfolio_pct=max_portfolio_pct(),
+                        portfolio_pct=active_max_portfolio_pct(),
                     )
                     if (
                         kelly_size is None
@@ -907,7 +1049,7 @@ class ApexEdgeEngine:
                                 market_exposure=exposure,
                                 total_open_notional=open_notional,
                                 min_ladder_usd=APEX_MIN_LADDER_USD,
-                                portfolio_pct=max_portfolio_pct(),
+                                portfolio_pct=active_max_portfolio_pct(),
                             )
                             logger.info(
                                 "APEX TRIM cash_recycle: %s freed cash for ladder",
@@ -931,7 +1073,7 @@ class ApexEdgeEngine:
                                     cap_reasons.get("churn_guard", 0) + 1
                                 )
                                 continue
-                            closed, _ = close_smallest_open_leg(
+                            closed, _, _, _ = close_smallest_open_leg(
                                 conn,
                                 agent_id=APEX_AGENT_ID,
                                 exit_reason="PORTFOLIO_CAP_ROTATE",
@@ -954,7 +1096,7 @@ class ApexEdgeEngine:
                                     market_exposure=exposure,
                                     total_open_notional=open_notional,
                                     min_ladder_usd=APEX_MIN_LADDER_USD,
-                                    portfolio_pct=max_portfolio_pct(),
+                                    portfolio_pct=active_max_portfolio_pct(),
                                 )
                                 logger.info(
                                     "APEX TRIM portfolio_cap: closed smallest leg for headroom",
@@ -992,7 +1134,7 @@ class ApexEdgeEngine:
                                     market_exposure=exposure,
                                     total_open_notional=open_notional,
                                     min_ladder_usd=APEX_MIN_LADDER_USD,
-                                    portfolio_pct=max_portfolio_pct(),
+                                    portfolio_pct=active_max_portfolio_pct(),
                                 )
                                 logger.info(
                                     "APEX TRIM cap_headroom: %s closed 1 leg for ladder room",
@@ -1084,6 +1226,8 @@ class ApexEdgeEngine:
                     cash=cash,
                     nav=nav,
                     min_ladder_usd=APEX_MIN_LADDER_USD,
+                    open_legs=count_agent_open_legs(conn, APEX_AGENT_ID),
+                    max_ladder_legs=APEX_MAX_LADDER_LEGS,
                     cap_reasons=cap_reasons,
                 )
                 if self._churn_guard.observe(
@@ -1096,6 +1240,35 @@ class ApexEdgeEngine:
                         cap_churn_cooldown_seconds(),
                         self._churn_guard.last_activation_detail,
                     )
+                if (
+                    self._stoppage.cap_blocked_streak >= cap_stall_remediate_ticks()
+                    and should_cap_trim(
+                        tick_stats,
+                        cap_blocked_streak=self._stoppage.cap_blocked_streak,
+                        pending_kelly=cap_trim_pending_kelly,
+                        pending_net_edge=cap_trim_pending_edge,
+                        min_net_edge=min_net_edge,
+                    )
+                ):
+                    hold_ids = [row[0] for row in idle_rotation_rows]
+                    try:
+                        n_trim = remediate_cap_trim(
+                            conn,
+                            agent_id=APEX_AGENT_ID,
+                            hold_market_ids=hold_ids,
+                            nav=nav,
+                            pending_kelly=cap_trim_pending_kelly,
+                        )
+                    except Exception as exc:
+                        logger.error("APEX CAP_TRIM failed: %s", exc)
+                        n_trim = 0
+                    if n_trim:
+                        tick_stats.closed_rebalance += n_trim
+                        closed_rebalance += n_trim
+                        logger.warning(
+                            "APEX CAP_TRIM: trimmed %d HOLD leg(s) for pending entry",
+                            n_trim,
+                        )
                 if (
                     self._stoppage.cap_blocked_streak >= cap_stall_remediate_ticks()
                     and should_remediate_cap_stall(tick_stats)
@@ -1229,7 +1402,12 @@ class ApexEdgeEngine:
                     if n_idle and rotated_mid:
                         tick_stats.closed_rebalance += n_idle
                         closed_rebalance += n_idle
-                        self._churn_guard.note_market_rebalance(rotated_mid)
+                        if self._churn_guard.note_market_rebalance(rotated_mid):
+                            logger.warning(
+                                "APEX CAP CHURN GUARD activated on idle rotate %s — %s",
+                                rotated_mid,
+                                self._churn_guard.last_activation_detail,
+                            )
                         reentry_until = (
                             time.monotonic() + idle_rotate_reentry_cooldown_seconds()
                         )
@@ -1258,7 +1436,7 @@ class ApexEdgeEngine:
                         )
                     else:
                         try:
-                            n_fd, rotated_mid = remediate_fully_deployed(
+                            n_fd, rotated_mid, rotate_dir, exit_mid = remediate_fully_deployed(
                                 conn,
                                 agent_id=APEX_AGENT_ID,
                                 cap_blocked_streak=self._stoppage.cap_blocked_streak,
@@ -1270,7 +1448,31 @@ class ApexEdgeEngine:
                     if n_fd and rotated_mid:
                         tick_stats.closed_rebalance += n_fd
                         closed_rebalance += n_fd
-                        self._churn_guard.note_market_rebalance(rotated_mid)
+                        if self._churn_guard.note_market_rebalance(rotated_mid):
+                            logger.warning(
+                                "APEX CAP CHURN GUARD activated on fully-deployed rotate %s — %s",
+                                rotated_mid,
+                                self._churn_guard.last_activation_detail,
+                            )
+                        rotate_blob = market_data.get(rotated_mid)
+                        rotate_fv: float | None = None
+                        if isinstance(rotate_blob, dict) and rotate_dir:
+                            rotate_state = build_market_state(rotated_mid, rotate_blob)
+                            rotate_fv = resolve_execution_fair_value(
+                                conn,
+                                agent_id=APEX_AGENT_ID,
+                                market_blob=rotate_blob,
+                                state=rotate_state,
+                                direction=rotate_dir,
+                            )
+                        self._fully_deployed_rotate_snapshot[rotated_mid] = (
+                            RotateReentrySnapshot(
+                                direction=str(rotate_dir or "YES"),
+                                exit_mid=float(exit_mid or 0.5),
+                                fair_value=rotate_fv,
+                                rotated_at=time.monotonic(),
+                            )
+                        )
                         reentry_until = (
                             time.monotonic() + idle_rotate_reentry_cooldown_seconds()
                         )

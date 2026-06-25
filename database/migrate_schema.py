@@ -814,6 +814,20 @@ def migrate_active_strategy_python_source(conn) -> bool:
     return changed
 
 
+def migrate_active_strategy_shadow(conn) -> bool:
+    """Shadow strategy soak columns before champion promotion."""
+    changed = False
+    for col, ddl in (
+        ("shadow_python_source", "ALTER TABLE active_strategy ADD COLUMN shadow_python_source TEXT"),
+        ("shadow_started_at", "ALTER TABLE active_strategy ADD COLUMN shadow_started_at TEXT"),
+        ("shadow_metrics_json", "ALTER TABLE active_strategy ADD COLUMN shadow_metrics_json TEXT"),
+    ):
+        if not _column_exists(conn, "active_strategy", col):
+            conn.execute(ddl)
+            changed = True
+    return changed
+
+
 def migrate_resolved_corpus(conn) -> bool:
     if _table_exists(conn, "resolved_corpus"):
         return False
@@ -1339,6 +1353,8 @@ def migrate_connection(conn, label: str, *, quiet: bool = False) -> None:
         changes.append("active_strategy")
     if migrate_active_strategy_python_source(conn):
         changes.append("active_strategy.python_source+best_score")
+    if migrate_active_strategy_shadow(conn):
+        changes.append("active_strategy.shadow_*")
     if migrate_resolved_corpus(conn):
         changes.append("resolved_corpus")
     if migrate_trade_exhaust(conn):

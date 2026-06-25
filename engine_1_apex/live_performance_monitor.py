@@ -103,6 +103,20 @@ def evaluate_live_performance(conn, *, agent_id: str | None = None) -> tuple[str
         "alpha_pnl": breakdown.get("alpha_pnl", 0.0),
         "best_score": best_score,
     }
+    try:
+        from engine_1_apex.runtime_levers import get_active_levers
+
+        levers = get_active_levers()
+        if levers is not None:
+            metrics["hmm_state"] = levers.hmm_state
+            metrics["runtime_levers"] = {
+                "min_net_edge": levers.min_net_edge,
+                "obi_weight": levers.obi_weight,
+                "max_fractional_kelly": levers.max_fractional_kelly,
+                "max_portfolio_pct": levers.max_portfolio_pct,
+            }
+    except ImportError:
+        pass
 
     if total_closes < live_audit_min_closes():
         metrics["phase"] = "shadow_window"
@@ -152,7 +166,7 @@ def run_live_audit_tick(conn, *, agent_id: str | None = None) -> str | None:
             conn,
             event_type="live_audit_shadow",
             source="live_performance_monitor",
-            payload=breach,
+            payload=json.dumps(metrics),
             violations=[breach],
             action_taken="log_only",
         )

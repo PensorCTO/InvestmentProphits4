@@ -135,7 +135,7 @@ def test_remediate_cap_stall_below_threshold(monkeypatch):
     def fake_close(conn, **kwargs):
         raise AssertionError("should not close below threshold")
 
-    monkeypatch.setattr(trade_close, "close_smallest_market_leg", fake_close)
+    monkeypatch.setattr(trade_close, "close_worst_alpha_decay_market_leg", fake_close)
     monkeypatch.setattr(stoppage_mod, "cap_stall_remediate_ticks", lambda: 30)
 
     n = stoppage_mod.remediate_cap_stall(
@@ -155,7 +155,7 @@ def test_remediate_cap_stall_no_max_legs(monkeypatch):
     def fake_close(conn, **kwargs):
         raise AssertionError("should not close without max_legs_per_market")
 
-    monkeypatch.setattr(trade_close, "close_smallest_market_leg", fake_close)
+    monkeypatch.setattr(trade_close, "close_worst_alpha_decay_market_leg", fake_close)
     monkeypatch.setattr(stoppage_mod, "cap_stall_remediate_ticks", lambda: 30)
 
     n = stoppage_mod.remediate_cap_stall(
@@ -178,7 +178,7 @@ def test_remediate_cap_stall_closes_smallest_leg(monkeypatch):
         calls.append(kwargs["market_id"])
         return True
 
-    monkeypatch.setattr(trade_close, "close_smallest_market_leg", fake_close)
+    monkeypatch.setattr(trade_close, "close_worst_alpha_decay_market_leg", fake_close)
     monkeypatch.setattr(stoppage_mod, "cap_stall_remediate_ticks", lambda: 30)
 
     n = stoppage_mod.remediate_cap_stall(
@@ -199,7 +199,7 @@ def test_remediate_skips_max_legs_cap(monkeypatch):
     def fake_close(conn, **kwargs):
         raise AssertionError("should not close on max_legs alone")
 
-    monkeypatch.setattr(trade_close, "close_smallest_market_leg", fake_close)
+    monkeypatch.setattr(trade_close, "close_worst_alpha_decay_market_leg", fake_close)
     monkeypatch.setattr(stoppage_mod, "stoppage_threshold_ticks", lambda: 6)
 
     n = stoppage_mod.remediate_stoppage(
@@ -311,8 +311,76 @@ def test_should_remediate_idle_deployment_edge_gated_only():
         cap_reasons={"max_legs_per_market": 4},
         cash=52.0,
         min_ladder_usd=5.0,
+        open_legs=4,
+        max_ladder_legs=6,
     )
     assert should_remediate_idle_deployment(stats) is True
+
+
+def test_should_remediate_fully_deployed_requires_min_open_legs():
+    from engine_1_apex.stoppage import should_remediate_fully_deployed
+
+    sparse = TickStats(
+        signals=0,
+        skipped_already_positioned=1,
+        cap_reasons={"max_legs_per_market": 1},
+        cash=150.0,
+        min_ladder_usd=5.0,
+        open_legs=1,
+        max_ladder_legs=6,
+    )
+    dense = TickStats(
+        signals=0,
+        skipped_already_positioned=4,
+        cap_reasons={"max_legs_per_market": 4},
+        cash=52.0,
+        min_ladder_usd=5.0,
+        open_legs=4,
+        max_ladder_legs=6,
+    )
+    assert should_remediate_fully_deployed(sparse) is False
+    assert should_remediate_fully_deployed(dense) is True
+
+
+def test_blocks_fully_deployed_rotate_reentry_until_material_move(monkeypatch):
+    from engine_1_apex.stoppage import (
+        RotateReentrySnapshot,
+        blocks_fully_deployed_rotate_reentry,
+    )
+
+    monkeypatch.setenv("APEX_ROTATE_REENTRY_MID_DELTA", "0.02")
+    snapshot = RotateReentrySnapshot(
+        direction="YES",
+        exit_mid=0.1228,
+        fair_value=0.13,
+        rotated_at=__import__("time").monotonic(),
+    )
+    assert blocks_fully_deployed_rotate_reentry(
+        snapshot,
+        signal_direction="YES",
+        mid=0.1228,
+        fair_value=0.13,
+    )
+    assert not blocks_fully_deployed_rotate_reentry(
+        snapshot,
+        signal_direction="YES",
+        mid=0.15,
+        fair_value=0.13,
+    )
+    assert not blocks_fully_deployed_rotate_reentry(
+        snapshot,
+        signal_direction="NO",
+        mid=0.1228,
+        fair_value=0.13,
+    )
+
+
+def test_fully_deployed_rotate_min_open_legs_default_fraction(monkeypatch):
+    from engine_1_apex.stoppage import fully_deployed_rotate_min_open_legs
+
+    monkeypatch.delenv("APEX_FULLY_DEPLOYED_ROTATE_MIN_OPEN_LEGS", raising=False)
+    monkeypatch.setenv("APEX_FULLY_DEPLOYED_ROTATE_MIN_FRACTION", "0.67")
+    assert fully_deployed_rotate_min_open_legs(6) == 4
 
 
 def test_remediate_idle_deployment_closes_hold_leg(monkeypatch):
@@ -326,7 +394,7 @@ def test_remediate_idle_deployment_closes_hold_leg(monkeypatch):
         assert kwargs["exit_reason"] == "IDLE_DEPLOYMENT_ROTATE"
         return True
 
-    monkeypatch.setattr(trade_close, "close_smallest_market_leg", fake_close)
+    monkeypatch.setattr(trade_close, "close_worst_alpha_decay_market_leg", fake_close)
     monkeypatch.setattr(stoppage_mod, "cap_stall_remediate_ticks", lambda: 18)
 
     n, rotated = stoppage_mod.remediate_idle_deployment(

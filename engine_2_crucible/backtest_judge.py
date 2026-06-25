@@ -5,6 +5,171 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Callable
+from dataclasses import dataclass
+
+
+def judge_min_is_sortino() -> float:
+    return float(os.getenv("JUDGE_MIN_IS_SORTINO", "0.0"))
+
+
+def judge_min_oos_sortino() -> float:
+    return float(os.getenv("JUDGE_MIN_OOS_SORTINO", "0.0"))
+
+
+def judge_max_oos_mdd() -> float:
+    return float(os.getenv("JUDGE_MAX_OOS_MDD", "0.10"))
+
+
+def judge_train_fraction() -> float:
+    return float(os.getenv("VALIDATION_TRAIN_FRACTION", "0.80"))
+
+
+def sortino_ratio(returns: list[float]) -> float:
+    if not returns:
+        return 0.0
+    mean_r = sum(returns) / len(returns)
+    downside = [min(0.0, r) for r in returns]
+    downside_sq = [d * d for d in downside if d < 0]
+    if not downside_sq:
+        return mean_r if mean_r > 0 else 0.0
+    downside_dev = math.sqrt(sum(downside_sq) / len(downside_sq))
+    if downside_dev <= 1e-12:
+        return mean_r if mean_r > 0 else 0.0
+    return mean_r / downside_dev
+
+
+def max_drawdown_from_returns(returns: list[float]) -> float:
+    """Peak-to-trough drawdown on cumulative return curve."""
+    if not returns:
+        return 0.0
+    cumulative = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for r in returns:
+        cumulative += r
+        peak = max(peak, cumulative)
+        if peak > 0:
+            dd = (peak - cumulative) / peak
+            max_dd = max(max_dd, dd)
+        elif cumulative < 0:
+            max_dd = max(max_dd, abs(cumulative))
+    return max_dd
+
+
+def calmar_ratio(returns: list[float], max_dd: float | None = None) -> float:
+    """Annualized return / max drawdown proxy (per-trade returns scaled)."""
+    if not returns:
+        return 0.0
+    dd = max_dd if max_dd is not None else max_drawdown_from_returns(returns)
+    if dd <= 1e-12:
+        return sum(returns) / len(returns) if returns else 0.0
+    mean_r = sum(returns) / len(returns)
+    annualized = mean_r * 252.0
+    return annualized / dd
+
+
+def split_is_oos(
+    samples: list,
+    train_fraction: float | None = None,
+) -> tuple[list, list]:
+    """Chronological 80/20 in-sample / out-of-sample split."""
+    frac = train_fraction if train_fraction is not None else judge_train_fraction()
+    n = len(samples)
+    if n < 10:
+        return samples, []
+    train_end = int(n * frac)
+    if train_end >= n:
+        return samples, []
+    return samples[:train_end], samples[train_end:]
+
+
+@dataclass
+class OOSVerdict:
+    passed: bool
+    reason: str
+    is_sortino: float = 0.0
+    oos_sortino: float = 0.0
+    oos_mdd: float = 0.0
+    calmar: float = 0.0
+
+
+def evaluate_oos_gates(
+    is_returns: list[float],
+    oos_returns: list[float],
+    *,
+    max_oos_mdd: float | None = None,
+) -> OOSVerdict:
+    """Require positive Sortino on both IS and OOS; hard-reject OOS MDD breach."""
+    mdd_limit = max_oos_mdd if max_oos_mdd is not None else judge_max_oos_mdd()
+    min_is = judge_min_is_sortino()
+    min_oos = judge_min_oos_sortino()
+
+    is_sortino = sortino_ratio(is_returns)
+    oos_sortino = sortino_ratio(oos_returns)
+    oos_mdd = max_drawdown_from_returns(oos_returns)
+    calmar = calmar_ratio(oos_returns, oos_mdd)
+
+    if not oos_returns:
+        return OOSVerdict(
+            passed=False,
+            reason="OOS zero trades",
+            is_sortino=is_sortino,
+            oos_sortino=oos_sortino,
+            oos_mdd=oos_mdd,
+            calmar=calmar,
+        )
+    if oos_mdd > mdd_limit:
+        return OOSVerdict(
+            passed=False,
+            reason=f"OOS_MDD_REJECT mdd={oos_mdd:.4f} > {mdd_limit:.4f}",
+            is_sortino=is_sortino,
+            oos_sortino=oos_sortino,
+            oos_mdd=oos_mdd,
+            calmar=calmar,
+        )
+    if is_sortino <= min_is:
+        return OOSVerdict(
+            passed=False,
+            reason=f"IS_SORTINO_REJECT {is_sortino:.4f} <= {min_is:.4f}",
+            is_sortino=is_sortino,
+            oos_sortino=oos_sortino,
+            oos_mdd=oos_mdd,
+            calmar=calmar,
+        )
+    if oos_sortino <= min_oos:
+        return OOSVerdict(
+            passed=False,
+            reason=f"OOS_SORTINO_REJECT {oos_sortino:.4f} <= {min_oos:.4f}",
+            is_sortino=is_sortino,
+            oos_sortino=oos_sortino,
+            oos_mdd=oos_mdd,
+            calmar=calmar,
+        )
+    return OOSVerdict(
+        passed=True,
+        reason="ok",
+        is_sortino=is_sortino,
+        oos_sortino=oos_sortino,
+        oos_mdd=oos_mdd,
+        calmar=calmar,
+    )
+
+
+@dataclass
+class CandidateScore:
+    proposal_id: str
+    sortino: float
+    calmar: float
+    score: float
+
+
+def rank_candidates(candidates: list[CandidateScore]) -> list[CandidateScore]:
+    """Sort by Sortino primary, Calmar secondary (descending)."""
+    return sorted(
+        candidates,
+        key=lambda c: (c.sortino, c.calmar, c.score),
+        reverse=True,
+    )
 
 
 def judge_slope_window() -> int:

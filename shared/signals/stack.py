@@ -35,6 +35,9 @@ class SignalStack:
     flow_imbalance_30s: float = 0.0
     liquidity_quality: float = 0.0
     historical_reliability: float = 0.5
+    phantom_liquidity_penalty: float = 0.0
+    spread_tick_rate: float = 0.0
+    effective_poll_ms: int = 250
     updated_at_ms: float = field(default_factory=lambda: time.time() * 1000.0)
 
     def to_dict(self) -> dict[str, Any]:
@@ -147,6 +150,8 @@ def compute_signal_stack(
         ask_depth=float(mtf_result["ask_depth"]),
         ephemeral_ratio=float(mtf_result["ephemeral_ratio"]),
         spoof_penalty=float(mtf_result["spoof_penalty"]),
+        phantom_liquidity_penalty=float(mtf_result.get("phantom_liquidity_penalty", 0.0)),
+        spread_tick_rate=float(mtf_result.get("spread_tick_rate", 0.0)),
         tau_mtf_ms=float(mtf_result["tau_mtf_ms"]),
         median_cancel_ms=float(mtf_result["median_cancel_ms"]),
         mtf_applied=bool(mtf_result["mtf_applied"]),

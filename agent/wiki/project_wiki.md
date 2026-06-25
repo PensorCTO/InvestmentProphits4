@@ -211,6 +211,9 @@ Ladder budget now defaults to min(5% cash, 5% NAV per market) with APEX_MAX_PORT
 - **Pillar 3:** Sharpe slope + 10bps friction KEEP gate; `strategy_history` append on KEEP; `live_performance_monitor.py` auto-revert (default `LIVE_AUDIT_ENABLED=false`, shadow mode).
 - **Pillar 4:** `shared/adversarial_filter.py` on DeepSeek/news/prompt assembly; `audit_events` table; `TOXICITY_FAIL_CLOSED` option.
 - **CI:** `safety-gates` + `security` (bandit) jobs; `acceptance_gate --scope offline`; preflight blocking in CI.
+
+### 2026-06-24 — FULLY_DEPLOYED rotate anti-churn quartet
+Rotate only at >=67% ladder fill; remediate ticks 18; block same-thesis reentry after FULLY_DEPLOYED_ROTATE until mid/fv moves 2c; cross-market rotate+fill (3 mkts/900s) activates cap_churn_guard.
 ## Lessons Learned
 
 ### 2026-06-22 — Turso champion lag caused wallet STOPPED (high)
@@ -486,3 +489,15 @@ Ladder budget now defaults to min(5% cash, 5% NAV per market) with APEX_MAX_PORT
 - **Fix:** Move `is_stop_loss_cooldown_active()` before `signals += 1` in `ip4_apex_edge.py`. Post-restart: `trading=IDLE`, `streak=0`, FULLY_DEPLOYED rotate cleared all legs; only fed_cut edge-gated NO remains.
 
 **Next:** Wait for strategy BUY with ≥0.015 edge on uncooled markets; trade-flow buy pending (all-HOLD + fed_cut reject).
+
+### 2026-06-24 — Dynamic Microstructure & Regime Enhancement (5 phases)
+
+- **Phase 1:** `shared/rolling_stats.py`; `backtest_judge` IS/OOS Sortino gates, OOS MDD hard reject (10%), Calmar ranking; walk-forward 80/20 split.
+- **Phase 2:** DMA vol-adaptive BookWatcher poll (50–250ms); MTF notional debounce + phantom liquidity; regime z-score Schmitt hysteresis in `regime_classifier.py`.
+- **Phase 3:** Alpha-decay leg ranking + `CAP_TRIM` partial closes in `trade_close.py`; wired into stoppage + Apex cap remediation.
+- **Phase 4:** Shadow strategy soak (`shadow_python_source` columns); Crucible stages `backtest_pass`; Apex parallel eval + 1h promotion monitor.
+- **Phase 5:** numpy HMM regime decoder + `runtime_levers.py`; `LIVE_AUDIT_ENABLED=true` shadow-first in `.env.example`.
+
+**Next:** Restart Apex stack to load new code; soak shadow promotion + HMM lever mapping; flip `LIVE_AUDIT_SHADOW=false` after audit soak.
+
+### 2026-06-24 17:23 — Implemented rotate-churn fixes (stoppage, cap_churn_guard, ip4_apex_edge); 46 tests pass; post-restart holds 3 legs without rotate. Next: soak cross-market guard.

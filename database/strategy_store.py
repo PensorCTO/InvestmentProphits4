@@ -231,6 +231,107 @@ def revert_active_strategy(
     }
 
 
+def read_shadow_strategy(conn) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT shadow_python_source, shadow_started_at, shadow_metrics_json
+        FROM active_strategy WHERE id = 1
+        """
+    ).fetchone()
+    if not row or not row[0]:
+        return None
+    metrics = {}
+    if row[2]:
+        try:
+            metrics = json.loads(row[2])
+        except json.JSONDecodeError:
+            metrics = {}
+    return {
+        "python_source": row[0],
+        "shadow_started_at": row[1],
+        "metrics": metrics,
+    }
+
+
+def write_shadow_strategy(
+    conn,
+    python_source: str,
+    *,
+    score: float,
+    proposal_id: str | None = None,
+    commit: bool = True,
+) -> None:
+    metrics = {
+        "proposal_id": proposal_id,
+        "shadow_score": score,
+        "champion_edge_sum": 0.0,
+        "shadow_edge_sum": 0.0,
+        "tick_count": 0,
+    }
+    conn.execute(
+        """
+        UPDATE active_strategy SET
+            shadow_python_source = ?,
+            shadow_started_at = ?,
+            shadow_metrics_json = ?
+        WHERE id = 1
+        """,
+        (python_source, _utc_now_iso(), json.dumps(metrics)),
+    )
+    if commit:
+        commit_local(conn)
+
+
+def update_shadow_metrics(conn, metrics: dict[str, Any], *, commit: bool = True) -> None:
+    conn.execute(
+        """
+        UPDATE active_strategy SET shadow_metrics_json = ? WHERE id = 1
+        """,
+        (json.dumps(metrics),),
+    )
+    if commit:
+        commit_local(conn)
+
+
+def clear_shadow_strategy(conn, *, commit: bool = True) -> None:
+    conn.execute(
+        """
+        UPDATE active_strategy SET
+            shadow_python_source = NULL,
+            shadow_started_at = NULL,
+            shadow_metrics_json = NULL
+        WHERE id = 1
+        """
+    )
+    if commit:
+        commit_local(conn)
+
+
+def promote_shadow_to_champion(
+    conn,
+    *,
+    score: float,
+    commit: bool = True,
+) -> int | None:
+    """Promote shadow source to champion; clear shadow columns."""
+    shadow = read_shadow_strategy(conn)
+    if not shadow or not shadow.get("python_source"):
+        return None
+    source = str(shadow["python_source"])
+    version = write_active_strategy_source(
+        conn,
+        source,
+        score,
+        source="shadow_promote",
+        metadata={"last_score": score, "shadow_promoted": True},
+        commit=False,
+    )
+    clear_shadow_strategy(conn, commit=False)
+    if commit:
+        commit_local(conn)
+    return version
+
+
 def seed_active_strategy_if_empty(
     conn,
     defaults: dict[str, Any] | None = None,

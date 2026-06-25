@@ -63,6 +63,26 @@ def mtf_spread_window_ms() -> float:
     return _env_float("MTF_SPREAD_WINDOW_MS", "300000")
 
 
+def dma_debounce_base_ms() -> float:
+    return _env_float("DMA_DEBOUNCE_BASE_MS", "200")
+
+
+def dma_debounce_floor_ms() -> float:
+    return _env_float("DMA_DEBOUNCE_FLOOR_MS", "50")
+
+
+def dma_debounce_ceiling_ms() -> float:
+    return _env_float("DMA_DEBOUNCE_CEILING_MS", "500")
+
+
+def dma_min_notional_usd() -> float:
+    return _env_float("DMA_MIN_NOTIONAL_USD", "50")
+
+
+def dma_spread_tick_window_ms() -> float:
+    return _env_float("DMA_SPREAD_TICK_WINDOW_MS", "30000")
+
+
 @dataclass
 class LevelRecord:
     first_seen_ms: float
@@ -79,15 +99,23 @@ class CancelRecord:
 
 
 @dataclass
+class SpreadTickRecord:
+    ts_ms: float
+
+
+@dataclass
 class TokenMTFState:
     levels: dict[str, dict[float, LevelRecord]] = field(
         default_factory=lambda: {"bid": {}, "ask": {}}
     )
     cancel_events: deque[CancelRecord] = field(default_factory=deque)
     spread_history: deque[tuple[float, float]] = field(default_factory=deque)
+    spread_ticks: deque[SpreadTickRecord] = field(default_factory=deque)
+    last_spread: float | None = None
     flow: AggressiveFlowTracker = field(default_factory=AggressiveFlowTracker)
     last_stable_imbalance: float = 0.0
     last_tau_mtf_ms: float = 250.0
+    last_psi: float = 1.0
 
 
 def _median(values: list[float], default: float) -> float:
@@ -146,6 +174,12 @@ class AdaptiveMTFFilter:
         while state.spread_history and state.spread_history[0][0] < cutoff:
             state.spread_history.popleft()
         state.spread_history.append((now_ms, spread))
+        if state.last_spread is not None and abs(spread - state.last_spread) > 1e-8:
+            tick_cutoff = now_ms - dma_spread_tick_window_ms()
+            while state.spread_ticks and state.spread_ticks[0].ts_ms < tick_cutoff:
+                state.spread_ticks.popleft()
+            state.spread_ticks.append(SpreadTickRecord(ts_ms=now_ms))
+        state.last_spread = spread
         spreads = [s for _, s in state.spread_history]
         if len(spreads) < 5:
             return 1.0
@@ -155,8 +189,28 @@ class AdaptiveMTFFilter:
         if std <= 1e-12:
             return 1.0
         if spread > mean + mtf_spasm_sigma() * std:
-            return mtf_spasm_multiplier()
+            state.last_psi = mtf_spasm_multiplier()
+            return state.last_psi
+        state.last_psi = 1.0
         return 1.0
+
+    def _spread_tick_rate(self, state: TokenMTFState, now_ms: float) -> float:
+        tick_cutoff = now_ms - dma_spread_tick_window_ms()
+        while state.spread_ticks and state.spread_ticks[0].ts_ms < tick_cutoff:
+            state.spread_ticks.popleft()
+        window_s = dma_spread_tick_window_ms() / 1000.0
+        if window_s <= 0:
+            return 0.0
+        return len(state.spread_ticks) / window_s
+
+    def _debounce_ms(self, state: TokenMTFState, psi: float, now_ms: float) -> float:
+        rate = max(self._spread_tick_rate(state, now_ms), 0.1)
+        base = dma_debounce_base_ms()
+        if psi > 1.0:
+            t_ms = base / rate
+        else:
+            t_ms = base * 0.5
+        return max(dma_debounce_floor_ms(), min(dma_debounce_ceiling_ms(), t_ms))
 
     def compute_tau_mtf_ms(
         self,
@@ -218,14 +272,27 @@ class AdaptiveMTFFilter:
         now = now_ms if now_ms is not None else time.time() * 1000.0
         state = self._state(token_id)
         tau_mtf = self.compute_tau_mtf_ms(token_id, spread=spread, now_ms=now)
+        psi = state.last_psi
+        debounce_ms = self._debounce_ms(state, psi, now)
+        if psi > 1.0:
+            tau_mtf = max(tau_mtf, debounce_ms)
 
         sorted_bids = sorted(bids, key=lambda x: -x[0])[:depth_levels]
         sorted_asks = sorted(asks, key=lambda x: x[0])[:depth_levels]
+
+        all_notionals: list[float] = []
+        for price, size in sorted_bids + sorted_asks:
+            if size > 0:
+                all_notionals.append(size * price)
+        median_notional = _median(all_notionals, dma_min_notional_usd())
+        min_notional = dma_min_notional_usd()
 
         raw_bid = raw_ask = 0.0
         weighted_bid = weighted_ask = 0.0
         ephemeral_size = 0.0
         raw_total = 0.0
+        phantom_notional = 0.0
+        total_notional = 0.0
 
         for side_key, levels in (("bid", sorted_bids), ("ask", sorted_asks)):
             side_reg = state.levels[side_key]
@@ -255,7 +322,13 @@ class AdaptiveMTFFilter:
                 trade_ok = rec.trade_confirmed or state.flow.recent_trade_at_price(
                     price, now_ms=now
                 )
-                weight = _level_weight(lifetime, side_tau, trade_ok)
+                notional = size * price
+                total_notional += notional
+                if notional < min_notional:
+                    notional_weight = 0.0
+                else:
+                    notional_weight = min(1.0, notional / max(median_notional, min_notional))
+                weight = _level_weight(lifetime, side_tau, trade_ok) * notional_weight
                 if side_key == "bid":
                     raw_bid += size
                     weighted_bid += size * weight
@@ -265,6 +338,8 @@ class AdaptiveMTFFilter:
                 raw_total += size
                 if weight < 1.0:
                     ephemeral_size += size * (1.0 - weight)
+                    if notional >= median_notional:
+                        phantom_notional += notional * (1.0 - weight)
 
         filtered_total = weighted_bid + weighted_ask
         ephemeral_ratio = (ephemeral_size / raw_total) if raw_total > 0 else 0.0
@@ -283,6 +358,10 @@ class AdaptiveMTFFilter:
             imbalance = 0.0
 
         spoof_penalty = min(1.0, ephemeral_ratio)
+        phantom_liquidity_penalty = (
+            phantom_notional / total_notional if total_notional > 0 else 0.0
+        )
+        spread_tick_rate = self._spread_tick_rate(state, now)
 
         return {
             "bid_depth": round(weighted_bid, 2),
@@ -292,6 +371,9 @@ class AdaptiveMTFFilter:
             "depth_imbalance": round(imbalance, 4),
             "ephemeral_ratio": round(ephemeral_ratio, 4),
             "spoof_penalty": round(spoof_penalty, 4),
+            "phantom_liquidity_penalty": round(phantom_liquidity_penalty, 4),
+            "spread_tick_rate": round(spread_tick_rate, 4),
+            "debounce_ms": round(debounce_ms, 2),
             "tau_mtf_ms": round(tau_mtf, 2),
             "mtf_applied": filtered_total > 0 or bool(state.last_stable_imbalance),
             "median_cancel_ms": round(self._median_cancel_ms(state, now), 2),

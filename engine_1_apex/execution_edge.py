@@ -55,6 +55,7 @@ def _feature_score(state: dict, direction: str) -> dict[str, float]:
     liq_q = float(state.get("liquidity_quality", 0.5))
     reliability = float(state.get("historical_reliability", 0.5))
     spoof = float(state.get("spoof_penalty", state.get("ephemeral_ratio", 0.0)))
+    phantom = float(state.get("phantom_liquidity_penalty", 0.0))
 
     sign = 1.0 if direction == "YES" else -1.0
     return {
@@ -63,7 +64,7 @@ def _feature_score(state: dict, direction: str) -> dict[str, float]:
         "obi": sign * obi,
         "liquidity": liq_q - 0.5,
         "reliability": reliability - 0.5,
-        "spoof_penalty": spoof,
+        "spoof_penalty": min(1.0, spoof + phantom * 0.5),
     }
 
 
@@ -85,7 +86,12 @@ def compute_composite_edge(
     """
     w_mp = _weight("V2_EDGE_WEIGHT_MICROPRICE", "0.25")
     w_flow = _weight("V2_EDGE_WEIGHT_FLOW", "0.25")
-    w_obi = _weight("V2_EDGE_WEIGHT_OBI", "0.20")
+    try:
+        from engine_1_apex.runtime_levers import active_obi_weight
+
+        w_obi = active_obi_weight()
+    except ImportError:
+        w_obi = _weight("V2_EDGE_WEIGHT_OBI", "0.20")
     w_liq = _weight("V2_EDGE_WEIGHT_LIQUIDITY", "0.15")
     w_rel = _weight("V2_EDGE_WEIGHT_RELIABILITY", "0.10")
 

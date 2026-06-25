@@ -118,6 +118,8 @@ After Crucible beats `best_score`, validated Python source is written to Turso `
 
 **Architecture reference:** [`InvestmentProphits4_MASTER_BLUEPRINTS.md`](InvestmentProphits4_MASTER_BLUEPRINTS.md) — validated on push; LLM refresh via `scripts/sync_master_blueprints.py` (workflow dispatch).
 
+**Algorithm levers:** [`IP4_ALGO_BLUEPRINTS.md`](IP4_ALGO_BLUEPRINTS.md) — tunable env taxonomy, interaction matrix, safe tuning order.
+
 ---
 
 ## Tests

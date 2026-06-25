@@ -166,7 +166,9 @@ class PaperGateway:
                 return {"status": "REJECTED", "reason": "liquidity_floor"}
 
             state = market_state or {}
-            hold, regime_reason = circuit_breaker_holds(state)
+            hold, regime_reason = circuit_breaker_holds(
+                state, market_id=str(state.get("market_id", market_id))
+            )
             if hold:
                 return {"status": "REJECTED", "reason": regime_reason}
 

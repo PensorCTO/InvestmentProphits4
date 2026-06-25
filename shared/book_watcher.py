@@ -14,6 +14,7 @@ from typing import Any
 import aiohttp
 
 from shared.polymarket_clob import CLOB_BASE, HTTP_TIMEOUT, PolymarketClobClient, _levels
+from shared.mid_vol_tracker import MidVolTracker
 from shared.signals.mtf_filter import mtf_poll_ms
 from shared.signals.stack import SignalStack, compute_signal_stack
 
@@ -41,6 +42,8 @@ class BookWatcher:
         self._lock = threading.Lock()
         self._last_persist: dict[str, float] = {}
         self._persist_interval_s = float(os.getenv("BOOK_BUFFER_PERSIST_INTERVAL_S", "1.0"))
+        self._vol_tracker = MidVolTracker()
+        self._effective_poll_ms = self.config.poll_ms
 
     def set_market_tokens(self, mapping: dict[str, tuple[str, str]]) -> None:
         """Map market_id -> (yes_token_id, liquidity_tier)."""
@@ -112,6 +115,9 @@ class BookWatcher:
             trades=trades,
             liquidity_tier=liquidity_tier,
         )
+        stack.effective_poll_ms = self._effective_poll_ms
+        ts_ms = time.time() * 1000.0
+        self._vol_tracker.record_mid(token_id, mid, ts_ms)
         with self._lock:
             self._snapshots[token_id] = stack
 
@@ -172,14 +178,16 @@ class BookWatcher:
 
     async def run_loop(self, token_provider) -> None:
         """token_provider: callable returning dict[market_id, (token_id, tier)]."""
-        interval = self.config.poll_ms / 1000.0
         while not self._shutdown.is_set():
             try:
                 mapping = token_provider()
                 self.set_market_tokens(mapping)
+                token_ids = [tok for _, (tok, _) in mapping.items()]
+                self._effective_poll_ms = self._vol_tracker.effective_poll_ms(token_ids)
                 await self.run_once(mapping)
             except Exception as exc:
                 logger.warning("BookWatcher poll cycle failed: %s", exc)
+            interval = self._effective_poll_ms / 1000.0
             try:
                 await asyncio.wait_for(self._shutdown.wait(), timeout=interval)
             except asyncio.TimeoutError:

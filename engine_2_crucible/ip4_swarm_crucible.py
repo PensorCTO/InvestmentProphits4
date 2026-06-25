@@ -520,6 +520,36 @@ class AutoResearchCrucible:
                 conn.close()
         request_cloud_sync("crucible_strategy_keep")
 
+    def _stage_shadow_strategy(
+        self, python_source: str, score: float, *, proposal_id: str | None = None
+    ) -> None:
+        from database.strategy_store import write_shadow_strategy
+
+        with arena_lock(ARENA_LOCK_PATH):
+            conn = open_replica()
+            try:
+                write_shadow_strategy(
+                    conn,
+                    python_source,
+                    score=score,
+                    proposal_id=proposal_id,
+                    commit=True,
+                )
+                if proposal_id:
+                    update_proposal_status(
+                        conn,
+                        proposal_id,
+                        status="backtest_pass",
+                        gate_results={"score": score, "phase": "shadow_soak"},
+                        commit=True,
+                    )
+            finally:
+                conn.close()
+        logging.info(
+            "Shadow soak started (score=%.4f) — champion unchanged until Apex promotion",
+            score,
+        )
+
     def _score_returns_for_source(self, python_source: str) -> tuple[float, int, float, list[float]]:
         from engine_2_crucible.backtest_corpus import flatten_exhaust_rows
         from engine_2_crucible.strategy_loader import load_evaluate_market_from_source
@@ -742,7 +772,7 @@ class AutoResearchCrucible:
                 )
                 return
             atomic_write_strategy(STRATEGY_BACKUP_PATH, proposed)
-            self._keep_strategy(proposed, score, proposal_id=proposal_id)
+            self._stage_shadow_strategy(proposed, score, proposal_id=proposal_id)
             self._failure_context.clear()
             logging.info("Victory — new best score %.4f > %.4f", score, best_score)
         else:

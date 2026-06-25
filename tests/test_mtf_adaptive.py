@@ -25,6 +25,8 @@ def test_spoof_penalty_on_flickering_levels():
     mtf.update_book("tok2", [(0.5, 200.0)], [(0.51, 10.0)], spread=0.01, now_ms=now)
     result = mtf.update_book("tok2", [(0.5, 200.0)], [(0.51, 10.0)], spread=0.01, now_ms=now + 50.0)
     assert 0.0 <= result["spoof_penalty"] <= 1.0
+    assert "phantom_liquidity_penalty" in result
+    assert "spread_tick_rate" in result
 
 
 def test_trade_confirmed_exemption():

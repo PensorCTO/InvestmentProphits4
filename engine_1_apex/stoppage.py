@@ -31,7 +31,72 @@ class TickStats:
     cash: float = 0.0
     nav: float = 0.0
     min_ladder_usd: float = 5.0
+    open_legs: int = 0
+    max_ladder_legs: int = 0
     cap_reasons: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RotateReentrySnapshot:
+    """Thesis snapshot recorded when FULLY_DEPLOYED_ROTATE closes a leg."""
+
+    direction: str
+    exit_mid: float
+    fair_value: float | None
+    rotated_at: float
+
+
+def fully_deployed_rotate_min_open_legs(max_ladder_legs: int) -> int:
+    """Minimum open legs before idle / fully-deployed rotation may fire."""
+    explicit = os.getenv("APEX_FULLY_DEPLOYED_ROTATE_MIN_OPEN_LEGS")
+    if explicit:
+        return max(1, int(explicit))
+    fraction = float(os.getenv("APEX_FULLY_DEPLOYED_ROTATE_MIN_FRACTION", "0.67"))
+    return max(1, int(max_ladder_legs * fraction))
+
+
+def rotate_reentry_material_mid_delta() -> float:
+    return float(os.getenv("APEX_ROTATE_REENTRY_MID_DELTA", "0.02"))
+
+
+def rotate_reentry_material_fv_delta() -> float:
+    return float(os.getenv("APEX_ROTATE_REENTRY_FV_DELTA", "0.02"))
+
+
+def rotate_reentry_block_max_seconds() -> int:
+    return int(os.getenv("APEX_ROTATE_REENTRY_BLOCK_SECONDS", "3600"))
+
+
+def blocks_fully_deployed_rotate_reentry(
+    snapshot: RotateReentrySnapshot | None,
+    *,
+    signal_direction: str,
+    mid: float,
+    fair_value: float,
+) -> bool:
+    """
+    Block same-direction refill after FULLY_DEPLOYED_ROTATE until mid or fair
+    value moves materially (not merely after idle-rotate cooldown expires).
+    """
+    if snapshot is None:
+        return False
+    if time.monotonic() - snapshot.rotated_at > rotate_reentry_block_max_seconds():
+        return False
+    if snapshot.direction != signal_direction:
+        return False
+    mid_moved = abs(mid - snapshot.exit_mid) >= rotate_reentry_material_mid_delta()
+    fv_moved = (
+        snapshot.fair_value is not None
+        and abs(fair_value - snapshot.fair_value) >= rotate_reentry_material_fv_delta()
+    )
+    return not (mid_moved or fv_moved)
+
+
+def _deployment_rotate_min_legs_met(stats: TickStats) -> bool:
+    max_legs = stats.max_ladder_legs or int(os.getenv("APEX_MAX_LADDER_LEGS", "6"))
+    if stats.open_legs <= 0:
+        return False
+    return stats.open_legs >= fully_deployed_rotate_min_open_legs(max_legs)
 
 
 def stoppage_threshold_ticks() -> int:
@@ -82,6 +147,8 @@ def is_cap_stall_tick(stats: TickStats) -> bool:
     reason = derive_dominant_block_reason(stats)
     if reason == "fully_deployed":
         # Deployed with idle cash and no actionable entries — rotate a HOLD leg.
+        if not _deployment_rotate_min_legs_met(stats):
+            return False
         return (
             stats.cash >= stats.min_ladder_usd
             and actionable_unfilled_signals(stats) == 0
@@ -408,6 +475,8 @@ def should_remediate_idle_deployment(stats: TickStats) -> bool:
         return False
     if actionable_unfilled_signals(stats) > 0:
         return False
+    if not _deployment_rotate_min_legs_met(stats):
+        return False
     return derive_dominant_block_reason(stats) == "fully_deployed"
 
 
@@ -428,10 +497,10 @@ def remediate_idle_deployment(
     if not market_rows:
         return 0, None
 
-    from engine_1_apex.trade_close import close_smallest_market_leg
+    from engine_1_apex.trade_close import close_worst_alpha_decay_market_leg
 
     for market_id, category, market_mid, liq_tier in market_rows:
-        if close_smallest_market_leg(
+        if close_worst_alpha_decay_market_leg(
             conn,
             agent_id=agent_id,
             market_id=market_id,
@@ -462,10 +531,10 @@ def remediate_cap_stall(
     if not (cap_reasons or {}).get("max_legs_per_market"):
         return 0
 
-    from engine_1_apex.trade_close import close_smallest_market_leg
+    from engine_1_apex.trade_close import close_worst_alpha_decay_market_leg
 
     for market_id, category, market_mid, liq_tier in market_rows:
-        if close_smallest_market_leg(
+        if close_worst_alpha_decay_market_leg(
             conn,
             agent_id=agent_id,
             market_id=market_id,
@@ -494,14 +563,14 @@ def remediate_portfolio_cap(
     if not (cap_reasons or {}).get("portfolio_cap"):
         return 0, None
 
-    from engine_1_apex.trade_close import close_smallest_open_leg
+    from engine_1_apex.trade_close import close_worst_alpha_decay_leg
 
-    closed, market_id = close_smallest_open_leg(
+    closed, market_id, _, _ = close_worst_alpha_decay_leg(
         conn,
         agent_id=agent_id,
         exit_reason="PORTFOLIO_CAP_ROTATE",
     )
-    return 0, None
+    return (1, market_id) if closed else (0, None)
 
 
 def should_remediate_fully_deployed(stats: TickStats) -> bool:
@@ -512,6 +581,8 @@ def should_remediate_fully_deployed(stats: TickStats) -> bool:
         return False
     if not (stats.cap_reasons or {}).get("max_legs_per_market"):
         return False
+    if not _deployment_rotate_min_legs_met(stats):
+        return False
     return derive_dominant_block_reason(stats) == "fully_deployed"
 
 
@@ -520,22 +591,83 @@ def remediate_fully_deployed(
     *,
     agent_id: str,
     cap_blocked_streak: int,
-) -> tuple[int, str | None]:
+) -> tuple[int, str | None, str | None, float | None]:
     """
     Rotate capital off the smallest deployed leg when fully deployed with idle cash.
-    Returns (legs_closed, market_id).
+    Returns (legs_closed, market_id, direction, exit_mid).
     """
     if cap_blocked_streak < cap_stall_remediate_ticks():
-        return 0, None
+        return 0, None, None, None
 
-    from engine_1_apex.trade_close import close_smallest_open_leg
+    from engine_1_apex.trade_close import close_worst_alpha_decay_leg
 
-    closed, market_id = close_smallest_open_leg(
+    closed, market_id, direction, exit_mid = close_worst_alpha_decay_leg(
         conn,
         agent_id=agent_id,
         exit_reason="FULLY_DEPLOYED_ROTATE",
     )
-    return (1, market_id) if closed else (0, None)
+    if closed:
+        return 1, market_id, direction, exit_mid
+    return 0, None, None, None
+
+
+def should_cap_trim(
+    stats: TickStats,
+    *,
+    cap_blocked_streak: int,
+    pending_kelly: float,
+    pending_net_edge: float,
+    min_net_edge: float,
+) -> bool:
+    """True when cap-blocked with high-conviction entry waiting."""
+    from engine_1_apex.trade_close import cap_trim_enabled, cap_trim_min_edge_mult
+
+    if not cap_trim_enabled():
+        return False
+    if cap_blocked_streak < cap_stall_remediate_ticks():
+        return False
+    if pending_kelly <= 0:
+        return False
+    if pending_net_edge < min_net_edge * cap_trim_min_edge_mult():
+        return False
+    if not (stats.cap_reasons or {}).get("max_legs_per_market"):
+        return False
+    return derive_dominant_block_reason(stats) == "cap_blocked"
+
+
+def remediate_cap_trim(
+    conn,
+    *,
+    agent_id: str,
+    hold_market_ids: list[str],
+    nav: float,
+    pending_kelly: float,
+) -> int:
+    """Trim worst HOLD legs to free cash for pending high-conviction entry."""
+    from engine_1_apex.trade_close import cap_trim_worst_hold_legs, get_agent_market_exposure
+
+    if not hold_market_ids:
+        return 0
+    trimmed = cap_trim_worst_hold_legs(
+        conn,
+        agent_id=agent_id,
+        hold_market_ids=hold_market_ids,
+        nav=nav,
+    )
+    if trimmed <= 0:
+        return 0
+    freed = 0.0
+    for mid in hold_market_ids:
+        freed += get_agent_market_exposure(conn, agent_id, mid) * cap_trim_fraction()
+    if freed >= pending_kelly * 0.5:
+        return trimmed
+    return trimmed
+
+
+def cap_trim_fraction() -> float:
+    from engine_1_apex.trade_close import cap_trim_fraction as _frac
+
+    return _frac()
 
 
 def persist_trader_health(

@@ -285,7 +285,10 @@ Crucible env:
 | `DEEPSEEK_V4_API` | API key |
 | `AUTORESEARCH_DRY_RUN` | Skip LLM; backtest-only loop |
 | `AUTORESEARCH_MIN_LIVE_FILL_ELIGIBLE` | Require live edge gate before KEEP |
-| `LIVE_AUDIT_ENABLED` | Shadow/live auto-revert on champion drift (default false) |
+| `LIVE_AUDIT_ENABLED` | Shadow-first auto-revert on champion drift (default true in `.env.example`) |
+| `HMM_ENABLED` | Regime-aware runtime lever overrides |
+| `DMA_ENABLED` | Vol-adaptive BookWatcher poll cadence |
+| `SHADOW_PROMOTE_WINDOW_S` | Shadow strategy soak before champion write |
 | `TOXICITY_FAIL_CLOSED` | Adversarial filter blocks on high toxicity |
 
 ### QA audit remediation (June 2026)
@@ -296,8 +299,21 @@ Crucible env:
 | Book buffer | `shared/book_watcher.py`, `book_buffer` | Debounced sub-second snapshots merged in Apex |
 | Proposal quarantine | `strategy_proposals`, Crucible scheduler | LLM output staged before Turso KEEP |
 | Audit judge | `backtest_judge.py` Sharpe slope + friction | KEEP gate hardening |
-| Live revert | `live_performance_monitor.py`, `strategy_history` | Optional shadow revert to prior champion |
+| Live revert | `live_performance_monitor.py`, `strategy_history` | Shadow-first auto-revert on champion drift |
 | Adversarial filter | `shared/adversarial_filter.py`, `audit_events` | Scan DeepSeek/news/prompt payloads |
+
+### Dynamic microstructure & regime (June 2026)
+
+| Pillar | Module / table | Role |
+|--------|----------------|------|
+| DMA polling | `shared/mid_vol_tracker.py`, `shared/book_watcher.py` | 50–250ms adaptive BookWatcher cadence |
+| MTF debounce | `shared/signals/mtf_filter.py` | Notional-weighted OBI, phantom liquidity penalty |
+| Regime hysteresis | `shared/regime_classifier.py` | Z-score Schmitt trigger (trip 80 / recover 40) |
+| WFO judge | `backtest_judge.py`, `walk_forward_pipeline.py` | 80/20 IS/OOS Sortino + OOS MDD hard gate |
+| Shadow promotion | `strategy_store.shadow_*`, `shadow_strategy_monitor.py` | Crucible soak → Apex 1h edge promote |
+| Alpha-decay rotate | `trade_close.py`, `stoppage.py` | ΔEdge leg ranking + CAP_TRIM partial close |
+| HMM levers | `market_regime_hmm.py`, `runtime_levers.py` | Trending / MeanReverting / Toxic overrides |
+| Algo reference | `IP4_ALGO_BLUEPRINTS.md` | Tunable lever taxonomy for operators |
 
 ---
 
@@ -316,7 +332,12 @@ APEX_IDLE_ROTATE_REENTRY_COOLDOWN_SECONDS=900
 APEX_CAP_STALL_ENTRY_COOLDOWN_SECONDS=120
 APEX_STOPPAGE_TICKS=6
 APEX_TRADING_STALL_TICKS=18
-LIVE_AUDIT_ENABLED=false         # shadow live-performance auto-revert
+LIVE_AUDIT_ENABLED=true          # shadow-first live-performance auto-revert
+LIVE_AUDIT_SHADOW=true
+HMM_ENABLED=true
+DMA_ENABLED=true
+JUDGE_MAX_OOS_MDD=0.10           # hard REVERT on OOS drawdown breach
+SHADOW_PROMOTE_WINDOW_S=3600
 ORACLE_CB_ENABLED=true
 BACKTEST_MOCK_RESOLUTIONS=true   # backtest judge (independent of live mock)
 IP4_DASHBOARD_PORT=8501
