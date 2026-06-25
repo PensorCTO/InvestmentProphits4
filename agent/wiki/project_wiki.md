@@ -552,3 +552,7 @@ BookWatcher None fields no longer crash Apex ticks. Vector backfill runs after b
 ### 2026-06-25 13:06 — Fixed ORACLE STARVATION (stale_oracle age=800s+). Root cause: oracle worker thread blocked forever on arena_lock in _ensure_schema_once after Apex restart — never logged Oracle worker started, no snapshots after 12:47. Fix: mark_oracle_schema_initialized() in preflight, move CLOB auto-map to preflight, non-blocking vector backfill locks. Verified: Oracle worker started + snapshots every 30s, ticks resume.
 
 **Next:** Monitor risk daemon TRANSACTION_TIMEOUT under load; consider nb lock in oracle_sync write path if recurs.
+
+### 2026-06-25 14:50 — Landed infrastructure hardening batch + blueprint sync + push (f9df5de). Bankruptcy halt (DRAIN_AND_HALT), Kelly clamp, Hrana retry, state_float, oracle preflight, stop-loss reentry fix, live audit config, URI normalize. Master + algo blueprints updated manually (DeepSeek sync blocked by adversarial filter). 319 pytest pass. Pushed to origin/main.
+
+**Next:** 48–72h paper soak; verify_trade_flow on next clean restart if handoff required.
