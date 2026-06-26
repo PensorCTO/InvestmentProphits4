@@ -609,3 +609,11 @@ EDGE_MODEL_MOCKED=false
 ---
 
 *Last updated: 2026-06-25 — infrastructure hardening: bankruptcy halt (DRAIN_AND_HALT), Kelly clamp, stop-loss reentry edge fix, oracle preflight, state_float, Hrana retry, live audit preflight.*
+
+
+## 18. Kalman Filter & Log-Odds Model (Phase 1+)
+
+- **Kalman Filter**: Integrates a recursive Bayesian `kalman_tracker.py` to strip out microstructure noise and isolate continuous fair-value estimation.
+- **Log-Odds Combiner**: Replaces parallel if-chains with a log-odds additive model applying offline-calibrated $\beta$ weights onto `z_kf`, `OBI_norm`, and `regime_score` to vote on edge direction.
+- **Sizing**: Uses Full Kelly scaling on binary outcomes ($b=1$) configured via `DEFAULT_FRACTIONAL_KELLY=1.0` in sizing algorithms.
+- **Asynchronous Offline Calibration**: `beta_calibration_worker.py` evaluates recent CDC flow on `trade_exhaust` within the Crucible cycle and persists learned regression coefficients to `strategy_config.json`.

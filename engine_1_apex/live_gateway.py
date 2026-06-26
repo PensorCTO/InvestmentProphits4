@@ -88,6 +88,7 @@ class LiveGateway:
         entry_context: str,
         min_net_edge: float | None = None,
         conn=None,
+        market_state: dict | None = None,
     ) -> dict:
         own_conn = conn or self.get_client()
         close_conn = conn is None
@@ -112,6 +113,8 @@ class LiveGateway:
             ):
                 return {"status": "REJECTED", "reason": "liquidity_floor"}
 
+            state = market_state or {}
+
             sizing = load_agent_sizing_snapshot(own_conn, agent_id)
             if sizing is None:
                 return {"status": "REJECTED", "reason": "agent_inactive"}
@@ -133,6 +136,8 @@ class LiveGateway:
                     total_open_notional=sizing["open_notional"],
                     min_ladder_usd=MIN_LADDER_USD,
                     portfolio_pct=max_portfolio_pct(),
+                    lifetime_hwm=sizing.get("lifetime_hwm", 0.0),
+                    session_hwm=sizing.get("session_hwm", 0.0),
                 )
             if kelly_size is None:
                 return {"status": "REJECTED", "reason": sizing_reason or "position_cap"}
@@ -153,6 +158,13 @@ class LiveGateway:
                     "reason": herding_reason or "herding_headroom_insufficient",
                     **herding_meta,
                 }
+
+            mtf_bid = float(state.get("bid_depth", 0.0))
+            mtf_ask = float(state.get("ask_depth", 0.0))
+            mtf_book_depth_usd = (mtf_bid + mtf_ask) * market_mid
+            
+            if mtf_book_depth_usd > 0 and (kelly_size / mtf_book_depth_usd) > 0.05:
+                return {"status": "REJECTED", "reason": "liquidity_gate_mtf"}
 
             edge_threshold = resolve_min_net_edge(
                 market_mid,
@@ -205,7 +217,7 @@ class LiveGateway:
                 market_mid, direction, liquidity_tier, kelly_size, capital=capital
             )
             stop_loss, take_profit = PolyCostModel.compute_brackets(
-                fill_price, direction=direction
+                fill_price, direction=direction, target_dollar_move=0.10
             )
 
             if not assert_market_unresolved(own_conn, market_id):

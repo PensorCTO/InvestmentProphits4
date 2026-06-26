@@ -280,6 +280,9 @@ class AdaptiveMTFFilter:
         sorted_bids = sorted(bids, key=lambda x: -x[0])[:depth_levels]
         sorted_asks = sorted(asks, key=lambda x: x[0])[:depth_levels]
 
+        best_bid_price = sorted_bids[0][0] if sorted_bids else None
+        best_ask_price = sorted_asks[0][0] if sorted_asks else None
+
         all_notionals: list[float] = []
         for price, size in sorted_bids + sorted_asks:
             if size > 0:
@@ -363,6 +366,14 @@ class AdaptiveMTFFilter:
         )
         spread_tick_rate = self._spread_tick_rate(state, now)
 
+        if best_bid_price is not None and best_ask_price is not None:
+            if filtered_total > 0:
+                implied_fair_value = (weighted_bid * best_ask_price + weighted_ask * best_bid_price) / filtered_total
+            else:
+                implied_fair_value = (best_bid_price + best_ask_price) / 2.0
+        else:
+            implied_fair_value = None
+
         return {
             "bid_depth": round(weighted_bid, 2),
             "ask_depth": round(weighted_ask, 2),
@@ -377,6 +388,7 @@ class AdaptiveMTFFilter:
             "tau_mtf_ms": round(tau_mtf, 2),
             "mtf_applied": filtered_total > 0 or bool(state.last_stable_imbalance),
             "median_cancel_ms": round(self._median_cancel_ms(state, now), 2),
+            "implied_fair_value": round(implied_fair_value, 6) if implied_fair_value is not None else None,
         }
 
 

@@ -42,8 +42,10 @@ def test_record_and_fetch_snapshot(db_conn):
     assert len(history) == 1
     assert history[0]["cash"] == pytest.approx(100.0)
     assert history[0]["total_nav"] == pytest.approx(100.0)
-    assert snapshot["total_capital_injected"] == pytest.approx(100.0)
-    assert snapshot["true_pnl"] == pytest.approx(0.0)
+    
+    from database.portfolio_store import DEFAULT_INITIAL_CAPITAL
+    assert snapshot["total_capital_injected"] == pytest.approx(DEFAULT_INITIAL_CAPITAL)
+    assert snapshot["true_pnl"] == pytest.approx(100.0 - DEFAULT_INITIAL_CAPITAL)
 
 
 def test_reset_wallet_preserves_history_and_tracks_injection(db_conn):
@@ -70,18 +72,21 @@ def test_reset_wallet_preserves_history_and_tracks_injection(db_conn):
     record_portfolio_snapshot(db_conn, agent_id="APEX_EDGE", commit=True, sync=False)
     result = reset_apex_wallet(db_conn, agent_id="APEX_EDGE", commit=True, sync=False)
     assert result["closed_positions"] == 1
-    assert result["initial_capital"] == pytest.approx(100.0)
+    from database.portfolio_store import DEFAULT_INITIAL_CAPITAL
+    assert result["initial_capital"] == pytest.approx(DEFAULT_INITIAL_CAPITAL)
 
     total, cash, positions = compute_agent_nav(db_conn, "APEX_EDGE")
     assert positions == pytest.approx(0.0)
-    assert cash == pytest.approx(100.0)
-    assert total == pytest.approx(100.0)
+    from database.portfolio_store import DEFAULT_INITIAL_CAPITAL
+    assert cash == pytest.approx(DEFAULT_INITIAL_CAPITAL)
+    assert total == pytest.approx(DEFAULT_INITIAL_CAPITAL)
 
     history = fetch_portfolio_history(db_conn, agent_id="APEX_EDGE")
     assert len(history) >= 2
     injected = get_apex_total_injected(db_conn, "APEX_EDGE")
-    assert injected == pytest.approx(200.0)
-    assert true_trading_pnl(total, injected) == pytest.approx(-100.0)
+    from database.portfolio_store import DEFAULT_INITIAL_CAPITAL
+    assert injected == pytest.approx(DEFAULT_INITIAL_CAPITAL * 2)
+    assert true_trading_pnl(total, injected) == pytest.approx(DEFAULT_INITIAL_CAPITAL - (DEFAULT_INITIAL_CAPITAL * 2))
 
 
 def test_fetch_portfolio_session_metrics(db_conn):
@@ -90,8 +95,9 @@ def test_fetch_portfolio_session_metrics(db_conn):
     record_portfolio_snapshot(db_conn, agent_id="APEX_EDGE", commit=True, sync=False)
     portfolio = fetch_portfolio(db_conn)
     assert portfolio["total_nav"] == pytest.approx(100.0)
-    assert portfolio["session_capital"] == pytest.approx(100.0)
-    assert portfolio["session_pnl"] == pytest.approx(0.0)
+    from database.portfolio_store import DEFAULT_INITIAL_CAPITAL
+    assert portfolio["session_capital"] == pytest.approx(DEFAULT_INITIAL_CAPITAL)
+    assert portfolio["session_pnl"] == pytest.approx(100.0 - DEFAULT_INITIAL_CAPITAL)
     assert portfolio["history"][-1]["total_nav"] == pytest.approx(portfolio["total_nav"])
 
 

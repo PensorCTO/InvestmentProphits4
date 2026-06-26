@@ -22,7 +22,7 @@ from database.replica_store import commit_local, request_cloud_sync
 logger = logging.getLogger(__name__)
 
 DEFAULT_APEX_AGENT_ID = os.getenv("APEX_AGENT_ID", "APEX_EDGE")
-DEFAULT_INITIAL_CAPITAL = float(os.getenv("APEX_INITIAL_CAPITAL", "1000.0"))
+DEFAULT_INITIAL_CAPITAL = float(os.getenv("APEX_INITIAL_CAPITAL", "100.0"))
 
 
 def _utc_now_iso() -> str:
@@ -131,7 +131,8 @@ def _mark_open_position_value(
     market_mid: float,
     liquidity_tier: str,
 ) -> float:
-    exit_price = PolyCostModel.get_position_exit_price(
+    from engine_1_apex.trade_close import mark_to_market_exit_price
+    exit_price = mark_to_market_exit_price(
         direction, market_mid, liquidity_tier, kelly_size
     )
     return (kelly_size / entry_price) * exit_price

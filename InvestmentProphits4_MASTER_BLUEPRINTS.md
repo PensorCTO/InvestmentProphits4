@@ -1,6 +1,7 @@
 # InvestmentProphits4 — Master Blueprints
 
 **Version:** June 2026 checkpoint (infrastructure hardening, bankruptcy halt, Hrana retry, null-safe state parsing, oracle preflight fix, stop-loss reentry edge fix, Kelly clamp, async guardrails, DMA heartbeat telemetry, churn lockout, shadow Welch promotion, tri-state regime + HMM runtime levers, QA audit remediation, dual-engine Turso/libSQL arena, Karpathy AutoResearch Crucible, Apex Edge execution, Streamlit Command Center, live Polymarket CLOB when `EDGE_MODEL_MOCKED=false`)  
+**Update (June 2026 Phase 1+):** Added Kalman Filter fair value extraction, Full Kelly sizing ($b=1$), and Log-Odds Offline Beta Calibration.
 **Scope:** Paper-first Polymarket-inspired binary prediction market trading with optional LIVE execution scaffold. No real capital unless explicitly switched to LIVE mode with wallet keys.
 
 This document describes **what IP4 is**, **how it works end-to-end**, and **exactly what the trading strategy is** — from oracle snapshots through Crucible research, Apex paper fills, dashboard control plane, and observability. It reflects the codebase as implemented at this checkpoint, not aspirational backlog.
@@ -594,6 +595,11 @@ InvestmentProphits4/
 ```
 
 ### Seed markets (`database/seed_arena.py`)
+
+The fallback/mock markets defined in `MARKETS` are:
+- `mkt_us_election` (Politics)
+- `mkt_btc_100k` (Crypto)
+- `mkt_ai_agi` (Science)
 
 The previous hardcoded top-10 list has been replaced. `seed_arena.py` now populates up to 100 active markets dynamically via `gamma_client.discover_liquid_markets(limit=100)`, ensuring that the local SQLite database always reflects the most actively traded Polymarket events.
 

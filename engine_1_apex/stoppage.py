@@ -23,6 +23,7 @@ class TickStats:
     skipped_cooldown: int = 0
     skipped_edge: int = 0
     skipped_toxicity: int = 0
+    skipped_liquidity: int = 0
     skipped_already_positioned: int = 0
     evaluated: int = 0
     signals: int = 0
@@ -261,6 +262,12 @@ def classify_stoppage(stats: TickStats) -> tuple[str | None, str]:
     """Return (kind, detail). kind=None means healthy tick."""
     if stats.filled > 0 or stats.closed_flip > 0:
         return None, "activity"
+
+    if stats.evaluated > 0 and stats.skipped_liquidity >= stats.evaluated:
+        return (
+            "LIQUIDITY_STARVATION",
+            f"all {stats.skipped_liquidity}/{stats.evaluated} markets failed liquidity floor",
+        )
 
     if stats.evaluated > 0 and stats.skipped_hold >= stats.evaluated:
         return (
@@ -678,6 +685,71 @@ def cap_trim_fraction() -> float:
     from engine_1_apex.trade_close import cap_trim_fraction as _frac
 
     return _frac()
+
+
+def directional_hold_expiry_seconds() -> int:
+    return int(os.getenv("APEX_DIRECTIONAL_HOLD_EXPIRY_SECONDS", "3600"))
+
+
+def remediate_directional_hold_expiry(
+    conn,
+    *,
+    agent_id: str,
+    market_rows: list[tuple[str, str, float, str]],
+) -> int:
+    """Close OPEN trades held longer than directional hold expiry limit without moving favorably."""
+    expiry_limit = directional_hold_expiry_seconds()
+    if expiry_limit <= 0:
+        return 0
+
+    from datetime import datetime, timezone
+    from engine_1_apex.trade_close import close_open_trade, calculate_pnl, mark_to_market_exit_price
+
+    now = datetime.now(timezone.utc)
+    closed = 0
+    for market_id, category, market_mid, liq_tier in market_rows:
+        cursor = conn.execute(
+            """
+            SELECT trade_id, direction, entry_price, kelly_size, committed_at
+            FROM trade_execution
+            WHERE agent_id = ? AND market_id = ? AND status = 'OPEN'
+            """,
+            (agent_id, market_id),
+        )
+        for row in cursor.fetchall():
+            trade_id, direction, entry_price, size, committed_at = row
+            if not committed_at:
+                continue
+            try:
+                opened = datetime.fromisoformat(str(committed_at).replace("Z", "+00:00"))
+                if opened.tzinfo is None:
+                    opened = opened.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+
+            age_s = (now - opened).total_seconds()
+            if age_s >= expiry_limit:
+                exit_price = mark_to_market_exit_price(direction, market_mid, liq_tier, size)
+                pnl = calculate_pnl(entry_price, exit_price, size)
+                # If it hasn't moved favorably (e.g., PnL <= 0), close it
+                if pnl <= 0.0:
+                    close_open_trade(
+                        conn,
+                        trade_id=trade_id,
+                        agent_id=agent_id,
+                        market_id=market_id,
+                        direction=direction,
+                        entry_price=entry_price,
+                        size=size,
+                        category=category,
+                        market_mid=market_mid,
+                        liquidity_tier=liq_tier,
+                        entry_context=None,
+                        exit_reason="DIRECTIONAL_HOLD_EXPIRY",
+                    )
+                    closed += 1
+
+    return closed
 
 
 def persist_trader_health(

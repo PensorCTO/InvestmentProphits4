@@ -83,9 +83,11 @@ def mark_to_market_exit_price(
     liquidity_tier: str,
     size: float,
 ) -> float:
-    return PolyCostModel.get_position_exit_price(
+    base_exit = PolyCostModel.get_position_exit_price(
         direction, market_mid, liquidity_tier, size
     )
+    # Apply hardcoded 10 bps transaction cost friction per side
+    return base_exit * (1.0 - 0.0010)
 
 
 def get_agent_market_exposure(conn, agent_id: str, market_id: str) -> float:

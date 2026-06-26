@@ -1,53 +1,53 @@
 {
     "weights": {
-        "order_book_imbalance": 0.15941364985081177,
-        "cross_venue_adj": 0.13832186164821259,
-        "spread": 0.020237097400278237,
-        "mid_price": 0.5279094080441512,
-        "bid_depth": 0.04247022702551101,
-        "ask_depth": 0.9948690552504718
+        "order_book_imbalance": 0.826579198028864,
+        "cross_venue_adj": 0.663219583856783,
+        "spread": 0.05125837889196304,
+        "mid_price": 0.4563590654106902,
+        "bid_depth": 0.10583487815298484,
+        "ask_depth": 0.16640679649411777
     },
     "history": {
-        "max_history": 23,
+        "max_history": 27,
         "min_history": 3,
-        "breakout_periods": 9
+        "breakout_periods": 10
     },
     "extremes": {
-        "high": 0.9757591366594746,
-        "low": 0.0742674865913543
+        "high": 0.9253120154938322,
+        "low": 0.04218571627636521
     },
     "momentum": {
-        "price_change_up": 0.010446827486710759,
-        "price_change_down": -0.008430955477514759,
-        "trend_up_mult": 1.0146613214960054,
-        "trend_down_mult": 0.9934865210301498,
+        "price_change_up": 0.018985324966825163,
+        "price_change_down": -0.0012432882448843341,
+        "trend_up_mult": 1.0498910181484244,
+        "trend_down_mult": 0.9911034207381736,
         "consecutive_required": 2,
-        "ceiling": 0.9110865600820767,
-        "floor": 0.09175478149511786
+        "ceiling": 0.9014248654303574,
+        "floor": 0.07695814088143046
     },
     "breakout": {
-        "up_mult": 1.003046503999889,
-        "down_mult": 0.985733258967449,
-        "price_change_up": 0.0020450155075020567,
-        "price_change_down": -0.009899945779606368,
-        "ceiling": 0.8911386287508887,
-        "floor": 0.13225940134370107,
+        "up_mult": 1.009138489766759,
+        "down_mult": 0.9971952574167391,
+        "price_change_up": 0.005592740119863254,
+        "price_change_down": -0.0065277446097880614,
+        "ceiling": 0.9179322494458668,
+        "floor": 0.14519180909638585,
         "consecutive_required": 2
     },
     "obi": {
-        "threshold": 0.12321610743379198,
-        "mid_low": 0.6220947479359106,
-        "mid_high": 0.8661440914696249,
-        "mid_low_short": 0.13933422934411124,
-        "mid_high_short": 0.4851260535983883,
+        "threshold": 0.10685051383089594,
+        "mid_low": 0.49198282325610343,
+        "mid_high": 0.8936710457076645,
+        "mid_low_short": 0.06375921748292179,
+        "mid_high_short": 0.4457920487652159,
         "consecutive_required": 1
     },
     "volatility": {
-        "spread_max": 0.02561391694330685,
-        "vol_ratio_max": 2.0746683045592067,
-        "trend_up_mult": 1.019744403628353,
-        "trend_down_mult": 0.970049665685981,
-        "ceiling": 0.9335921992389237,
-        "floor": 0.12167742147312345
+        "spread_max": 0.02540619275559428,
+        "vol_ratio_max": 1.3234581392430715,
+        "trend_up_mult": 1.0207769991119942,
+        "trend_down_mult": 0.9513620340594433,
+        "ceiling": 0.9104945554242287,
+        "floor": 0.1067133112011378
     }
 }

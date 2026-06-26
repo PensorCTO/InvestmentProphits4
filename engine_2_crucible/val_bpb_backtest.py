@@ -148,7 +148,7 @@ def _score_samples(
         direction = "YES" if decision == "BUY_YES" else "NO"
         fair_value = _fair_value_for_backtest(state, direction)
         kelly_frac = compute_fractional_kelly(
-            fair_value=fair_value,
+            p_t=fair_value,
             market_mid=mid,
             direction=direction,
             edge_slope=float(state.get("flow_imbalance_5s", 0.0))

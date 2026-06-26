@@ -580,3 +580,16 @@ BookWatcher None fields no longer crash Apex ticks. Vector backfill runs after b
 - **Verified:** Stack restarted, trade flow verified, Optuna iterating successfully.
 
 **Next:** Monitor overnight Optuna trials for performance improvement.
+
+### 2026-06-26 18:51 — Implemented Phase 1: Risk Fixes (Drawdown guard, Dollar-Symmetric Expected Edge, Dynamic Liquidity Gate). Tests passed (319/319), trade flow validated, and acceptance gate passed.
+
+**Next:** Implement Phase 1+ local fitting script for log-odds beta weights using local trade_exhaust CDC.
+
+### 2026-06-26 — Phase 1+ Completed: Full Kelly and Asynchronous Beta Calibration
+
+- **Architecture:** Kalman Filter (`shared/kalman_tracker.py`) engineered to isolate fair value from microstructure noise, alongside the replacement of if-chains with a log-odds combiner.
+- **Sizing:** Swapped undefined fractional heuristics for Full Kelly ($b=1$) allocation by pushing `APEX_FRACTIONAL_KELLY` to $1.0$.
+- **Offline Model Learning:** Deployed an async logistic regression worker (`beta_calibration_worker.py`) inside the Crucible loop, actively learning $eta$ weights from `trade_exhaust` (CDC pattern) natively.
+- **Validation:** Reset wallet, ensured multi-leg live performance holds a strict NAV session floor without cascading limits, 319 pytest pass, acceptance_gate PASS.
+
+**Next:** Monitor real-world spread captures and model degradation rates under new continuous re-fitting paradigm.

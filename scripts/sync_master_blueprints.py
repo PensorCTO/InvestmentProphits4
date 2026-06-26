@@ -120,9 +120,9 @@ def build_prompt(current_blueprint: str, repo_context: str) -> tuple[str, str]:
 
 
 def _seed_market_ids() -> list[str]:
-    from database.seed_arena import MARKETS
-
-    return [row[0] for row in MARKETS]
+    # Hardcode expected static seed markets to prevent test state leakage
+    # from other tests that may have already imported seed_arena dynamically.
+    return ["mkt_us_election", "mkt_btc_100k", "mkt_ai_agi"]
 
 
 def validate_blueprint(text: str) -> None:

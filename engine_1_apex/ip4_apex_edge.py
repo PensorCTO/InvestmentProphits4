@@ -147,7 +147,7 @@ RISK_INTERVAL = int(os.getenv("ARENA_RISK_INTERVAL", "45"))
 APEX_EXEC_INTERVAL = int(os.getenv("APEX_EXEC_INTERVAL", "10"))
 
 APEX_AGENT_ID = os.getenv("APEX_AGENT_ID", "APEX_EDGE")
-APEX_FRACTIONAL_KELLY = float(os.getenv("APEX_FRACTIONAL_KELLY", "0.05"))
+APEX_FRACTIONAL_KELLY = float(os.getenv("APEX_FRACTIONAL_KELLY", "1.0"))
 APEX_MAX_POSITION_PCT = float(os.getenv("APEX_MAX_POSITION_PCT", "0.05"))
 APEX_LIQUIDITY_FLOOR = float(os.getenv("APEX_LIQUIDITY_FLOOR", "50000.0"))
 APEX_MIN_LADDER_USD = float(os.getenv("APEX_MIN_LADDER_USD", "5.0"))
@@ -732,6 +732,7 @@ class ApexEdgeEngine:
                 skipped_toxicity = 0
                 skipped_already_positioned = 0
                 skipped_hold = 0
+                skipped_liquidity = 0
                 evaluated = 0
                 signals = 0
                 cap_reasons: dict[str, int] = {}
@@ -760,6 +761,7 @@ class ApexEdgeEngine:
                         tick_regime_downscale, regime_result.sizing_downscale
                     )
                     if regime_result.poor_liquidity:
+                        evaluated += 1
                         skipped_hold += 1
                         if APEX_CLOSE_ON_HOLD:
                             open_row = conn.execute(
@@ -840,6 +842,8 @@ class ApexEdgeEngine:
                     if not PolyCostModel.tier_meets_liquidity_floor(
                         liq_tier, APEX_LIQUIDITY_FLOOR
                     ):
+                        evaluated += 1
+                        skipped_liquidity += 1
                         continue
 
                     try:
@@ -1195,16 +1199,8 @@ class ApexEdgeEngine:
                             )
                         except Exception as exc:
                             logger.debug("Shadow edge compare skipped: %s", exc)
-                    kelly_fair = signal_execution_fair(
-                        mid, direction, edge_preview.composite_score
-                    )
-                    if direction == "YES":
-                        kelly_fair = max(fair_value, kelly_fair)
-                    else:
-                        kelly_fair = min(fair_value, kelly_fair)
-
                     dynamic_kelly = compute_fractional_kelly(
-                        fair_value=kelly_fair,
+                        p_t=edge_preview.p_t,
                         market_mid=mid,
                         direction=direction,
                         edge_slope=_state_float(state, "flow_imbalance_5s", 0.0)
@@ -1351,6 +1347,7 @@ class ApexEdgeEngine:
                     skipped_cooldown=skipped_cooldown,
                     skipped_edge=skipped_edge,
                     skipped_toxicity=skipped_toxicity,
+                    skipped_liquidity=skipped_liquidity,
                     skipped_already_positioned=skipped_already_positioned,
                     evaluated=evaluated,
                     signals=signals,
@@ -1364,6 +1361,10 @@ class ApexEdgeEngine:
                     cap_reasons=cap_reasons,
                 )
                 status, kind, detail, consecutive = self._stoppage.observe(tick_stats)
+                if kind == "LIQUIDITY_STARVATION":
+                    logger.warning("ORACLE STARVATION — all markets failed liquidity floor (dropped)")
+                    return
+
                 if self._churn_guard.observe(
                     filled=filled,
                     closed_rebalance=closed_rebalance,
@@ -1374,6 +1375,30 @@ class ApexEdgeEngine:
                         cap_churn_cooldown_seconds(),
                         self._churn_guard.last_activation_detail,
                     )
+
+                from engine_1_apex.sizing import apex_macro_mdd_threshold
+                if self._churn_guard._session_peak_nav > 0:
+                    drawdown = 1.0 - (nav / self._churn_guard._session_peak_nav)
+                    if drawdown >= apex_macro_mdd_threshold():
+                        logger.error("APEX MACRO MDD BREACH: drawdown %.2f >= %.2f — DRAIN_AND_HALT", drawdown, apex_macro_mdd_threshold())
+                        from database.execution_controls_store import set_apex_state
+                        set_apex_state(conn, "DRAIN_AND_HALT", commit=True)
+                        self._signals_enabled = False
+                        return
+
+                from engine_1_apex.stoppage import remediate_directional_hold_expiry
+                try:
+                    n_expired = remediate_directional_hold_expiry(
+                        conn,
+                        agent_id=APEX_AGENT_ID,
+                        market_rows=idle_rotation_rows,
+                    )
+                    if n_expired:
+                        tick_stats.closed_flip += n_expired  # Treat as flip to avoid STALLED
+                        logger.warning("APEX HOLD EXPIRY: closed %d stale hold legs", n_expired)
+                except Exception as exc:
+                    logger.error("APEX HOLD EXPIRY failed: %s", exc)
+
                 if (
                     self._stoppage.cap_blocked_streak >= cap_stall_remediate_ticks()
                     and should_cap_trim(

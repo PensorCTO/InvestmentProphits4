@@ -16,6 +16,8 @@ from shared.overlay_constants import OVERLAY_KEYS
 from shared.overlay_mode import cross_venue_enabled, longshot_only
 from shared.polymarket_clob import ClobSnapshot, MarketRow
 from shared.trend_history import trend_overlay_adj
+from shared.kalman_tracker import get_kalman_tracker
+from shared.regime_classifier import get_regime_tracker
 
 
 @dataclass
@@ -74,12 +76,26 @@ class LiveOverlayFeed:
         self.news_api_key = os.getenv("NEWS_API_KEY", "")
         self.cross_venue_api_key = os.getenv("CROSS_VENUE_API_KEY", "")
         self._calibration_report = load_calibration_report()
+        self._kalman = get_kalman_tracker()
+        self._regime = get_regime_tracker()
 
     def _get_headlines(self, market_id: str) -> list[str]:
         return load_news_headlines(market_id=market_id)
 
     async def compute(self, ctx: MarketContext) -> dict[str, float]:
         adjustments = {k: 0.0 for k in OVERLAY_KEYS}
+
+        # Inject Kalman tracking features
+        kf_fair, kf_innov = self._kalman.update(ctx.market_id, ctx.mid)
+        adjustments["kf_fair"] = round(kf_fair, 6)
+        adjustments["z_kf"] = round(kf_innov, 6)
+        
+        # Inject OBI normalized
+        adjustments["obi_norm"] = round(ctx.depth_imbalance, 4)
+
+        # Inject Regime
+        regime_state = self._regime._markets.get(ctx.market_id)
+        adjustments["regime_score"] = round(regime_state.last_score, 2) if regime_state else 0.0
 
         adjustments["longshot"] = round(longshot_correction(ctx.mid), 4)
 

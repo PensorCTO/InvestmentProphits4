@@ -28,6 +28,7 @@ from engine_1_apex.execution_edge import (
     composite_edge_passes,
     v2_cost_multiplier,
 )
+from engine_1_apex.kelly_sizing import CalibratedSizingEngine
 from database.replica_store import commit_local, open_replica, request_cloud_sync, sync_replica_now
 from database.transaction import arena_transaction
 from database.knowledge_store import KnowledgeStore
@@ -210,6 +211,8 @@ class PaperGateway:
                     total_open_notional=sizing["open_notional"],
                     min_ladder_usd=MIN_LADDER_USD,
                     portfolio_pct=max_portfolio_pct(),
+                    lifetime_hwm=sizing.get("lifetime_hwm", 0.0),
+                    session_hwm=sizing.get("session_hwm", 0.0),
                 )
             if kelly_size is None:
                 return {"status": "REJECTED", "reason": sizing_reason or "position_cap"}
@@ -230,6 +233,13 @@ class PaperGateway:
                     "reason": herding_reason or "herding_headroom_insufficient",
                     **herding_meta,
                 }
+
+            mtf_bid = float(state.get("bid_depth", 0.0))
+            mtf_ask = float(state.get("ask_depth", 0.0))
+            mtf_book_depth_usd = (mtf_bid + mtf_ask) * market_mid
+            
+            if mtf_book_depth_usd > 0 and (kelly_size / mtf_book_depth_usd) > 0.05:
+                return {"status": "REJECTED", "reason": "liquidity_gate_mtf"}
 
             edge_result = compute_composite_edge(
                 fair_value=fair_value,
@@ -286,9 +296,8 @@ class PaperGateway:
                 market_mid, direction, liquidity_tier, kelly_size, capital=capital
             )
 
-            # We define bracket orders. Note: NO edge_collapse_pct. Risk Daemon only exits on these brackets.
             stop_loss, take_profit = PolyCostModel.compute_brackets(
-                fill_price, direction=direction
+                fill_price, direction=direction, target_dollar_move=0.10
             )
 
             trade_id = f"trd_{agent_id}_{market_id[:8]}_{int(time.time() * 1000)}"

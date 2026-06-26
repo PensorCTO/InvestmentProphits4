@@ -125,21 +125,21 @@ class PolyCostModel:
         entry_price: float,
         *,
         direction: str = "YES",
-        tp_logit_delta: float = 1.2,
-        sl_logit_delta: float = 0.8,
+        target_dollar_move: float = 0.10,
     ) -> tuple[float, float]:
         """
-        Log-odds stop/take-profit bounded in [0.01, 0.99] price space.
+        Dollar-symmetric stop/take-profit brackets bounded in [0.02, 0.98] price space.
+        Capturing a true spread (e.g. $0.10) on a mean-reverting swing.
+        Returns (stop_loss, take_profit).
         """
-        entry = max(cls._PRICE_FLOOR, min(cls._PRICE_CEIL, entry_price))
-        logit = cls._to_logit(entry)
+        take_profit = entry_price + target_dollar_move
+        stop_loss = entry_price - target_dollar_move
 
-        stop_loss = cls._from_logit(logit - sl_logit_delta)
-        take_profit = cls._from_logit(logit + tp_logit_delta)
-        stop_loss = min(stop_loss, max(cls._PRICE_FLOOR, entry - 0.001))
-        take_profit = max(take_profit, min(cls._PRICE_CEIL, entry + 0.001))
-        if stop_loss >= entry:
-            stop_loss = max(0.001, entry * 0.5)
+        stop_loss = max(0.02, min(0.98, stop_loss))
+        take_profit = max(0.02, min(0.98, take_profit))
+
+        if stop_loss >= entry_price:
+            stop_loss = max(0.02, entry_price * 0.5)
 
         return stop_loss, take_profit
 

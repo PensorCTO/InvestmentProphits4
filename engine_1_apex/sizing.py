@@ -4,21 +4,86 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from datetime import datetime, timezone
+from typing import Any
 
 from database.portfolio_store import compute_agent_nav
 from shared.capital_injection import EVENT_WALLET_RESET
 
+_hwm_cache: dict[str, dict[str, Any]] = {}
+_hwm_lock = threading.Lock()
+
+def fetch_hwm(agent_id: str, nav: float) -> tuple[float, float]:
+    """
+    Non-blocking HWM retrieval. Bootstraps asynchronously if missing.
+    Returns (lifetime_hwm, session_hwm).
+    """
+    with _hwm_lock:
+        if agent_id in _hwm_cache:
+            state = _hwm_cache[agent_id]
+            if nav > state["lifetime_hwm"]:
+                state["lifetime_hwm"] = nav
+            if nav > state["session_hwm"]:
+                state["session_hwm"] = nav
+            return state["lifetime_hwm"], state["session_hwm"]
+        
+        _hwm_cache[agent_id] = {
+            "lifetime_hwm": nav,
+            "session_hwm": nav,
+            "bootstrapping": True,
+        }
+
+    def _bootstrap():
+        try:
+            from database.replica_store import open_replica
+            bg_conn = open_replica(read_only=True)
+            try:
+                row_lt = bg_conn.execute(
+                    "SELECT MAX(total_nav) FROM portfolio_snapshots WHERE agent_id = ?", 
+                    (agent_id,)
+                ).fetchone()
+                lifetime = float(row_lt[0]) if row_lt and row_lt[0] else nav
+
+                cutoff = _wallet_reset_cutoff_iso(bg_conn, agent_id)
+                if cutoff:
+                    row_sess = bg_conn.execute(
+                        "SELECT MAX(total_nav) FROM portfolio_snapshots WHERE agent_id = ? AND captured_at >= ?",
+                        (agent_id, cutoff)
+                    ).fetchone()
+                    session = float(row_sess[0]) if row_sess and row_sess[0] else nav
+                else:
+                    session = lifetime
+
+                with _hwm_lock:
+                    state = _hwm_cache.get(agent_id)
+                    if state:
+                        state["lifetime_hwm"] = max(state["lifetime_hwm"], lifetime)
+                        state["session_hwm"] = max(state["session_hwm"], session)
+                        state["bootstrapping"] = False
+            finally:
+                bg_conn.close()
+        except Exception:
+            pass
+
+    threading.Thread(target=_bootstrap, daemon=True).start()
+    return nav, nav
+
 # 0 = disabled (no portfolio-wide deployment cap)
 DEFAULT_MAX_PORTFOLIO_PCT = 0.50
 DEFAULT_MAX_POSITION_PCT = 0.05
-DEFAULT_FRACTIONAL_KELLY = 0.05
+DEFAULT_FRACTIONAL_KELLY = 1.0
 DEFAULT_STOP_LOSS_COOLDOWN_SECONDS = 900
 DEFAULT_STOP_LOSS_ESCALATION_MAX = 4
 DEFAULT_STOP_LOSS_REENTRY_EDGE_MARGIN = 0.01
 DEFAULT_STOP_LOSS_LOOKBACK_HOURS = 24
 DEFAULT_LONGSHOT_MID_THRESHOLD = 0.05
 DEFAULT_LONGSHOT_MIN_NET_EDGE = 0.020
+DEFAULT_APEX_MACRO_MDD_THRESHOLD = 0.15
+
+
+def apex_macro_mdd_threshold() -> float:
+    return float(os.getenv("APEX_MACRO_MDD_THRESHOLD", str(DEFAULT_APEX_MACRO_MDD_THRESHOLD)))
 
 
 def max_portfolio_pct() -> float:
@@ -335,6 +400,8 @@ def compute_ladder_budget(
     min_ladder_usd: float,
     portfolio_pct: float | None = None,
     regime_downscale: float = 1.0,
+    lifetime_hwm: float = 0.0,
+    session_hwm: float = 0.0,
 ) -> tuple[float | None, str | None]:
     """
     Return (kelly_size, skip_reason). skip_reason is set when kelly_size is None.
@@ -342,6 +409,12 @@ def compute_ladder_budget(
     """
     if nav <= 0:
         return None, "nav_zero"
+
+    mdd = apex_macro_mdd_threshold()
+    if lifetime_hwm > 0 and nav < lifetime_hwm * (1.0 - mdd):
+        return None, "macro_drawdown_lifetime"
+    if session_hwm > 0 and nav < session_hwm * (1.0 - mdd):
+        return None, "macro_drawdown_session"
 
     fractional_kelly = clamp_fractional_kelly(fractional_kelly)
 
@@ -399,10 +472,15 @@ def load_agent_sizing_snapshot(conn, agent_id: str) -> dict | None:
     max_position_pct = effective_max_position_pct(float(row[1]))
     fractional_kelly = effective_fractional_kelly(float(row[2]))
     nav, _, _ = compute_agent_nav(conn, agent_id)
+    
+    lifetime_hwm, session_hwm = fetch_hwm(agent_id, nav)
+    
     return {
         "cash": cash,
         "nav": nav,
         "max_position_pct": max_position_pct,
         "fractional_kelly": fractional_kelly,
         "open_notional": get_agent_open_notional(conn, agent_id),
+        "lifetime_hwm": lifetime_hwm,
+        "session_hwm": session_hwm,
     }

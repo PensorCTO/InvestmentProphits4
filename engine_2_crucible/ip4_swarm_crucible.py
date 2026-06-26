@@ -705,9 +705,12 @@ class AutoResearchCrucible:
                 # Walk-forward
                 from engine_2_crucible.walk_forward_pipeline import run_walk_forward_pipeline
                 from engine_2_crucible.strategy_loader import load_evaluate_market_from_source
+                from engine_2_crucible.beta_calibration_worker import run_calibration
                 with arena_lock(ARENA_LOCK_PATH):
                     wf_conn = open_replica()
                     try:
+                        # Re-calibrate Log-Odds beta weights on recent exhaust before testing
+                        run_calibration(wf_conn)
                         wf = run_walk_forward_pipeline(load_evaluate_market_from_source(winner_source), wf_conn)
                     finally:
                         wf_conn.close()
