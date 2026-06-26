@@ -20,7 +20,7 @@ ContextStream MCP is **disabled**. Use the in-repo Karpathy-style wiki as persis
 1. **Read** `agent/wiki/project_wiki.md` before exploring the codebase on a new task.
 2. Check **Current State Audit**, **Operator Runbook**, and **Active Work**.
 3. Skim **Decisions Log**, **Lessons Learned**, and **User Preferences** before changes.
-4. **Stack check:** `.venv/bin/python scripts/stack_status.py` — see `.cursor/skills/ip4-stack-lifecycle/SKILL.md`.
+4. **Stack check:** `.venv/bin/python scripts/stack_status.py` — see `.agents/skills/ip4-stack-lifecycle/SKILL.md`.
 5. **After restart:** `.venv/bin/python scripts/verify_trade_flow.py` — must see buy + sell before handoff.
 
 ## During work
@@ -36,7 +36,7 @@ ContextStream MCP is **disabled**. Use the in-repo Karpathy-style wiki as persis
 
 Append to `## Session Log` via `append_session_log()` — what changed, validation, **Next** step.
 
-**Before sign-off:** gate PASS + `stack_status.py --require-healthy` **OR** `stop_stack.py` (clean stop). See `.cursor/skills/ip4-stack-lifecycle/SKILL.md` and `.cursor/skills/ip4-definition-of-done/SKILL.md`. Exit 1 = not done. **Never hand off a crashed stack.**
+**Before sign-off:** gate PASS + `stack_status.py --require-healthy` **OR** `stop_stack.py` (clean stop). See `.agents/skills/ip4-stack-lifecycle/SKILL.md` and `.agents/skills/ip4-definition-of-done/SKILL.md`. Exit 1 = not done. **Never hand off a crashed stack.**
 
 ## Operator actions
 
