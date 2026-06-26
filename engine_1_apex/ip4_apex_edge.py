@@ -1069,9 +1069,39 @@ class ApexEdgeEngine:
                         """,
                         (APEX_AGENT_ID, market_id),
                     ).fetchone()
+
+                    direction = signal_direction
+                    mid = _state_float(state, "mid_price", 0.5)
+                    category = state.get("category", "")
+                    fair_value = resolve_execution_fair_value(
+                        conn,
+                        agent_id=APEX_AGENT_ID,
+                        market_blob=data,
+                        state=state,
+                        direction=direction,
+                    )
+
+                    from engine_1_apex.execution_edge import (
+                        compute_composite_edge,
+                        signal_execution_fair,
+                    )
+
+                    edge_preview = compute_composite_edge(
+                        fair_value=fair_value,
+                        market_mid=mid,
+                        direction=direction,
+                        liquidity_tier=liq_tier,
+                        kelly_size=APEX_MIN_LADDER_USD,
+                        capital=nav,
+                        state=state,
+                    )
+
                     if open_dir and open_dir[0] != signal_direction:
-                        category = state.get("category", "")
-                        mid = _state_float(state, "mid_price", 0.5)
+                        if edge_preview.composite_score < 0.015:
+                            logger.debug("APEX ignoring weak signal flip on %s", market_id)
+                            skipped_cap += 1
+                            continue
+
                         n_closed = close_agent_market_positions(
                             conn,
                             agent_id=APEX_AGENT_ID,
@@ -1095,22 +1125,11 @@ class ApexEdgeEngine:
                                 signal_direction,
                             )
 
-                    direction = signal_direction
-                    mid = _state_float(state, "mid_price", 0.5)
-                    category = state.get("category", "")
-                    fair_value = resolve_execution_fair_value(
-                        conn,
-                        agent_id=APEX_AGENT_ID,
-                        market_blob=data,
-                        state=state,
-                        direction=direction,
-                    )
-
                     position_cap = nav * sizing["max_position_pct"]
                     exposure = PaperGateway._get_agent_market_exposure(
                         conn, APEX_AGENT_ID, market_id
                     )
-                    if exposure >= position_cap - 1e-6:
+                    if exposure > position_cap * 1.05:
                         n_trim = 0
                         if not self._churn_guard.blocks_rebalance():
                             n_trim = trim_market_exposure_to_cap(
@@ -1143,21 +1162,6 @@ class ApexEdgeEngine:
                                 market_id,
                                 n_trim,
                             )
-
-                    from engine_1_apex.execution_edge import (
-                        compute_composite_edge,
-                        signal_execution_fair,
-                    )
-
-                    edge_preview = compute_composite_edge(
-                        fair_value=fair_value,
-                        market_mid=mid,
-                        direction=direction,
-                        liquidity_tier=liq_tier,
-                        kelly_size=APEX_MIN_LADDER_USD,
-                        capital=nav,
-                        state=state,
-                    )
                     if self._shadow_evaluate_fn is not None:
                         try:
                             from engine_1_apex.execution_edge import boosted_net_edge
@@ -1269,80 +1273,6 @@ class ApexEdgeEngine:
                         continue
 
                     if kelly_size is None:
-                        if skip_reason == "portfolio_cap" and open_notional > 0:
-                            if self._churn_guard.blocks_rebalance():
-                                skipped_cap += 1
-                                cap_reasons["churn_guard"] = (
-                                    cap_reasons.get("churn_guard", 0) + 1
-                                )
-                                continue
-                            closed, _, _, _ = close_smallest_open_leg(
-                                conn,
-                                agent_id=APEX_AGENT_ID,
-                                exit_reason="PORTFOLIO_CAP_ROTATE",
-                            )
-                            if closed:
-                                closed_rebalance += 1
-                                sizing = load_agent_sizing_snapshot(conn, APEX_AGENT_ID)
-                                if sizing:
-                                    cash = sizing["cash"]
-                                    nav = sizing["nav"]
-                                    open_notional = sizing["open_notional"]
-                                exposure = PaperGateway._get_agent_market_exposure(
-                                    conn, APEX_AGENT_ID, market_id
-                                )
-                                kelly_size, skip_reason = compute_ladder_budget(
-                                    nav=nav,
-                                    cash=cash,
-                                    fractional_kelly=signal_kelly,
-                                    max_position_pct=sizing["max_position_pct"],
-                                    market_exposure=exposure,
-                                    total_open_notional=open_notional,
-                                    min_ladder_usd=APEX_MIN_LADDER_USD,
-                                    portfolio_pct=active_max_portfolio_pct(),
-                                )
-                                logger.info(
-                                    "APEX TRIM portfolio_cap: closed smallest leg for headroom",
-                                )
-                        if skip_reason == "position_cap" and exposure > 0:
-                            if self._churn_guard.blocks_rebalance():
-                                skipped_cap += 1
-                                cap_reasons["churn_guard"] = (
-                                    cap_reasons.get("churn_guard", 0) + 1
-                                )
-                                continue
-                            if close_smallest_market_leg(
-                                conn,
-                                agent_id=APEX_AGENT_ID,
-                                market_id=market_id,
-                                category=category,
-                                market_mid=mid,
-                                liquidity_tier=liq_tier,
-                                exit_reason="CAP_REBALANCE",
-                            ):
-                                closed_rebalance += 1
-                                sizing = load_agent_sizing_snapshot(conn, APEX_AGENT_ID)
-                                if sizing:
-                                    cash = sizing["cash"]
-                                    nav = sizing["nav"]
-                                    open_notional = sizing["open_notional"]
-                                exposure = PaperGateway._get_agent_market_exposure(
-                                    conn, APEX_AGENT_ID, market_id
-                                )
-                                kelly_size, skip_reason = compute_ladder_budget(
-                                    nav=nav,
-                                    cash=cash,
-                                    fractional_kelly=signal_kelly,
-                                    max_position_pct=sizing["max_position_pct"],
-                                    market_exposure=exposure,
-                                    total_open_notional=open_notional,
-                                    min_ladder_usd=APEX_MIN_LADDER_USD,
-                                    portfolio_pct=active_max_portfolio_pct(),
-                                )
-                                logger.info(
-                                    "APEX TRIM cap_headroom: %s closed 1 leg for ladder room",
-                                    market_id,
-                                )
                         if kelly_size is None:
                             skipped_cap += 1
                             reason_key = skip_reason or "unknown"
