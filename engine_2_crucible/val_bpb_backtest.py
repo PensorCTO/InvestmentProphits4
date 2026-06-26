@@ -26,6 +26,7 @@ from engine_2_crucible.strategy_loader import (
     StrategyLoadError,
     load_evaluate_market_from_file,
 )
+from engine_2_crucible.backtest_judge import penalized_sortino
 
 STRATEGY_FILE = Path(__file__).resolve().parent / "active_strategy.py"
 BACKTEST_MAX_ROWS = int(os.getenv("BACKTEST_MAX_ROWS", "10000"))
@@ -169,12 +170,12 @@ def _score_samples(
             dd = (peak_capital - capital) / peak_capital
             max_drawdown = max(max_drawdown, dd)
 
-    sortino = _sortino_ratio(trade_returns)
-    total_return = (capital - INITIAL_CAPITAL) / INITIAL_CAPITAL
-    score = sortino if trade_returns else 0.0
-
-    if max_drawdown > DRAWDOWN_PENALTY_THRESHOLD:
-        score -= max_drawdown * 10.0
+    churn_rate = len(trade_returns) / len(samples) if samples else 0.0
+    
+    if trade_returns:
+        score = penalized_sortino(trade_returns, max_drawdown, churn_rate)
+    else:
+        score = 0.0
 
     if mae_values:
         avg_mae = sum(mae_values) / len(mae_values)

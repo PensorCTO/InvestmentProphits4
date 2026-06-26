@@ -8,3 +8,4 @@ aiohttp>=3.9.0
 eth-account>=0.11.0
 web3>=6.0.0
 streamlit>=1.32.0
+optuna>=4.1.0

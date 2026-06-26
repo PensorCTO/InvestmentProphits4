@@ -562,3 +562,21 @@ BookWatcher None fields no longer crash Apex ticks. Vector backfill runs after b
 ### 2026-06-26 12:13 — Analyzed initial post-reset trade flow. Stack restart verified PASS with verify_trade_flow.py logging plumbing + alpha signals (buy+sell) in current Apex session. The bot successfully bought `mkt_will_argentina_win_the_2026_fi YES @ 0.1542` and sold `mkt_will_england_win_the_2026_fifa YES` due to thesis_expired.
 
 **Next:** Monitor dashboard and run regression tests if needed. Wait for user feedback.
+
+### 2026-06-26 — Optuna Bayesian Optimization Integration
+
+- **Architecture:** Replaced Crucible DeepSeek proposal loop with an Optuna SQLite study ().
+- **Config:** Extracted numeric variables into .
+- **Math:** Integrated penalized Sortino (churn + mdd) into  to prioritize smooth equity curves.
+- **Verified:** Stack restarted, trade flow verified, Optuna iterating successfully.
+
+**Next:** Monitor overnight Optuna trials for performance improvement.
+
+### 2026-06-26 — Optuna Bayesian Optimization Integration
+
+- **Architecture:** Replaced Crucible DeepSeek proposal loop with an Optuna SQLite study (`database/optuna_study.db`).
+- **Config:** Extracted numeric variables into `engine_2_crucible/strategy_config.json`.
+- **Math:** Integrated penalized Sortino (churn + mdd) into `backtest_judge.py` to prioritize smooth equity curves.
+- **Verified:** Stack restarted, trade flow verified, Optuna iterating successfully.
+
+**Next:** Monitor overnight Optuna trials for performance improvement.

@@ -43,6 +43,15 @@ def sortino_ratio(returns: list[float]) -> float:
     return mean_r / downside_dev
 
 
+def penalized_sortino(returns: list[float], max_dd: float, churn_rate: float) -> float:
+    """Sortino ratio penalized by max drawdown and high churn rate."""
+    sortino = sortino_ratio(returns)
+    # The higher the drawdown and churn, the more the Sortino is penalized.
+    # Score = Sortino - (max_dd * 10) - (churn_rate * 10)
+    # This optimizes for the smoothest equity curve with consistent trading.
+    return sortino - (max_dd * 10.0) - (churn_rate * 10.0)
+
+
 def max_drawdown_from_returns(returns: list[float]) -> float:
     """Peak-to-trough drawdown on cumulative return curve."""
     if not returns:

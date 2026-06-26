@@ -1,0 +1,53 @@
+{
+    "weights": {
+        "order_book_imbalance": 0.15941364985081177,
+        "cross_venue_adj": 0.13832186164821259,
+        "spread": 0.020237097400278237,
+        "mid_price": 0.5279094080441512,
+        "bid_depth": 0.04247022702551101,
+        "ask_depth": 0.9948690552504718
+    },
+    "history": {
+        "max_history": 23,
+        "min_history": 3,
+        "breakout_periods": 9
+    },
+    "extremes": {
+        "high": 0.9757591366594746,
+        "low": 0.0742674865913543
+    },
+    "momentum": {
+        "price_change_up": 0.010446827486710759,
+        "price_change_down": -0.008430955477514759,
+        "trend_up_mult": 1.0146613214960054,
+        "trend_down_mult": 0.9934865210301498,
+        "consecutive_required": 2,
+        "ceiling": 0.9110865600820767,
+        "floor": 0.09175478149511786
+    },
+    "breakout": {
+        "up_mult": 1.003046503999889,
+        "down_mult": 0.985733258967449,
+        "price_change_up": 0.0020450155075020567,
+        "price_change_down": -0.009899945779606368,
+        "ceiling": 0.8911386287508887,
+        "floor": 0.13225940134370107,
+        "consecutive_required": 2
+    },
+    "obi": {
+        "threshold": 0.12321610743379198,
+        "mid_low": 0.6220947479359106,
+        "mid_high": 0.8661440914696249,
+        "mid_low_short": 0.13933422934411124,
+        "mid_high_short": 0.4851260535983883,
+        "consecutive_required": 1
+    },
+    "volatility": {
+        "spread_max": 0.02561391694330685,
+        "vol_ratio_max": 2.0746683045592067,
+        "trend_up_mult": 1.019744403628353,
+        "trend_down_mult": 0.970049665685981,
+        "ceiling": 0.9335921992389237,
+        "floor": 0.12167742147312345
+    }
+}

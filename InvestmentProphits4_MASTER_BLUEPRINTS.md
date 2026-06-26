@@ -16,7 +16,7 @@ InvestmentProphits4 (IP4) is a **dual-engine paper arena**:
 | Engine | Process | Role |
 |--------|---------|------|
 | **Engine 1 — Apex Edge** | `engine_1_apex/ip4_apex_edge.py` | Oracle sync → `trade_exhaust` snapshots → read `active_strategy` from Turso → fair value + net edge gates → paper (or LIVE) fills |
-| **Engine 2 — Crucible** | `engine_2_crucible/ip4_swarm_crucible.py` | Karpathy loop: DeepSeek proposes full `active_strategy.py` → `val_bpb_backtest.py` Sortino judge → keep/revert → push winners to Turso |
+| **Engine 2 — Crucible** | `engine_2_crucible/ip4_swarm_crucible.py` | Karpathy loop: Optuna Bayesian Optimization iterates on strategy_config.json → `val_bpb_backtest.py` Sortino judge → keep/revert → push winners to Turso |
 | **Engine 3 — Command Center** | `engine_3_dashboard/app.py` (Streamlit) | DB-driven controls, wallet NAV, engine process status, logs |
 
 State lives in **libSQL** — local `turso dev` sqld primary (`data/ip4_sqld_primary.db`) or Turso Cloud when credentials are set. A **supervisor** (`scripts/supervisor_watch.py`) spawns/stops Apex and Crucible based on the `execution_controls` singleton row. **Dashboard Start/Stop buttons only update that row**; they do not spawn OS processes without the supervisor running.
@@ -60,7 +60,7 @@ tail -f logs/apex.log logs/crucible.log logs/supervisor.log
 InvestmentProphits4 exists to:
 
 1. **Ingest live Polymarket market state** (Gamma + CLOB) into rolling `trade_exhaust` snapshots for backtest replay and Apex ticks.
-2. **Research strategy code** via Crucible AutoResearch — LLM edits `evaluate_market()` in `active_strategy.py`, backtest judge scores Sortino on replay rows.
+2. **Research strategy parameters** via Crucible AutoResearch — Optuna Bayesian Optimization searches numerical combinations in `strategy_config.json`, backtest judge scores penalized Sortino on replay rows.
 3. **Execute paper trades** on a single Apex agent (`APEX_EDGE`) using the champion strategy stored in `active_strategy.python_source`.
 4. **Gate fills** with fair value (mid + OBI bump), synthetic spread/slippage (`shared/poly_costs.py`), min net edge, position caps, max ladder legs, and cooldown rules.
 5. **Expose a control plane** — kill switch, execution mode (PAPER/LIVE), Apex/Crucible run states, portfolio chart, wallet health stoppage telemetry.
@@ -83,7 +83,7 @@ Lineage: conceptual descendant of IP2/IP3 agent arenas, but **standalone codebas
          │                              │                         │
          ▼                              ▼                         ▼
    Oracle + Apex tick              AutoResearch loop          Streamlit UI
-   (10s exec interval)            (DeepSeek → backtest)      (reads/writes DB)
+   (10s exec interval)            (Optuna → backtest)        (reads/writes DB)
          │                              │
          └──────────────┬───────────────┘
                         ▼
@@ -107,7 +107,7 @@ Lineage: conceptual descendant of IP2/IP3 agent arenas, but **standalone codebas
 ### Crucible loop (simplified)
 
 1. Read champion from `active_strategy.py.bak`.
-2. DeepSeek proposes full replacement `active_strategy.py`.
+2. Optuna Bayesian Optimization proposes numeric parameter combinations into `strategy_config.json`.
 3. Run `val_bpb_backtest.py` → `TRADES:N` / `SCORE:x.xxxx`.
 4. If score > `best_score` and live fill-eligible gate passes → KEEP (write Turso, bump version).
 5. Else REVERT to backup.

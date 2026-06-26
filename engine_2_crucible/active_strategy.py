@@ -1,122 +1,113 @@
 OVERLAY_WEIGHTS = {
-    "order_book_imbalance": 0.15,
+    "order_book_imbalance": 0.20,
     "cross_venue_adj": 0.10,
-    "spread": 0.25,
-    "mid_price": 0.30,
-    "bid_depth": 0.10,
+    "spread": 0.20,
+    "mid_price": 0.25,
+    "bid_depth": 0.15,
     "ask_depth": 0.10,
 }
 
-# Pure momentum with volatility-adjusted entry thresholds
-_last_mid = None
-_price_history = []
-_spread_history = []
-_max_history = 15
-_consecutive_buys = 0
-_consecutive_sells = 0
+# State tracking per market
+_market_states = {}
 
 def evaluate_market(market_state: dict) -> str:
-    """Aggressive momentum strategy - follow price trends with volatility-adjusted sizing"""
-    global _last_mid, _price_history, _spread_history, _consecutive_buys, _consecutive_sells
-    
+    """Pure mean-reversion strategy - bet against extreme price moves"""
     mid_price = float(market_state.get("mid_price", 0.5))
     spread = float(market_state.get("spread", 0.01))
     obi = float(market_state.get("order_book_imbalance", 0.0))
     bid_depth = float(market_state.get("bid_depth", 0.0))
     ask_depth = float(market_state.get("ask_depth", 0.0))
+    market_id = market_state.get("market_id", "default")
     
-    # Update history
-    _price_history.append(mid_price)
-    _spread_history.append(spread)
-    if len(_price_history) > _max_history:
-        _price_history.pop(0)
-        _spread_history.pop(0)
+    # Initialize state for this market
+    if market_id not in _market_states:
+        _market_states[market_id] = {
+            "price_history": [],
+            "last_signal": "HOLD",
+            "signal_streak": 0,
+            "max_history": 20
+        }
     
-    # Need minimum history for signals
-    if len(_price_history) < 3:
-        _last_mid = mid_price
+    state = _market_states[market_id]
+    state["price_history"].append(mid_price)
+    if len(state["price_history"]) > state["max_history"]:
+        state["price_history"].pop(0)
+    
+    # Need minimum history
+    if len(state["price_history"]) < 5:
         return "HOLD"
     
     # Calculate rolling statistics
-    avg_price = sum(_price_history) / len(_price_history)
-    avg_spread = sum(_spread_history) / len(_spread_history)
+    prices = state["price_history"]
+    avg_price = sum(prices) / len(prices)
+    recent_prices = prices[-5:]
+    recent_avg = sum(recent_prices) / len(recent_prices)
     
-    # Price momentum - percentage change from last tick
-    price_change = (mid_price - _last_mid) / _last_mid if _last_mid and _last_mid > 0 else 0
-    
-    # Volatility measure - spread relative to average
-    vol_ratio = spread / avg_spread if avg_spread > 0 else 1.0
+    # Calculate standard deviation of recent prices
+    variance = sum((p - recent_avg) ** 2 for p in recent_prices) / len(recent_prices)
+    std_dev = variance ** 0.5 if variance > 0 else 0.001
     
     # Avoid extremes - too close to resolution
     if mid_price > 0.97 or mid_price < 0.03:
-        _consecutive_buys = 0
-        _consecutive_sells = 0
-        _last_mid = mid_price
+        state["last_signal"] = "HOLD"
+        state["signal_streak"] = 0
         return "HOLD"
     
-    # Strong momentum signals - follow the trend aggressively
-    # Price moving up with volume (depth imbalance)
-    if price_change > 0.005 and mid_price > avg_price * 1.01:
-        _consecutive_buys += 1
-        _consecutive_sells = 0
-        if _consecutive_buys >= 2 and mid_price < 0.92:
-            _last_mid = mid_price
-            return "BUY_YES"
+    # Mean reversion signals - bet when price deviates significantly from average
+    # Account for spread crossing: need ~0.5*spread edge to break even
+    spread_cost = spread * 0.5
     
-    # Price moving down with volume
-    if price_change < -0.005 and mid_price < avg_price * 0.99:
-        _consecutive_sells += 1
-        _consecutive_buys = 0
-        if _consecutive_sells >= 2 and mid_price > 0.08:
-            _last_mid = mid_price
+    # Calculate z-score (how many std devs from mean)
+    z_score = (mid_price - recent_avg) / std_dev if std_dev > 0 else 0
+    
+    # Strong mean reversion signals
+    # Price too high - bet NO (expect reversal down)
+    if z_score > 2.0 and mid_price > 0.60 and mid_price < 0.95:
+        # Check if we're not already in this position
+        if state["last_signal"] != "BUY_NO" or state["signal_streak"] < 2:
+            state["last_signal"] = "BUY_NO"
+            state["signal_streak"] = state["signal_streak"] + 1 if state["last_signal"] == "BUY_NO" else 1
             return "BUY_NO"
     
-    # Breakout detection - price breaking out of recent range
-    if len(_price_history) >= 5:
-        recent_max = max(_price_history[-5:])
-        recent_min = min(_price_history[-5:])
-        range_width = recent_max - recent_min
-        
-        # Breakout above range with momentum
-        if mid_price > recent_max * 1.005 and price_change > 0.003 and mid_price < 0.90:
-            _consecutive_buys = max(_consecutive_buys, 1)
-            if _consecutive_buys >= 1:
-                _last_mid = mid_price
-                return "BUY_YES"
-        
-        # Breakout below range with momentum
-        if mid_price < recent_min * 0.995 and price_change < -0.003 and mid_price > 0.10:
-            _consecutive_sells = max(_consecutive_sells, 1)
-            if _consecutive_sells >= 1:
-                _last_mid = mid_price
-                return "BUY_NO"
-    
-    # OBI momentum confirmation - trade with the imbalance
-    if abs(obi) > 0.05:
-        if obi > 0.05 and mid_price > 0.55 and mid_price < 0.90:
-            _consecutive_buys += 1
-            if _consecutive_buys >= 2:
-                _last_mid = mid_price
-                return "BUY_YES"
-        elif obi < -0.05 and mid_price < 0.45 and mid_price > 0.10:
-            _consecutive_sells += 1
-            if _consecutive_sells >= 2:
-                _last_mid = mid_price
-                return "BUY_NO"
-    
-    # Volatility-adjusted entries - trade when spread is reasonable
-    if spread < 0.012 and vol_ratio < 1.5:
-        # Price trending up with tight spread
-        if mid_price > avg_price * 1.015 and mid_price < 0.88:
-            _last_mid = mid_price
+    # Price too low - bet YES (expect reversal up)
+    if z_score < -2.0 and mid_price < 0.40 and mid_price > 0.05:
+        if state["last_signal"] != "BUY_YES" or state["signal_streak"] < 2:
+            state["last_signal"] = "BUY_YES"
+            state["signal_streak"] = state["signal_streak"] + 1 if state["last_signal"] == "BUY_YES" else 1
             return "BUY_YES"
-        # Price trending down with tight spread
-        elif mid_price < avg_price * 0.985 and mid_price > 0.12:
-            _last_mid = mid_price
-            return "BUY_NO"
     
-    # Reset counters if no signal
-    _consecutive_buys = 0
-    _consecutive_sells = 0
-    _last_mid = mid_price
+    # Moderate mean reversion with OBI confirmation
+    if abs(obi) > 0.10:
+        # OBI says buy pressure but price is high - contrarian NO bet
+        if obi > 0.10 and mid_price > 0.65 and mid_price < 0.90:
+            if state["last_signal"] != "BUY_NO":
+                state["last_signal"] = "BUY_NO"
+                state["signal_streak"] = 1
+                return "BUY_NO"
+        # OBI says sell pressure but price is low - contrarian YES bet
+        elif obi < -0.10 and mid_price < 0.35 and mid_price > 0.10:
+            if state["last_signal"] != "BUY_YES":
+                state["last_signal"] = "BUY_YES"
+                state["signal_streak"] = 1
+                return "BUY_YES"
+    
+    # Price reversal from extreme levels
+    if len(prices) >= 10:
+        old_avg = sum(prices[-10:-5]) / 5
+        if mid_price > 0.80 and old_avg > 0.75 and mid_price < old_avg * 0.98:
+            # Price dropping from high levels - follow down
+            if state["last_signal"] != "BUY_NO":
+                state["last_signal"] = "BUY_NO"
+                state["signal_streak"] = 1
+                return "BUY_NO"
+        elif mid_price < 0.20 and old_avg < 0.25 and mid_price > old_avg * 1.02:
+            # Price rising from low levels - follow up
+            if state["last_signal"] != "BUY_YES":
+                state["last_signal"] = "BUY_YES"
+                state["signal_streak"] = 1
+                return "BUY_YES"
+    
+    # Reset if no signal
+    state["signal_streak"] = 0
+    state["last_signal"] = "HOLD"
     return "HOLD"
