@@ -9,7 +9,7 @@ class PolyCostModel:
     Strictly Paper Execution.
     """
 
-    BASELINE_FRICTION_BPS = 0.001  # 10 bps — hardcoded per spec
+    BASELINE_FRICTION_BPS = 0.0015  # 15 bps — Middle ground for Autoresearch
 
     # Base spread when crossing the book (Ask - Bid)
     TIER_SPREADS = {
@@ -130,27 +130,16 @@ class PolyCostModel:
     ) -> tuple[float, float]:
         """
         Log-odds stop/take-profit bounded in [0.01, 0.99] price space.
-
-        YES: stop below entry, take above entry (asymptotic near 1.0).
-        NO: stop above entry (YES rose), take below entry (YES fell).
         """
         entry = max(cls._PRICE_FLOOR, min(cls._PRICE_CEIL, entry_price))
         logit = cls._to_logit(entry)
 
-        if direction == "YES":
-            stop_loss = cls._from_logit(logit - sl_logit_delta)
-            take_profit = cls._from_logit(logit + tp_logit_delta)
-            stop_loss = min(stop_loss, max(cls._PRICE_FLOOR, entry - 0.001))
-            take_profit = max(take_profit, min(cls._PRICE_CEIL, entry + 0.001))
-            if stop_loss >= entry:
-                stop_loss = max(0.001, entry * 0.5)
-        else:
-            stop_loss = cls._from_logit(logit + sl_logit_delta)
-            take_profit = cls._from_logit(logit - tp_logit_delta)
-            stop_loss = max(stop_loss, min(cls._PRICE_CEIL, entry + 0.001))
-            take_profit = min(take_profit, max(cls._PRICE_FLOOR, entry - 0.001))
-            if take_profit >= entry:
-                take_profit = max(cls._PRICE_FLOOR, entry * 0.5)
+        stop_loss = cls._from_logit(logit - sl_logit_delta)
+        take_profit = cls._from_logit(logit + tp_logit_delta)
+        stop_loss = min(stop_loss, max(cls._PRICE_FLOOR, entry - 0.001))
+        take_profit = max(take_profit, min(cls._PRICE_CEIL, entry + 0.001))
+        if stop_loss >= entry:
+            stop_loss = max(0.001, entry * 0.5)
 
         return stop_loss, take_profit
 
@@ -239,5 +228,5 @@ class PolyCostModel:
         if direction == "YES":
             fill_price = market_mid + penalty
             return max(0.01, min(fill_price, 0.99))
-        fill_price = market_mid - penalty
-        return max(fill_price, 0.01)
+        fill_price = (1.0 - market_mid) + penalty
+        return max(0.01, min(fill_price, 0.99))
