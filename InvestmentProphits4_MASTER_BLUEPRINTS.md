@@ -618,6 +618,8 @@ InvestmentProphits4 paper-trades up to ten Polymarket-style binary markets by co
 
 *Manual engineering sync 2026-06-25 (infrastructure hardening: bankruptcy halt, Kelly clamp, Hrana retry, state_float, oracle preflight, stop-loss reentry fix, URI normalize, live audit preflight).*
 
+*Manual engineering sync 2026-06-26 (Execution Math & Strategy fixes: fixed poly_costs NO token math to properly subtract spread instead of add; removed headroom_trim from ip4_apex_edge.py to eliminate churn loops; rewrote active_strategy.py to use market_id-keyed dictionaries for state tracking, resolving cross-market signal pollution).*
+
 *Auto-synced by deepseek-v4-flash on 2026-06-25T14:15:00Z (attempt blocked by adversarial filter — manual section updates applied).*
 
 *This document reflects the IP4 codebase at checkpoint June 2026. For session-level engineering notes see `agent/wiki/project_wiki.md`. Prior art: `../InvestmentProphits3/InvestmentProphits3_MASTER_BLUEPRINTS.md`.*

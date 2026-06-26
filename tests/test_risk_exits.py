@@ -37,7 +37,7 @@ def test_longshot_yes_stop_triggers_with_correct_mark():
     assert reason == "STOP_LOSS"
 
 
-def test_no_take_profit_triggers_when_yes_mid_rallies():
+def test_no_stop_loss_triggers_when_yes_mid_rallies():
     entry = 0.7581
     sl, tp = PolyCostModel.compute_brackets(entry, direction="NO")
     triggered, _, reason = RiskDaemon.evaluate_bracket_exit(
@@ -49,4 +49,4 @@ def test_no_take_profit_triggers_when_yes_mid_rallies():
         take_profit=tp,
     )
     assert triggered is True
-    assert reason == "TAKE_PROFIT"
+    assert reason == "STOP_LOSS"

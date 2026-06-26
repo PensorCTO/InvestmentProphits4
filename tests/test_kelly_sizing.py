@@ -5,7 +5,8 @@ from __future__ import annotations
 from engine_1_apex.kelly_sizing import compute_fractional_kelly
 
 
-def test_kelly_positive_for_favorable_yes():
+def test_kelly_positive_for_favorable_yes(monkeypatch):
+    monkeypatch.delenv("APEX_MAX_FRACTIONAL_KELLY", raising=False)
     kelly = compute_fractional_kelly(fair_value=0.65, market_mid=0.5, direction="YES")
     assert kelly > 0.0
     assert kelly <= 0.05

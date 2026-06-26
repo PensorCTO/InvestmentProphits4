@@ -150,7 +150,8 @@ def test_compute_ladder_budget_floors_tiny_kelly_to_min_ladder():
     assert size == pytest.approx(5.0)
 
 
-def test_resolve_min_net_edge_longshot():
+def test_resolve_min_net_edge_longshot(monkeypatch):
+    monkeypatch.delenv("APEX_LONGSHOT_MIN_NET_EDGE", raising=False)
     assert resolve_min_net_edge(0.50, 0.015) == pytest.approx(0.015)
     assert resolve_min_net_edge(0.03, 0.015) == pytest.approx(0.020)
 
@@ -373,7 +374,8 @@ def test_stop_loss_cooldown_escalates_with_repeats(db_conn, monkeypatch):
     assert is_stop_loss_cooldown_active(db_conn, "APEX_EDGE", "mkt_oscars") is True
 
 
-def test_default_max_portfolio_pct():
+def test_default_max_portfolio_pct(monkeypatch):
+    monkeypatch.delenv("APEX_MAX_PORTFOLIO_PCT", raising=False)
     assert max_portfolio_pct() == pytest.approx(0.50)
 
 
@@ -405,7 +407,8 @@ def test_sizing_at_sub100_nav_uses_position_cap():
     assert size == pytest.approx(99.87 * 0.05, rel=1e-3)
 
 
-def test_portfolio_cap_blocks_when_half_nav_deployed():
+def test_portfolio_cap_blocks_when_half_nav_deployed(monkeypatch):
+    monkeypatch.delenv("APEX_MAX_PORTFOLIO_PCT", raising=False)
     size, reason = compute_ladder_budget(
         nav=100.0,
         cash=50.0,

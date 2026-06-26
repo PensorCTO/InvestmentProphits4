@@ -86,16 +86,10 @@ class RiskDaemon:
             direction, market_mid, liquidity_tier, size, capital=capital
         )
 
-        if direction == "YES":
-            if current_exit_value <= stop_loss:
-                return True, current_exit_value, "STOP_LOSS"
-            if current_exit_value >= take_profit:
-                return True, current_exit_value, "TAKE_PROFIT"
-        else:
-            if current_exit_value >= stop_loss:
-                return True, current_exit_value, "STOP_LOSS"
-            if current_exit_value <= take_profit:
-                return True, current_exit_value, "TAKE_PROFIT"
+        if current_exit_value <= stop_loss:
+            return True, current_exit_value, "STOP_LOSS"
+        if current_exit_value >= take_profit:
+            return True, current_exit_value, "TAKE_PROFIT"
         return False, current_exit_value, ""
 
     @staticmethod
