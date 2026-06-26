@@ -25,7 +25,7 @@ IP4 is a **dual-engine paper arena** on libSQL (local sqld or Turso Cloud):
 
 ## Current State Audit
 
-*Last audited: 2026-06-23 09:38*
+*Last audited: 2026-06-26 15:13*
 
 ### Codebase (June 2026 audit refactor — landed)
 
