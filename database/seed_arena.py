@@ -38,56 +38,33 @@ MARKETS = [
         0.92,
         "HIGH_LIQUIDITY",
     ),
-    (
-        "mkt_oscars",
-        "0x098e2be3df8ab529940c567819f8ef007cf007820e9d627642a5bbfaa42af372",
-        "Culture",
-        0.35,
-        "HIGH_LIQUIDITY",
-    ),
-    (
-        "mkt_fed_cut",
-        "0x7412d284c8f63791fec807f9b1f61c6fe61163621775a3dc8686cd2575272abe",
-        "Macro",
-        0.48,
-        "HIGH_LIQUIDITY",
-    ),
-    (
-        "mkt_ukraine_peace",
-        "0x1111111111111111111111111111111111111111111111111111111111111111",
-        "Geopolitics",
-        0.25,
-        "MED_LIQUIDITY",
-    ),
-    (
-        "mkt_super_bowl",
-        "0x2222222222222222222222222222222222222222222222222222222222222222",
-        "Sports",
-        0.55,
-        "MED_LIQUIDITY",
-    ),
-    (
-        "mkt_scotus_tariff",
-        "0x3333333333333333333333333333333333333333333333333333333333333333",
-        "Legal",
-        0.40,
-        "MED_LIQUIDITY",
-    ),
-    (
-        "mkt_oil_100",
-        "0x4444444444444444444444444444444444444444444444444444444444444444",
-        "Energy",
-        0.12,
-        "HIGH_LIQUIDITY",
-    ),
-    (
-        "mkt_recession",
-        "0x5555555555555555555555555555555555555555555555555555555555555555",
-        "Business",
-        0.30,
-        "MED_LIQUIDITY",
-    ),
 ]
+
+# Fetch dynamically if not mocked
+mocked = os.getenv("EDGE_MODEL_MOCKED", "true").lower() in ("true", "1", "yes")
+if not mocked:
+    from shared.gamma_client import discover_liquid_markets
+    print("EDGE_MODEL_MOCKED=false: Discovering top 100 liquid markets from Polymarket...")
+    try:
+        live_markets = discover_liquid_markets(limit=100)
+        MARKETS = []
+        for m in live_markets:
+            mid = m.get("yes_price")
+            if mid is None:
+                mid = 0.5
+            tier = m.get("tier", "MED_LIQUIDITY")
+            slug = m.get("slug", "")
+            market_id = f"mkt_{slug[:30].replace('-', '_')}"
+            MARKETS.append((
+                market_id,
+                m.get("condition_id"),
+                m.get("category", "General"),
+                mid,
+                tier
+            ))
+        print(f"Successfully discovered {len(MARKETS)} live markets.")
+    except Exception as e:
+        print(f"Failed to fetch live markets: {e}. Falling back to mock markets.")
 
 from shared.overlay_constants import OVERLAY_KEYS
 VARIANTS_PER_QUADRANT = 6

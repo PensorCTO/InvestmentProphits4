@@ -36,9 +36,10 @@ Your goal is to maximize the Risk-Adjusted Return (Sortino Ratio) of the live tr
 
 ## Preferred Patterns to TRY
 
-- Simple mid_price momentum: `if mid_price > last_mid * 1.02: return BUY_YES`
-- Mean reversion: `if mid_price < sma_20 * 0.98: return BUY_YES`
-- Spread compression: `if spread < avg_spread * 0.5: return BUY_YES`
-- State persistence: track last signal in evaluate_market closure or simple counter
+- Simple mid_price momentum: `if mid_price > _market_state_tracker[mkt]['last_mid'] * 1.02: return 'BUY_YES'`
+- Mean reversion: `if mid_price < _market_state_tracker[mkt]['sma_20'] * 0.98: return 'BUY_YES'`
+- State persistence: track last signal using a dictionary keyed by `market_state['market_id']`
+
+**CRITICAL RULE FOR STATE**: `evaluate_market` is called sequentially across MULTIPLE different markets! You MUST NOT use simple scalar global variables (like `_last_mid = None`). You MUST use a global dictionary keyed by `market_state['market_id']` to track state independently for each market.
 
 NEVER STOP. Once the loop begins, continuously propose new hypotheses. The current champion is at -10.75 — any score above this is an improvement.

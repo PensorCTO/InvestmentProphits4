@@ -556,3 +556,9 @@ BookWatcher None fields no longer crash Apex ticks. Vector backfill runs after b
 ### 2026-06-25 14:50 — Landed infrastructure hardening batch + blueprint sync + push (f9df5de). Bankruptcy halt (DRAIN_AND_HALT), Kelly clamp, Hrana retry, state_float, oracle preflight, stop-loss reentry fix, live audit config, URI normalize. Master + algo blueprints updated manually (DeepSeek sync blocked by adversarial filter). 319 pytest pass. Pushed to origin/main.
 
 **Next:** 48–72h paper soak; verify_trade_flow on next clean restart if handoff required.
+
+### 2026-06-26 10:58 — Fixed poly_costs.py NO token spread math, removed ip4_apex_edge.py headroom churn loop, and rewrote active_strategy.py to use per-market state dictionaries.
+
+### 2026-06-26 12:13 — Analyzed initial post-reset trade flow. Stack restart verified PASS with verify_trade_flow.py logging plumbing + alpha signals (buy+sell) in current Apex session. The bot successfully bought `mkt_will_argentina_win_the_2026_fi YES @ 0.1542` and sold `mkt_will_england_win_the_2026_fifa YES` due to thesis_expired.
+
+**Next:** Monitor dashboard and run regression tests if needed. Wait for user feedback.

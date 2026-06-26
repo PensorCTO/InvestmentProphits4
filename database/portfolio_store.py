@@ -22,7 +22,7 @@ from database.replica_store import commit_local, request_cloud_sync
 logger = logging.getLogger(__name__)
 
 DEFAULT_APEX_AGENT_ID = os.getenv("APEX_AGENT_ID", "APEX_EDGE")
-DEFAULT_INITIAL_CAPITAL = float(os.getenv("APEX_INITIAL_CAPITAL", "100.0"))
+DEFAULT_INITIAL_CAPITAL = float(os.getenv("APEX_INITIAL_CAPITAL", "1000.0"))
 
 
 def _utc_now_iso() -> str:

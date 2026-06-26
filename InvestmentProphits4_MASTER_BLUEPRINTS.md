@@ -595,24 +595,13 @@ InvestmentProphits4/
 
 ### Seed markets (`database/seed_arena.py`)
 
-| market_id | category |
-|-----------|----------|
-| mkt_us_election | Politics |
-| mkt_btc_100k | Crypto |
-| mkt_ai_agi | Science |
-| mkt_oscars | Culture |
-| mkt_fed_cut | Macro |
-| mkt_ukraine_peace | Geopolitics |
-| mkt_super_bowl | Sports |
-| mkt_scotus_tariff | Legal |
-| mkt_oil_100 | Energy |
-| mkt_recession | Business |
+The previous hardcoded top-10 list has been replaced. `seed_arena.py` now populates up to 100 active markets dynamically via `gamma_client.discover_liquid_markets(limit=100)`, ensuring that the local SQLite database always reflects the most actively traded Polymarket events.
 
 ---
 
 ## 20. Strategy Summary (One Paragraph)
 
-InvestmentProphits4 paper-trades up to ten Polymarket-style binary markets by combining a **Crucible-evolved** `evaluate_market()` strategy (OBI + cross-venue consensus + depth gates at checkpoint) with an **Apex execution stack** that computes fair value from live CLOB mids, enforces synthetic transaction costs and a **0.015 net-edge bar** (exploration 0.008 only when explicitly enabled), and simulates fractional-Kelly ladder entries bounded by `APEX_MAX_FRACTIONAL_KELLY`, subject to **portfolio-wide** `APEX_MAX_LADDER_LEGS`, per-market `APEX_MAX_LEGS_PER_MARKET`, and `APEX_MAX_PORTFOLIO_PCT` deployment caps. Oracle snapshots land in `trade_exhaust` with BookWatcher-fed `book_buffer` merge and **DMA heartbeat** liveness; an **oracle circuit breaker** protects ingest, and Apex **preflight** initializes oracle schema without blocking the worker thread. **Tri-state regime** classification (GOOD/CAUTION/POOR_LIQUIDITY) and **HMM runtime levers** adjust edge and sizing using null-safe `state_float()` parsing. Stoppage telemetry distinguishes infra health from trading activity (`IDLE`, `STALLED`, `STARVED`) using `actionable_unfilled_signals` — edge-gated and cooldown-blocked signals must not inflate false STALLED states; stop-loss re-entry compares **unboosted** stored edge with direction-scoped history. Idle and fully-deployed rotation redeploys idle cash when strategy is HOLD-heavy; **alpha-decay churn lockout** blocks destructive re-entry loops after rotate exits. **Bankruptcy floor** (`APEX_BANKRUPTCY_FLOOR`) halts new entries via `DRAIN_AND_HALT` — no automatic capital injection. Crucible quarantines LLM proposals in `strategy_proposals`, scores KEEP candidates with walk-forward Sortino + OOS MDD gates, promotes shadow champions via Welch t-test edge comparison, and optionally shadows live champion drift via `live_performance_monitor`. Risk daemon uses non-blocking arena locks and Hrana retries for bracket exits and vector backfill. Per-tick **telemetry jsonl** exports regime/HMM/portfolio state for soak audits. Adversarial filtering guards DeepSeek and news inputs. The acceptance gate and CI safety-gates validate schema, engines, trade flow, telemetry schema, and blueprint consistency before handoff.
+InvestmentProphits4 paper-trades up to 100 Polymarket-style binary markets by combining a **Crucible-evolved** `evaluate_market()` strategy (OBI + cross-venue consensus + depth gates at checkpoint) with an **Apex execution stack** that computes fair value from live CLOB mids, enforces synthetic transaction costs and a **0.02 net-edge bar** (exploration 0.008 only when explicitly enabled), and simulates fractional-Kelly ladder entries bounded by `APEX_MAX_FRACTIONAL_KELLY`, subject to **portfolio-wide** `APEX_MAX_LADDER_LEGS`, per-market `APEX_MAX_LEGS_PER_MARKET`, and `APEX_MAX_PORTFOLIO_PCT` deployment caps. Oracle snapshots land in `trade_exhaust` with BookWatcher-fed `book_buffer` merge and **DMA heartbeat** liveness; an **oracle circuit breaker** protects ingest, and Apex **preflight** initializes oracle schema without blocking the worker thread. **Tri-state regime** classification (GOOD/CAUTION/POOR_LIQUIDITY) and **HMM runtime levers** adjust edge and sizing using null-safe `state_float()` parsing. Stoppage telemetry distinguishes infra health from trading activity (`IDLE`, `STALLED`, `STARVED`) using `actionable_unfilled_signals` — edge-gated and cooldown-blocked signals must not inflate false STALLED states; stop-loss re-entry compares **unboosted** stored edge with direction-scoped history. Idle and fully-deployed rotation redeploys idle cash when strategy is HOLD-heavy; **alpha-decay churn lockout** blocks destructive re-entry loops after rotate exits. **Bankruptcy floor** (`APEX_BANKRUPTCY_FLOOR`) halts new entries via `DRAIN_AND_HALT` — no automatic capital injection. Crucible quarantines LLM proposals in `strategy_proposals`, scores KEEP candidates with walk-forward Sortino + OOS MDD gates, promotes shadow champions via Welch t-test edge comparison, and optionally shadows live champion drift via `live_performance_monitor`. Risk daemon uses non-blocking arena locks and Hrana retries for bracket exits and vector backfill. Per-tick **telemetry jsonl** exports regime/HMM/portfolio state for soak audits. Adversarial filtering guards DeepSeek and news inputs. The acceptance gate and CI safety-gates validate schema, engines, trade flow, telemetry schema, and blueprint consistency before handoff.
 
 ---
 
